@@ -13,6 +13,7 @@
 
 #include "julia.h"
 #include "julia_internal.h"
+#include "llvm-version.h"
 
 #ifdef _OS_WINDOWS_
 #include <psapi.h>
@@ -26,6 +27,7 @@
 #include <sys/ptrace.h>
 #include <sys/mman.h>
 #include <dlfcn.h>
+#include <grp.h>
 #endif
 
 #ifndef _OS_WINDOWS_
@@ -58,24 +60,18 @@
 
 #include "julia_assert.h"
 
+#include <llvm-c/Core.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#if defined(_OS_WINDOWS_) && !defined(_COMPILER_MINGW_)
+#if defined(_OS_WINDOWS_) && !defined(_COMPILER_GCC_)
 JL_DLLEXPORT char *dirname(char *);
 #else
 #include <libgen.h>
 #endif
 
-JL_DLLEXPORT uint32_t jl_getutf8(ios_t *s)
-{
-    uint32_t wc=0;
-    ios_getutf8(s, &wc);
-    return wc;
-}
-
-JL_DLLEXPORT int jl_sizeof_uv_mutex(void) { return sizeof(uv_mutex_t); }
 JL_DLLEXPORT int jl_sizeof_off_t(void) { return sizeof(off_t); }
 #ifndef _OS_WINDOWS_
 JL_DLLEXPORT int jl_sizeof_mode_t(void) { return sizeof(mode_t); }
@@ -118,21 +114,20 @@ JL_DLLEXPORT int32_t jl_nb_available(ios_t *s)
 // --- dir/file stuff ---
 
 JL_DLLEXPORT int jl_sizeof_uv_fs_t(void) { return sizeof(uv_fs_t); }
-JL_DLLEXPORT void jl_uv_fs_req_cleanup(uv_fs_t *req) { uv_fs_req_cleanup(req); }
 JL_DLLEXPORT char *jl_uv_fs_t_ptr(uv_fs_t *req) { return (char*)req->ptr; }
-JL_DLLEXPORT ssize_t jl_uv_fs_result(uv_fs_t *f) { return f->result; }
+JL_DLLEXPORT char *jl_uv_fs_t_path(uv_fs_t *req) { return (char*)req->path; }
 
 // --- stat ---
 JL_DLLEXPORT int jl_sizeof_stat(void) { return sizeof(uv_stat_t); }
 
-JL_DLLEXPORT int32_t jl_stat(const char *path, char *statbuf)
+JL_DLLEXPORT int32_t jl_stat(const char *path, char *statbuf) JL_NOTSAFEPOINT
 {
     uv_fs_t req;
     int ret;
 
     // Ideally one would use the statbuf for the storage in req, but
     // it's not clear that this is possible using libuv
-    ret = uv_fs_stat(uv_default_loop(), &req, path, NULL);
+    ret = uv_fs_stat(unused_uv_loop_arg, &req, path, NULL);
     if (ret == 0)
         memcpy(statbuf, req.ptr, sizeof(uv_stat_t));
     uv_fs_req_cleanup(&req);
@@ -144,7 +139,7 @@ JL_DLLEXPORT int32_t jl_lstat(const char *path, char *statbuf)
     uv_fs_t req;
     int ret;
 
-    ret = uv_fs_lstat(uv_default_loop(), &req, path, NULL);
+    ret = uv_fs_lstat(unused_uv_loop_arg, &req, path, NULL);
     if (ret == 0)
         memcpy(statbuf, req.ptr, sizeof(uv_stat_t));
     uv_fs_req_cleanup(&req);
@@ -156,7 +151,7 @@ JL_DLLEXPORT int32_t jl_fstat(uv_os_fd_t fd, char *statbuf)
     uv_fs_t req;
     int ret;
 
-    ret = uv_fs_fstat(uv_default_loop(), &req, fd, NULL);
+    ret = uv_fs_fstat(unused_uv_loop_arg, &req, fd, NULL);
     if (ret == 0)
         memcpy(statbuf, req.ptr, sizeof(uv_stat_t));
     uv_fs_req_cleanup(&req);
@@ -235,6 +230,231 @@ JL_DLLEXPORT double jl_stat_ctime(char *statbuf)
     uv_stat_t *s;
     s = (uv_stat_t*)statbuf;
     return (double)s->st_ctim.tv_sec + (double)s->st_ctim.tv_nsec * 1e-9;
+}
+
+JL_DLLEXPORT int jl_os_get_passwd(uv_passwd_t *pwd, size_t uid)
+{
+#ifdef _OS_WINDOWS_
+  return UV_ENOTSUP;
+#else
+  // taken directly from libuv
+  struct passwd pw;
+  struct passwd* result;
+  char* buf;
+  size_t bufsize;
+  size_t name_size;
+  size_t homedir_size;
+  size_t shell_size;
+  size_t gecos_size;
+  long initsize;
+  int r;
+
+  if (pwd == NULL)
+    return UV_EINVAL;
+
+  initsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+
+  if (initsize <= 0)
+    bufsize = 4096;
+  else
+    bufsize = (size_t) initsize;
+
+  buf = NULL;
+
+  for (;;) {
+    free(buf);
+    buf = (char*)malloc(bufsize);
+
+    if (buf == NULL)
+      return UV_ENOMEM;
+
+    r = getpwuid_r(uid, &pw, buf, bufsize, &result);
+
+    if (r != ERANGE)
+      break;
+
+    bufsize *= 2;
+  }
+
+  if (r != 0) {
+    free(buf);
+    return -r;
+  }
+
+  if (result == NULL) {
+    free(buf);
+    return UV_ENOENT;
+  }
+
+  /* Allocate memory for the username, gecos, shell, and home directory. */
+  name_size = strlen(pw.pw_name) + 1;
+  homedir_size = strlen(pw.pw_dir) + 1;
+  shell_size = strlen(pw.pw_shell) + 1;
+
+#ifdef __MVS__
+  gecos_size = 0; /* pw_gecos does not exist on zOS. */
+#else
+  if (pw.pw_gecos != NULL)
+    gecos_size = strlen(pw.pw_gecos) + 1;
+  else
+    gecos_size = 0;
+#endif
+
+  pwd->username = (char*)malloc(name_size +
+                         homedir_size +
+                         shell_size +
+                         gecos_size);
+
+  if (pwd->username == NULL) {
+    free(buf);
+    return UV_ENOMEM;
+  }
+
+  /* Copy the username */
+  memcpy(pwd->username, pw.pw_name, name_size);
+
+  /* Copy the home directory */
+  pwd->homedir = pwd->username + name_size;
+  memcpy(pwd->homedir, pw.pw_dir, homedir_size);
+
+  /* Copy the shell */
+  pwd->shell = pwd->homedir + homedir_size;
+  memcpy(pwd->shell, pw.pw_shell, shell_size);
+
+  /* Copy the gecos field */
+#ifdef __MVS__
+  pwd->gecos = NULL;  /* pw_gecos does not exist on zOS. */
+#else
+  if (pw.pw_gecos == NULL) {
+    pwd->gecos = NULL;
+  } else {
+    pwd->gecos = pwd->shell + shell_size;
+    memcpy(pwd->gecos, pw.pw_gecos, gecos_size);
+  }
+#endif
+
+  /* Copy the uid and gid */
+  pwd->uid = pw.pw_uid;
+  pwd->gid = pw.pw_gid;
+
+  free(buf);
+
+  return 0;
+#endif
+}
+
+typedef struct jl_group_s {
+    char* groupname;
+    long gid;
+    char** members;
+} jl_group_t;
+
+JL_DLLEXPORT int jl_os_get_group(jl_group_t *grp, size_t gid)
+{
+#ifdef _OS_WINDOWS_
+  return UV_ENOTSUP;
+#else
+  // modified directly from uv_os_get_password
+  struct group gp;
+  struct group* result;
+  char* buf;
+  char* gr_mem;
+  size_t bufsize;
+  size_t name_size;
+  long members;
+  size_t mem_size;
+  long initsize;
+  int r;
+
+  if (grp == NULL)
+    return UV_EINVAL;
+
+  initsize = sysconf(_SC_GETGR_R_SIZE_MAX);
+
+  if (initsize <= 0)
+    bufsize = 4096;
+  else
+    bufsize = (size_t) initsize;
+
+  buf = NULL;
+
+  for (;;) {
+    free(buf);
+    buf = (char*)malloc(bufsize);
+
+    if (buf == NULL)
+      return UV_ENOMEM;
+
+    r = getgrgid_r(gid, &gp, buf, bufsize, &result);
+
+    if (r != ERANGE)
+      break;
+
+    bufsize *= 2;
+  }
+
+  if (r != 0) {
+    free(buf);
+    return -r;
+  }
+
+  if (result == NULL) {
+    free(buf);
+    return UV_ENOENT;
+  }
+
+  /* Allocate memory for the groupname and members. */
+  name_size = strlen(gp.gr_name) + 1;
+  members = 0;
+  mem_size = sizeof(char*);
+  for (r = 0; gp.gr_mem[r] != NULL; r++) {
+    mem_size += strlen(gp.gr_mem[r]) + 1 + sizeof(char*);
+    members++;
+  }
+
+  gr_mem = (char*)malloc(name_size + mem_size);
+  if (gr_mem == NULL) {
+    free(buf);
+    return UV_ENOMEM;
+  }
+
+  /* Copy the members */
+  grp->members = (char**) gr_mem;
+  grp->members[members] = NULL;
+  gr_mem = (char*) ((char**) gr_mem + members + 1);
+  for (r = 0; r < members; r++) {
+    grp->members[r] = gr_mem;
+    gr_mem = stpcpy(gr_mem, gp.gr_mem[r]) + 1;
+  }
+  assert(gr_mem == (char*)grp->members + mem_size);
+
+  /* Copy the groupname */
+  grp->groupname = gr_mem;
+  memcpy(grp->groupname, gp.gr_name, name_size);
+  gr_mem += name_size;
+
+  /* Copy the gid */
+  grp->gid = gp.gr_gid;
+
+  free(buf);
+
+  return 0;
+#endif
+}
+
+JL_DLLEXPORT void jl_os_free_group(jl_group_t *grp)
+{
+  if (grp == NULL)
+    return;
+
+  /*
+    The memory for is allocated in a single uv__malloc() call. The base of the
+    pointer is stored in grp->members, so that is the only field that needs
+    to be freed.
+  */
+  free(grp->members);
+  grp->members = NULL;
+  grp->groupname = NULL;
 }
 
 // --- buffer manipulation ---
@@ -316,16 +536,21 @@ JL_DLLEXPORT jl_value_t *jl_readuntil(ios_t *s, uint8_t delim, uint8_t str, uint
     return (jl_value_t*)a;
 }
 
-JL_DLLEXPORT uint64_t jl_ios_get_nbyte_int(ios_t *s, const size_t n)
+JL_DLLEXPORT int jl_ios_buffer_n(ios_t *s, const size_t n)
 {
-    assert(n <= 8);
     size_t space, ret;
     do {
         space = (size_t)(s->size - s->bpos);
         ret = ios_readprep(s, n);
         if (space == ret && ret < n)
-            jl_eof_error();
-    } while(ret < n);
+            return 1;
+    } while (ret < n);
+    return 0;
+}
+
+JL_DLLEXPORT uint64_t jl_ios_get_nbyte_int(ios_t *s, const size_t n)
+{
+    assert(n <= 8);
     uint64_t x = 0;
     uint8_t *buf = (uint8_t*)&s->buf[s->bpos];
     if (n == 8) {
@@ -350,8 +575,8 @@ JL_DLLEXPORT uint64_t jl_ios_get_nbyte_int(ios_t *s, const size_t n)
 
 // -- syscall utilities --
 
-JL_DLLEXPORT int jl_errno(void) { return errno; }
-JL_DLLEXPORT void jl_set_errno(int e) { errno = e; }
+JL_DLLEXPORT int jl_errno(void) JL_NOTSAFEPOINT { return errno; }
+JL_DLLEXPORT void jl_set_errno(int e) JL_NOTSAFEPOINT { errno = e; }
 
 // -- get the number of CPU threads (logical cores) --
 
@@ -362,7 +587,7 @@ typedef DWORD (WINAPI *GAPC)(WORD);
 #endif
 #endif
 
-JL_DLLEXPORT int jl_cpu_threads(void)
+JL_DLLEXPORT int jl_cpu_threads(void) JL_NOTSAFEPOINT
 {
 #if defined(HW_AVAILCPU) && defined(HW_NCPU)
     size_t len = 4;
@@ -382,12 +607,8 @@ JL_DLLEXPORT int jl_cpu_threads(void)
     return count;
 #elif defined(_OS_WINDOWS_)
     //Try to get WIN7 API method
-    GAPC gapc = (GAPC) jl_dlsym_e(
-        jl_kernel32_handle,
-        "GetActiveProcessorCount"
-    );
-
-    if (gapc) {
+    GAPC gapc;
+    if (jl_dlsym(jl_kernel32_handle, "GetActiveProcessorCount", (void **)&gapc, 0)) {
         return gapc(ALL_PROCESSOR_GROUPS);
     }
     else { //fall back on GetSystemInfo
@@ -404,7 +625,7 @@ JL_DLLEXPORT int jl_cpu_threads(void)
 
 // -- high resolution timers --
 // Returns time in nanosec
-JL_DLLEXPORT uint64_t jl_hrtime(void)
+JL_DLLEXPORT uint64_t jl_hrtime(void) JL_NOTSAFEPOINT
 {
     return uv_hrtime();
 }
@@ -414,7 +635,7 @@ JL_DLLEXPORT uint64_t jl_hrtime(void)
 #ifdef __APPLE__
 #include <crt_externs.h>
 #else
-#if !defined(_OS_WINDOWS_) || defined(_COMPILER_MINGW_)
+#if !defined(_OS_WINDOWS_) || defined(_COMPILER_GCC_)
 extern char **environ;
 #endif
 #endif
@@ -496,13 +717,15 @@ JL_DLLEXPORT long jl_getpagesize(void)
 #else
 JL_DLLEXPORT long jl_getpagesize(void)
 {
-    return sysconf(_SC_PAGESIZE);
+    long page_size = sysconf(_SC_PAGESIZE);
+    assert(page_size != -1);
+    return page_size;
 }
 #endif
 
 #ifdef _OS_WINDOWS_
 static long cachedAllocationGranularity = 0;
-JL_DLLEXPORT long jl_getallocationgranularity(void)
+JL_DLLEXPORT long jl_getallocationgranularity(void) JL_NOTSAFEPOINT
 {
     if (!cachedAllocationGranularity) {
         SYSTEM_INFO systemInfo;
@@ -512,7 +735,7 @@ JL_DLLEXPORT long jl_getallocationgranularity(void)
     return cachedAllocationGranularity;
 }
 #else
-JL_DLLEXPORT long jl_getallocationgranularity(void)
+JL_DLLEXPORT long jl_getallocationgranularity(void) JL_NOTSAFEPOINT
 {
     return jl_getpagesize();
 }
@@ -538,7 +761,7 @@ JL_DLLEXPORT const char *jl_pathname_for_handle(void *handle)
     for (int32_t i = _dyld_image_count() - 1; i >= 0 ; i--) {
         // dlopen() each image, check handle
         const char *image_name = _dyld_get_image_name(i);
-        void *probe_lib = jl_load_dynamic_library(image_name, JL_RTLD_DEFAULT);
+        void *probe_lib = jl_load_dynamic_library(image_name, JL_RTLD_DEFAULT | JL_RTLD_NOLOAD, 0);
         jl_dlclose(probe_lib);
 
         // If the handle is the same as what was passed in (modulo mode bits), return this image name
@@ -548,8 +771,8 @@ JL_DLLEXPORT const char *jl_pathname_for_handle(void *handle)
 
 #elif defined(_OS_WINDOWS_)
 
-    wchar_t *pth16 = (wchar_t*)malloc(32768); // max long path length
-    DWORD n16 = GetModuleFileNameW((HMODULE)handle,pth16,32768);
+    wchar_t *pth16 = (wchar_t*)malloc_s(32768 * sizeof(*pth16)); // max long path length
+    DWORD n16 = GetModuleFileNameW((HMODULE)handle, pth16, 32768);
     if (n16 <= 0) {
         free(pth16);
         return NULL;
@@ -560,7 +783,7 @@ JL_DLLEXPORT const char *jl_pathname_for_handle(void *handle)
         free(pth16);
         return NULL;
     }
-    char *filepath = (char*)malloc(++n8);
+    char *filepath = (char*)malloc_s(++n8);
     if (!WideCharToMultiByte(CP_UTF8, 0, pth16, -1, filepath, n8, NULL, NULL)) {
         free(pth16);
         free(filepath);
@@ -588,23 +811,33 @@ JL_DLLEXPORT const char *jl_pathname_for_handle(void *handle)
 }
 
 #ifdef _OS_WINDOWS_
-static BOOL CALLBACK jl_EnumerateLoadedModulesProc64(
-  _In_      PCTSTR ModuleName,
-  _In_      DWORD64 ModuleBase,
-  _In_      ULONG ModuleSize,
-  _In_opt_  PVOID a
-)
-{
-    jl_array_grow_end((jl_array_t*)a, 1);
-    //XXX: change to jl_arrayset if array storage allocation for Array{String,1} changes:
-    jl_value_t *v = jl_cstr_to_string(ModuleName);
-    jl_array_ptr_set(a, jl_array_dim0(a)-1, v);
-    return TRUE;
-}
-// Takes a handle (as returned from dlopen()) and returns the absolute path to the image loaded
+// Get a list of all the modules in this process.
 JL_DLLEXPORT int jl_dllist(jl_array_t *list)
 {
-    return EnumerateLoadedModules64(GetCurrentProcess(), jl_EnumerateLoadedModulesProc64, list);
+    DWORD cb, cbNeeded;
+    HMODULE *hMods = NULL;
+    unsigned int i;
+    cbNeeded = 1024 * sizeof(*hMods);
+    do {
+        cb = cbNeeded;
+        hMods = (HMODULE*)realloc_s(hMods, cb);
+        if (!EnumProcessModulesEx(GetCurrentProcess(), hMods, cb, &cbNeeded, LIST_MODULES_ALL)) {
+          free(hMods);
+          return FALSE;
+        }
+    } while (cb < cbNeeded);
+    for (i = 0; i < cbNeeded / sizeof(HMODULE); i++) {
+        const char *path = jl_pathname_for_handle(hMods[i]);
+        // XXX: change to jl_arrayset if array storage allocation for Array{String,1} changes:
+        if (path == NULL)
+            continue;
+        jl_array_grow_end((jl_array_t*)list, 1);
+        jl_value_t *v = jl_cstr_to_string(path);
+        free(path);
+        jl_array_ptr_set(list, jl_array_dim0(list) - 1, v);
+    }
+    free(hMods);
+    return TRUE;
 }
 #endif
 
@@ -618,12 +851,12 @@ JL_DLLEXPORT void jl_raise_debugger(void)
 #endif // _OS_WINDOWS_
 }
 
-JL_DLLEXPORT jl_sym_t *jl_get_UNAME(void)
+JL_DLLEXPORT jl_sym_t *jl_get_UNAME(void) JL_NOTSAFEPOINT
 {
     return jl_symbol(JL_BUILD_UNAME);
 }
 
-JL_DLLEXPORT jl_sym_t *jl_get_ARCH(void)
+JL_DLLEXPORT jl_sym_t *jl_get_ARCH(void) JL_NOTSAFEPOINT
 {
     return jl_symbol(JL_BUILD_ARCH);
 }
@@ -654,10 +887,32 @@ JL_DLLEXPORT size_t jl_maxrss(void)
 
 JL_DLLEXPORT int jl_threading_enabled(void)
 {
-#ifdef JULIA_ENABLE_THREADING
     return 1;
+}
+
+JL_DLLEXPORT jl_value_t *jl_get_libllvm(void) JL_NOTSAFEPOINT {
+#if defined(_OS_WINDOWS_)
+    HMODULE mod;
+    // FIXME: GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS on LLVMContextCreate,
+    //        but that just points to libjulia.dll
+#if JL_LLVM_VERSION <= 110000
+    const char* libLLVM = "LLVM";
 #else
-    return 0;
+    const char* libLLVM = "libLLVM";
+#endif
+
+    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, libLLVM, &mod))
+        return jl_nothing;
+
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA(mod, path, sizeof(path)))
+        return jl_nothing;
+    return (jl_value_t*) jl_symbol(path);
+#else
+    Dl_info dli;
+    if (!dladdr(LLVMContextCreate, &dli))
+        return jl_nothing;
+    return (jl_value_t*) jl_symbol(dli.dli_fname);
 #endif
 }
 

@@ -21,6 +21,20 @@ g = Float16(1.)
     @test isequal(Float16(0.0), Float16(0.0))
     @test !isequal(Float16(-0.0), Float16(0.0))
     @test !isequal(Float16(0.0), Float16(-0.0))
+
+    for T = Base.BitInteger_types
+        @test -Inf16 < typemin(T)
+        @test -Inf16 <= typemin(T)
+        @test typemin(T) > -Inf16
+        @test typemin(T) >= -Inf16
+        @test typemin(T) != -Inf16
+
+        @test Inf16 > typemax(T)
+        @test Inf16 >= typemax(T)
+        @test typemax(T) < Inf16
+        @test typemax(T) <= Inf16
+        @test typemax(T) != Inf16
+    end
 end
 
 @testset "convert" begin
@@ -76,9 +90,13 @@ end
     @test Float16(0.5f0)^2 ≈ Float16(0.5f0^2)
     @test sin(f) ≈ sin(2f0)
     @test log10(Float16(100)) == Float16(2.0)
+    @test sin(ComplexF16(f)) ≈ sin(complex(2f0))
 
     # no domain error is thrown for negative values
     @test cbrt(Float16(-1.0)) == -1.0
+    # test zero and Inf
+    @test cbrt(Float16(0.0)) == Float16(0.0)
+    @test cbrt(Inf16) == Inf16
 end
 @testset "binary ops" begin
     @test f+g === Float16(3f0)
@@ -156,6 +174,10 @@ end
     # halfway between and last bit is 0
     ff = reinterpret(Float32,                           0b00111110101010100001000000000000)
     @test Float32(Float16(ff)) === reinterpret(Float32, 0b00111110101010100000000000000000)
+
+    for x = (typemin(Int64), typemin(Int128)), R = (RoundUp, RoundToZero)
+        @test Float16(x, R) == nextfloat(-Inf16)
+    end
 end
 
 # issue #5948
@@ -166,3 +188,17 @@ end
 
 # issue #17148
 @test rem(Float16(1.2), Float16(one(1.2))) == 0.20019531f0
+
+# issue #32441
+const f16eps2 = Float32(eps(Float16(0.0)))/2
+const minsubf16 = nextfloat(Float16(0.0))
+const minsubf16_32 = Float32(minsubf16)
+@test Float16(f16eps2) == Float16(0.0)
+@test Float16(nextfloat(f16eps2)) == minsubf16
+@test Float16(prevfloat(minsubf16_32)) == minsubf16
+# Ties to even, in this case up
+@test Float16(minsubf16_32 + f16eps2) == nextfloat(minsubf16)
+@test Float16(prevfloat(minsubf16_32 + f16eps2)) == minsubf16
+
+# issues #33076
+@test Float16(1f5) == Inf16

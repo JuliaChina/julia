@@ -9,7 +9,7 @@
     Test.guardseed(12345) do
         x = ratio(collect(ExponentialBackOff(n=100, max_delay=Inf, factor=1, jitter=0.1)))
         xm = sum(x) / length(x)
-        @test (xm - 1.0) < 1e-4
+        @test abs(xm - 1.0) < 0.01
     end
 end
 @testset "retrying after errors" begin
@@ -77,4 +77,7 @@ end
     foo_kwargs(x; y=5) = x + y
     @test retry(foo_kwargs)(3) == 8
     @test retry(foo_kwargs)(3; y=4) == 7
+
+    # non-Functions
+    @test retry(Float64)(1) === 1.0
 end

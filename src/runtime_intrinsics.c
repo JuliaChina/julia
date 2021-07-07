@@ -65,14 +65,165 @@ JL_DLLEXPORT jl_value_t *jl_pointerset(jl_value_t *p, jl_value_t *x, jl_value_t 
     else {
         if (!jl_is_datatype(ety))
             jl_error("pointerset: invalid pointer");
+        if (jl_typeof(x) != ety)
+            jl_type_error("pointerset", ety, x);
         size_t elsz = jl_datatype_size(ety);
         size_t nb = LLT_ALIGN(elsz, jl_datatype_align(ety));
         char *pp = (char*)jl_unbox_long(p) + (jl_unbox_long(i)-1)*nb;
-        if (jl_typeof(x) != ety)
-            jl_error("pointerset: type mismatch in assign");
         memcpy(pp, x, elsz);
     }
     return p;
+}
+
+JL_DLLEXPORT jl_value_t *jl_atomic_pointerref(jl_value_t *p, jl_value_t *order)
+{
+    JL_TYPECHK(pointerref, pointer, p);
+    JL_TYPECHK(pointerref, symbol, order)
+    (void)jl_get_atomic_order_checked((jl_sym_t*)order, 1, 0);
+    jl_value_t *ety = jl_tparam0(jl_typeof(p));
+    char *pp = (char*)jl_unbox_long(p);
+    if (ety == (jl_value_t*)jl_any_type) {
+        return jl_atomic_load((jl_value_t**)pp);
+    }
+    else {
+        if (!jl_is_datatype(ety))
+            jl_error("pointerref: invalid pointer");
+        size_t nb = jl_datatype_size(ety);
+        if ((nb & (nb - 1)) != 0 || nb > MAX_POINTERATOMIC_SIZE)
+            jl_error("pointerref: invalid pointer for atomic operation");
+        return jl_atomic_new_bits(ety, pp);
+    }
+}
+
+JL_DLLEXPORT jl_value_t *jl_atomic_pointerset(jl_value_t *p, jl_value_t *x, jl_value_t *order)
+{
+    JL_TYPECHK(pointerset, pointer, p);
+    JL_TYPECHK(pointerset, symbol, order);
+    (void)jl_get_atomic_order_checked((jl_sym_t*)order, 0, 1);
+    jl_value_t *ety = jl_tparam0(jl_typeof(p));
+    char *pp = (char*)jl_unbox_long(p);
+    if (ety == (jl_value_t*)jl_any_type) {
+        jl_atomic_store((jl_value_t**)pp, x);
+    }
+    else {
+        if (!jl_is_datatype(ety))
+            jl_error("pointerset: invalid pointer");
+        if (jl_typeof(x) != ety)
+            jl_type_error("pointerset", ety, x);
+        size_t nb = jl_datatype_size(ety);
+        if ((nb & (nb - 1)) != 0 || nb > MAX_POINTERATOMIC_SIZE)
+            jl_error("pointerset: invalid pointer for atomic operation");
+        jl_atomic_store_bits(pp, x, nb);
+    }
+    return p;
+}
+
+JL_DLLEXPORT jl_value_t *jl_atomic_pointerswap(jl_value_t *p, jl_value_t *x, jl_value_t *order)
+{
+    JL_TYPECHK(pointerswap, pointer, p);
+    JL_TYPECHK(pointerswap, symbol, order);
+    (void)jl_get_atomic_order_checked((jl_sym_t*)order, 1, 1);
+    jl_value_t *ety = jl_tparam0(jl_typeof(p));
+    jl_value_t *y;
+    char *pp = (char*)jl_unbox_long(p);
+    if (ety == (jl_value_t*)jl_any_type) {
+        y = jl_atomic_exchange((jl_value_t**)pp, x);
+    }
+    else {
+        if (!jl_is_datatype(ety))
+            jl_error("pointerswap: invalid pointer");
+        if (jl_typeof(x) != ety)
+            jl_type_error("pointerswap", ety, x);
+        size_t nb = jl_datatype_size(ety);
+        if ((nb & (nb - 1)) != 0 || nb > MAX_POINTERATOMIC_SIZE)
+            jl_error("pointerswap: invalid pointer for atomic operation");
+        y = jl_atomic_swap_bits(ety, pp, x, nb);
+    }
+    return y;
+}
+
+JL_DLLEXPORT jl_value_t *jl_atomic_pointermodify(jl_value_t *p, jl_value_t *f, jl_value_t *x, jl_value_t *order_sym)
+{
+    // n.b. we use seq_cst always here, but need to verify the order sym
+    // against the weaker load-only that happens first
+    if (order_sym == (jl_value_t*)acquire_release_sym)
+        order_sym = (jl_value_t*)acquire_sym;
+    jl_value_t *expected = jl_atomic_pointerref(p, order_sym);
+    jl_value_t *ety = jl_tparam0(jl_typeof(p));
+    char *pp = (char*)jl_unbox_long(p);
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 2);
+    args[0] = expected;
+    while (1) {
+        args[1] = x;
+        jl_value_t *y = jl_apply_generic(f, args, 2);
+        args[1] = y;
+        if (ety == (jl_value_t*)jl_any_type) {
+            if (jl_atomic_cmpswap((jl_value_t**)pp, &expected, y))
+                break;
+        }
+        else {
+            if (jl_typeof(y) != ety)
+                jl_type_error("pointermodify", ety, y);
+            size_t nb = jl_datatype_size(ety);
+            if (jl_atomic_bool_cmpswap_bits(pp, expected, y, nb))
+                break;
+            expected = jl_atomic_new_bits(ety, pp);
+        }
+        args[0] = expected;
+        jl_gc_safepoint();
+    }
+    // args[0] == expected (old); args[1] == y (new)
+    args[0] = jl_f_tuple(NULL, args, 2);
+    JL_GC_POP();
+    return args[0];
+}
+
+JL_DLLEXPORT jl_value_t *jl_atomic_pointerreplace(jl_value_t *p, jl_value_t *expected, jl_value_t *x, jl_value_t *success_order_sym, jl_value_t *failure_order_sym)
+{
+    JL_TYPECHK(pointerreplace, pointer, p);
+    JL_TYPECHK(pointerreplace, symbol, success_order_sym);
+    JL_TYPECHK(pointerreplace, symbol, failure_order_sym);
+    enum jl_memory_order success_order = jl_get_atomic_order_checked((jl_sym_t*)success_order_sym, 1, 1);
+    enum jl_memory_order failure_order = jl_get_atomic_order_checked((jl_sym_t*)failure_order_sym, 1, 0);
+    if (failure_order > success_order)
+        jl_atomic_error("pointerreplace: invalid atomic ordering");
+    // TODO: filter other invalid orderings
+    jl_value_t *ety = jl_tparam0(jl_typeof(p));
+    char *pp = (char*)jl_unbox_long(p);
+    if (ety == (jl_value_t*)jl_any_type) {
+        jl_value_t **result;
+        JL_GC_PUSHARGS(result, 2);
+        result[0] = expected;
+        int success;
+        while (1) {
+            success = jl_atomic_cmpswap((jl_value_t**)pp, &result[0], x);
+            if (success || !jl_egal(result[0], expected))
+                break;
+        }
+        result[1] = success ? jl_true : jl_false;
+        result[0] = jl_f_tuple(NULL, result, 2);
+        JL_GC_POP();
+        return result[0];
+    }
+    else {
+        if (!jl_is_datatype(ety))
+            jl_error("pointerreplace: invalid pointer");
+        if (jl_typeof(x) != ety)
+            jl_type_error("pointerreplace", ety, x);
+        size_t nb = jl_datatype_size(ety);
+        if ((nb & (nb - 1)) != 0 || nb > MAX_POINTERATOMIC_SIZE)
+            jl_error("pointerreplace: invalid pointer for atomic operation");
+        return jl_atomic_cmpswap_bits((jl_datatype_t*)ety, pp, expected, x, nb);
+    }
+}
+
+JL_DLLEXPORT jl_value_t *jl_atomic_fence(jl_value_t *order)
+{
+    JL_TYPECHK(fence, symbol, order);
+    (void)jl_get_atomic_order_checked((jl_sym_t*)order, 0, 0);
+    jl_fence();
+    return jl_nothing;
 }
 
 JL_DLLEXPORT jl_value_t *jl_cglobal(jl_value_t *v, jl_value_t *ty)
@@ -80,7 +231,7 @@ JL_DLLEXPORT jl_value_t *jl_cglobal(jl_value_t *v, jl_value_t *ty)
     JL_TYPECHK(cglobal, type, ty);
     JL_GC_PUSH1(&v);
     jl_value_t *rt =
-        ty == (jl_value_t*)jl_void_type ? (jl_value_t*)jl_voidpointer_type : // a common case
+        ty == (jl_value_t*)jl_nothing_type ? (jl_value_t*)jl_voidpointer_type : // a common case
             (jl_value_t*)jl_apply_type1((jl_value_t*)jl_pointer_type, ty);
     JL_GC_PROMISE_ROOTED(rt); // (JL_ALWAYS_LEAFTYPE)
 
@@ -121,7 +272,8 @@ JL_DLLEXPORT jl_value_t *jl_cglobal(jl_value_t *v, jl_value_t *ty)
         f_lib = (char*)jl_dlfind_win32(f_name);
 #endif
 
-    void *ptr = jl_dlsym(jl_get_library(f_lib), f_name);
+    void *ptr;
+    jl_dlsym(jl_get_library(f_lib), f_name, &ptr, 1);
     jl_value_t *jv = jl_gc_alloc_1w();
     jl_set_typeof(jv, rt);
     *(void**)jl_data_ptr(jv) = ptr;
@@ -130,7 +282,7 @@ JL_DLLEXPORT jl_value_t *jl_cglobal(jl_value_t *v, jl_value_t *ty)
 }
 
 JL_DLLEXPORT jl_value_t *jl_cglobal_auto(jl_value_t *v) {
-    return jl_cglobal(v, (jl_value_t*)jl_void_type);
+    return jl_cglobal(v, (jl_value_t*)jl_nothing_type);
 }
 
 static inline char signbitbyte(void *a, unsigned bytes) JL_NOTSAFEPOINT
@@ -210,6 +362,20 @@ static inline void name(unsigned osize, void *pa, void *pr) JL_NOTSAFEPOINT \
     OP((c_type*)pr, a); \
 }
 
+#define un_fintrinsic_half(OP, name) \
+static inline void name(unsigned osize, void *pa, void *pr) JL_NOTSAFEPOINT \
+{ \
+    uint16_t a = *(uint16_t*)pa; \
+    float A = __gnu_h2f_ieee(a); \
+    if (osize == 16) { \
+        float R; \
+        OP(&R, A); \
+        *(uint16_t*)pr = __gnu_f2h_ieee(R); \
+    } else { \
+        OP((uint16_t*)pr, A); \
+    } \
+    }
+
 // float or integer inputs
 // OP::Function macro(inputa, inputb)
 // name::unique string
@@ -221,6 +387,18 @@ static void jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb, void *p
     c_type a = *(c_type*)pa; \
     c_type b = *(c_type*)pb; \
     *(c_type*)pr = (c_type)OP(a, b); \
+}
+
+#define bi_intrinsic_half(OP, name) \
+static void jl_##name##16(unsigned runtime_nbits, void *pa, void *pb, void *pr) JL_NOTSAFEPOINT \
+{ \
+    uint16_t a = *(uint16_t*)pa; \
+    uint16_t b = *(uint16_t*)pb; \
+    float A = __gnu_h2f_ieee(a); \
+    float B = __gnu_h2f_ieee(b); \
+    runtime_nbits = 16; \
+    float R = OP(A, B); \
+    *(uint16_t*)pr = __gnu_f2h_ieee(R); \
 }
 
 // float or integer inputs, bool output
@@ -236,6 +414,18 @@ static int jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb) JL_NOTSA
     return OP(a, b); \
 }
 
+#define bool_intrinsic_half(OP, name) \
+static int jl_##name##16(unsigned runtime_nbits, void *pa, void *pb) JL_NOTSAFEPOINT \
+{ \
+    uint16_t a = *(uint16_t*)pa; \
+    uint16_t b = *(uint16_t*)pb; \
+    float A = __gnu_h2f_ieee(a); \
+    float B = __gnu_h2f_ieee(b); \
+    runtime_nbits = 16; \
+    return OP(A, B); \
+}
+
+
 // integer inputs, with precondition test
 // OP::Function macro(inputa, inputb)
 // name::unique string
@@ -246,10 +436,8 @@ static int jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb, void *pr
 { \
     c_type a = *(c_type*)pa; \
     c_type b = *(c_type*)pb; \
-    if (CHECK_OP(a, b)) \
-        return 1; \
     *(c_type*)pr = (c_type)OP(a, b); \
-    return 0; \
+    return CHECK_OP(c_type, a, b);    \
 }
 
 // float inputs
@@ -264,6 +452,20 @@ static void jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb, void *p
     c_type b = *(c_type*)pb; \
     c_type c = *(c_type*)pc; \
     *(c_type*)pr = (c_type)OP(a, b, c); \
+}
+
+#define ter_intrinsic_half(OP, name) \
+static void jl_##name##16(unsigned runtime_nbits, void *pa, void *pb, void *pc, void *pr) JL_NOTSAFEPOINT \
+{ \
+    uint16_t a = *(uint16_t*)pa; \
+    uint16_t b = *(uint16_t*)pb; \
+    uint16_t c = *(uint16_t*)pc; \
+    float A = __gnu_h2f_ieee(a); \
+    float B = __gnu_h2f_ieee(b); \
+    float C = __gnu_h2f_ieee(c); \
+    runtime_nbits = 16; \
+    float R = OP(A, B, C); \
+    *(uint16_t*)pr = __gnu_f2h_ieee(R); \
 }
 
 
@@ -363,7 +565,7 @@ static inline jl_value_t *jl_intrinsiclambda_ty1(jl_value_t *ty, void *pa, unsig
 
 static inline jl_value_t *jl_intrinsiclambda_u1(jl_value_t *ty, void *pa, unsigned osize, unsigned osize2, const void *voidlist)
 {
-    jl_ptls_t ptls = jl_get_ptls_states();
+    jl_task_t *ct = jl_current_task;
     intrinsic_u1_t op = select_intrinsic_u1(osize2, (const intrinsic_u1_t*)voidlist);
     uint64_t cnt = op(osize * host_char_bit, pa);
     // TODO: the following assume little-endian
@@ -371,7 +573,7 @@ static inline jl_value_t *jl_intrinsiclambda_u1(jl_value_t *ty, void *pa, unsign
     if (osize <= sizeof(cnt)) {
         return jl_new_bits(ty, &cnt);
     }
-    jl_value_t *newv = jl_gc_alloc(ptls, osize, ty);
+    jl_value_t *newv = jl_gc_alloc(ct->ptls, osize, ty);
     // perform zext, if needed
     memset((char*)jl_data_ptr(newv) + sizeof(cnt), 0, osize - sizeof(cnt));
     memcpy(jl_data_ptr(newv), &cnt, sizeof(cnt));
@@ -401,8 +603,6 @@ static inline jl_value_t *jl_intrinsic_cvt(jl_value_t *ty, jl_value_t *a, const 
     void *pr = alloca(osize);
     unsigned isize_bits = isize * host_char_bit;
     unsigned osize_bits = osize * host_char_bit;
-    if (aty == (jl_value_t*)jl_bool_type)
-       isize_bits = 1;
     op(isize_bits, pa, osize_bits, pr);
     return jl_new_bits(ty, pr);
 }
@@ -410,11 +610,12 @@ static inline jl_value_t *jl_intrinsic_cvt(jl_value_t *ty, jl_value_t *a, const 
 // floating point
 
 #define un_fintrinsic_withtype(OP, name) \
+un_fintrinsic_half(OP, jl_##name##16) \
 un_fintrinsic_ctype(OP, jl_##name##32, float) \
 un_fintrinsic_ctype(OP, jl_##name##64, double) \
 JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *ty, jl_value_t *a) \
 { \
-    return jl_fintrinsic_1(ty, a, #name, jl_##name##32, jl_##name##64); \
+    return jl_fintrinsic_1(ty, a, #name, jl_##name##16, jl_##name##32, jl_##name##64); \
 }
 
 #define un_fintrinsic(OP, name) \
@@ -426,19 +627,22 @@ JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a) \
 
 typedef void (fintrinsic_op1)(unsigned, void*, void*);
 
-static inline jl_value_t *jl_fintrinsic_1(jl_value_t *ty, jl_value_t *a, const char *name, fintrinsic_op1 *floatop, fintrinsic_op1 *doubleop)
+static inline jl_value_t *jl_fintrinsic_1(jl_value_t *ty, jl_value_t *a, const char *name, fintrinsic_op1 *halfop, fintrinsic_op1 *floatop, fintrinsic_op1 *doubleop)
 {
-    jl_ptls_t ptls = jl_get_ptls_states();
+    jl_task_t *ct = jl_current_task;
     if (!jl_is_primitivetype(jl_typeof(a)))
         jl_errorf("%s: value is not a primitive type", name);
     if (!jl_is_primitivetype(ty))
         jl_errorf("%s: type is not a primitive type", name);
     unsigned sz2 = jl_datatype_size(ty);
-    jl_value_t *newv = jl_gc_alloc(ptls, sz2, ty);
+    jl_value_t *newv = jl_gc_alloc(ct->ptls, sz2, ty);
     void *pa = jl_data_ptr(a), *pr = jl_data_ptr(newv);
     unsigned sz = jl_datatype_size(jl_typeof(a));
     switch (sz) {
     /* choose the right size c-type operation based on the input */
+    case 2:
+        halfop(sz2 * host_char_bit, pa, pr);
+        break;
     case 4:
         floatop(sz2 * host_char_bit, pa, pr);
         break;
@@ -446,7 +650,7 @@ static inline jl_value_t *jl_fintrinsic_1(jl_value_t *ty, jl_value_t *a, const c
         doubleop(sz2 * host_char_bit, pa, pr);
         break;
     default:
-        jl_errorf("%s: runtime floating point intrinsics are not implemented for bit sizes other than 32 and 64", name);
+        jl_errorf("%s: runtime floating point intrinsics are not implemented for bit sizes other than 16, 32 and 64", name);
     }
     return newv;
 }
@@ -591,9 +795,9 @@ static inline jl_value_t *jl_intrinsiclambda_checked(jl_value_t *ty, void *pa, v
     params[0] = ty;
     params[1] = (jl_value_t*)jl_bool_type;
     jl_datatype_t *tuptyp = jl_apply_tuple_type_v(params, 2);
-    JL_GC_PROMISE_ROOTED(tuptyp); // (JL_ALAWYS_LEAFTYPE)
-    jl_ptls_t ptls = jl_get_ptls_states();
-    jl_value_t *newv = jl_gc_alloc(ptls, ((jl_datatype_t*)tuptyp)->size, tuptyp);
+    JL_GC_PROMISE_ROOTED(tuptyp); // (JL_ALWAYS_LEAFTYPE)
+    jl_task_t *ct = jl_current_task;
+    jl_value_t *newv = jl_gc_alloc(ct->ptls, ((jl_datatype_t*)tuptyp)->size, tuptyp);
 
     intrinsic_checked_t op = select_intrinsic_checked(sz2, (const intrinsic_checked_t*)voidlist);
     int ovflw = op(sz * host_char_bit, pa, pb, jl_data_ptr(newv));
@@ -615,21 +819,25 @@ static inline jl_value_t *jl_intrinsiclambda_checkeddiv(jl_value_t *ty, void *pa
 // floating point
 
 #define bi_fintrinsic(OP, name) \
+    bi_intrinsic_half(OP, name) \
     bi_intrinsic_ctype(OP, name, 32, float) \
     bi_intrinsic_ctype(OP, name, 64, double) \
 JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b) \
 { \
-    jl_ptls_t ptls = jl_get_ptls_states();\
+    jl_task_t *ct = jl_current_task; \
     jl_value_t *ty = jl_typeof(a); \
     if (jl_typeof(b) != ty) \
         jl_error(#name ": types of a and b must match"); \
     if (!jl_is_primitivetype(ty)) \
         jl_error(#name ": values are not primitive types"); \
     int sz = jl_datatype_size(ty); \
-    jl_value_t *newv = jl_gc_alloc(ptls, sz, ty);          \
+    jl_value_t *newv = jl_gc_alloc(ct->ptls, sz, ty); \
     void *pa = jl_data_ptr(a), *pb = jl_data_ptr(b), *pr = jl_data_ptr(newv); \
     switch (sz) { \
     /* choose the right size c-type operation */ \
+    case 2: \
+        jl_##name##16(16, pa, pb, pr); \
+        break; \
     case 4: \
         jl_##name##32(32, pa, pb, pr); \
         break; \
@@ -637,12 +845,13 @@ JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b) \
         jl_##name##64(64, pa, pb, pr); \
         break; \
     default: \
-        jl_error(#name ": runtime floating point intrinsics are not implemented for bit sizes other than 32 and 64"); \
+        jl_error(#name ": runtime floating point intrinsics are not implemented for bit sizes other than 16, 32 and 64"); \
     } \
     return newv; \
 }
 
 #define bool_fintrinsic(OP, name) \
+    bool_intrinsic_half(OP, name) \
     bool_intrinsic_ctype(OP, name, 32, float) \
     bool_intrinsic_ctype(OP, name, 64, double) \
 JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b) \
@@ -657,6 +866,9 @@ JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b) \
     int cmp; \
     switch (sz) { \
     /* choose the right size c-type operation */ \
+    case 2: \
+        cmp = jl_##name##16(16, pa, pb); \
+        break; \
     case 4: \
         cmp = jl_##name##32(32, pa, pb); \
         break; \
@@ -670,21 +882,25 @@ JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b) \
 }
 
 #define ter_fintrinsic(OP, name) \
+    ter_intrinsic_half(OP, name) \
     ter_intrinsic_ctype(OP, name, 32, float) \
     ter_intrinsic_ctype(OP, name, 64, double) \
 JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b, jl_value_t *c) \
 { \
-    jl_ptls_t ptls = jl_get_ptls_states();\
+    jl_task_t *ct = jl_current_task; \
     jl_value_t *ty = jl_typeof(a); \
     if (jl_typeof(b) != ty || jl_typeof(c) != ty) \
         jl_error(#name ": types of a, b, and c must match"); \
     if (!jl_is_primitivetype(ty)) \
         jl_error(#name ": values are not primitive types"); \
-    int sz = jl_datatype_size(ty);                                      \
-    jl_value_t *newv = jl_gc_alloc(ptls, sz, ty);                       \
+    int sz = jl_datatype_size(ty); \
+    jl_value_t *newv = jl_gc_alloc(ct->ptls, sz, ty); \
     void *pa = jl_data_ptr(a), *pb = jl_data_ptr(b), *pc = jl_data_ptr(c), *pr = jl_data_ptr(newv); \
     switch (sz) { \
     /* choose the right size c-type operation */ \
+    case 2: \
+        jl_##name##16(16, pa, pb, pc, pr); \
+        break; \
     case 4: \
         jl_##name##32(32, pa, pb, pc, pr); \
         break; \
@@ -692,7 +908,7 @@ JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b, jl_value_t *c) 
         jl_##name##64(64, pa, pb, pc, pr); \
         break; \
     default: \
-        jl_error(#name ": runtime floating point intrinsics are not implemented for bit sizes other than 32 and 64"); \
+        jl_error(#name ": runtime floating point intrinsics are not implemented for bit sizes other than 16, 32 and 64"); \
     } \
     return newv; \
 }
@@ -758,7 +974,7 @@ typedef union {
 } bits64;
 
 #define fpiseq_n(c_type, nbits) \
-static inline int fpiseq##nbits(c_type a, c_type b) { \
+static inline int fpiseq##nbits(c_type a, c_type b) JL_NOTSAFEPOINT { \
     bits##nbits ua, ub; \
     ua.f = a; \
     ub.f = b; \
@@ -769,32 +985,11 @@ fpiseq_n(double, 64)
 #define fpiseq(a,b) \
     sizeof(a) == sizeof(float) ? fpiseq32(a, b) : fpiseq64(a, b)
 
-#define fpislt_n(c_type, nbits) \
-static inline int fpislt##nbits(c_type a, c_type b) { \
-    bits##nbits ua, ub; \
-    ua.f = a; \
-    ub.f = b; \
-    if (!isnan(a) && isnan(b)) \
-        return 1; \
-    if (isnan(a) || isnan(b)) \
-        return 0; \
-    if (ua.d >= 0 && ua.d < ub.d) \
-        return 1; \
-    if (ua.d < 0 && ua.ud > ub.ud) \
-        return 1; \
-    return 0; \
-}
-fpislt_n(float, 32)
-fpislt_n(double, 64)
-#define fpislt(a, b) \
-    sizeof(a) == sizeof(float) ? fpislt32(a, b) : fpislt64(a, b)
-
 bool_fintrinsic(eq,eq_float)
 bool_fintrinsic(ne,ne_float)
 bool_fintrinsic(lt,lt_float)
 bool_fintrinsic(le,le_float)
 bool_fintrinsic(fpiseq,fpiseq)
-bool_fintrinsic(fpislt,fpislt)
 
 // bitwise operators
 #define and_op(a,b) a & b
@@ -807,7 +1002,7 @@ bi_iintrinsic_fast(LLVMXor, xor_op, xor_int, u)
 bi_iintrinsic_cnvtb_fast(LLVMShl, shl_op, shl_int, u, 1)
 #define lshr_op(a,b) (b >= 8 * sizeof(a)) ? 0 : a >> b
 bi_iintrinsic_cnvtb_fast(LLVMLShr, lshr_op, lshr_int, u, 1)
-#define ashr_op(a,b) ((b < 0 || b >= 8 * sizeof(a)) ? a >> (8*sizeof(a) - 1) : a >> b)
+#define ashr_op(a,b) ((b < 0 || b >= 8 * sizeof(a)) ? a >> (8 * sizeof(a) - 1) : a >> b)
 bi_iintrinsic_cnvtb_fast(LLVMAShr, ashr_op, ashr_int, , 1)
 //#define bswap_op(a) __builtin_bswap(a)
 //un_iintrinsic_fast(LLVMByteSwap, bswap_op, bswap_int, u)
@@ -833,31 +1028,61 @@ cvt_iintrinsic(LLVMUItoFP, uitofp)
 cvt_iintrinsic(LLVMFPtoSI, fptosi)
 cvt_iintrinsic(LLVMFPtoUI, fptoui)
 
-#define fpcvt(pr, a) \
+#define fptrunc(pr, a) \
+        if (!(osize < 8 * sizeof(a))) \
+            jl_error("fptrunc: output bitsize must be < input bitsize"); \
+        else if (osize == 16) \
+            *(uint16_t*)pr = __gnu_f2h_ieee(a); \
+        else if (osize == 32) \
+            *(float*)pr = a; \
+        else if (osize == 64) \
+            *(double*)pr = a; \
+        else \
+            jl_error("fptrunc: runtime floating point intrinsics are not implemented for bit sizes other than 16, 32 and 64");
+#define fpext(pr, a) \
+        if (!(osize >= 8 * sizeof(a))) \
+            jl_error("fpext: output bitsize must be >= input bitsize"); \
         if (osize == 32) \
             *(float*)pr = a; \
         else if (osize == 64) \
             *(double*)pr = a; \
         else \
-            jl_error("fptrunc/fpext: runtime floating point intrinsics are not implemented for bit sizes other than 32 and 64");
-un_fintrinsic_withtype(fpcvt,fptrunc)
-un_fintrinsic_withtype(fpcvt,fpext)
+            jl_error("fpext: runtime floating point intrinsics are not implemented for bit sizes other than 32 and 64");
+un_fintrinsic_withtype(fptrunc,fptrunc)
+un_fintrinsic_withtype(fpext,fpext)
 
 // checked arithmetic
-#define check_sadd_int(a,b) \
-        /* this test is a reduction of (b > 0) ? (a + b > typemax(a)) : (a + b < typemin(a)) ==> overflow \
-         * where (a - a) == (typeof(a))0 */ \
-        (b > 0) ? (a > ~((a - a + 1) << (8 * sizeof(a) - 1)) - b) : (a < ((a - a + 1) << (8 * sizeof(a) - 1)) - b)
+/**
+ * s_typemin = - s_typemax - 1
+ * s_typemax = ((t)1 << (runtime_nbits - 1)) - 1
+ * u_typemin = 0
+ * u_typemax = ((t)1 << runtime_nbits) - 1
+ **/
+#define sTYPEMIN(t) -sTYPEMAX(t) - 1
+#define sTYPEMAX(t)                                                \
+    ((t)(8 * sizeof(a) == runtime_nbits                            \
+         ? ((((((t)1) << (8 * sizeof(t) - 2)) - 1) << 1) + 1)      \
+         : (  (((t)1) << (runtime_nbits - 1)) - 1)))
+
+#define uTYPEMIN(t) ((t)0)
+#define uTYPEMAX(t)                                             \
+    ((t)(8 * sizeof(t) == runtime_nbits                         \
+         ? (~((t)0)) : (~(((t)~((t)0)) << runtime_nbits))))
+#define check_sadd_int(t, a, b)                                         \
+        /* this test checks for (b >= 0) ? (a + b > typemax) : (a + b < typemin) ==> overflow */ \
+        (b >= 0) ? (a > sTYPEMAX(t) - b) : (a < sTYPEMIN(t) - b)
 checked_iintrinsic_fast(LLVMAdd_sov, check_sadd_int, add, checked_sadd_int,  )
-#define check_uadd_int(a,b) \
-        /* this test checks for (a + b) > typemax(a) ==> overflow */ \
-        a >= -b
+#define check_uadd_int(t, a, b)                                       \
+    /* this test checks for (a + b) > typemax(a) ==> overflow */      \
+    a > uTYPEMAX(t) - b
 checked_iintrinsic_fast(LLVMAdd_uov, check_uadd_int, add, checked_uadd_int, u)
-#define check_ssub_int(a,b) check_sadd_int(a,-b)
+#define check_ssub_int(t, a, b)                                         \
+    /* this test checks for (b >= 0) ? (a - b < typemin) : (a - b > typemax) ==> overflow */ \
+    (b >= 0) ? (a < sTYPEMIN(t) + b) : (a > sTYPEMAX(t) + b)
 checked_iintrinsic_fast(LLVMSub_sov, check_ssub_int, sub, checked_ssub_int,  )
-#define check_usub_int(a,b) \
-        /* this test checks for (a - b) < 0 ==> overflow */ \
-        a < b
+#define check_usub_int(t, a, b)                                   \
+    /* this test checks for (a - b) < typemin ==> overflow */     \
+    a < uTYPEMIN(t) + b
 checked_iintrinsic_fast(LLVMSub_uov, check_usub_int, sub, checked_usub_int, u)
 checked_iintrinsic_slow(LLVMMul_sov, checked_smul_int,  )
 checked_iintrinsic_slow(LLVMMul_uov, checked_umul_int, u)
@@ -871,15 +1096,13 @@ checked_iintrinsic_div(LLVMRem_uov, checked_urem_int, u)
 #define flipsign(a, b) \
         (b >= 0) ? a : -a
 bi_iintrinsic_fast(jl_LLVMFlipSign, flipsign, flipsign_int,  )
-#define abs_float(pr, a) *pr = fp_select(a, fabs)
-#define ceil_float(pr, a) *pr = fp_select(a, ceil)
-#define floor_float(pr, a) *pr = fp_select(a, floor)
-#define trunc_float(pr, a) *pr = fp_select(a, trunc)
-#define rint_float(pr, a) *pr = fp_select(a, rint)
-#define sqrt_float(pr, a) \
-        *pr = fp_select(a, sqrt)
-#define copysign_float(a, b) \
-        fp_select2(a, b, copysign)
+#define abs_float(pr, a)      *pr = fp_select(a, fabs)
+#define ceil_float(pr, a)     *pr = fp_select(a, ceil)
+#define floor_float(pr, a)    *pr = fp_select(a, floor)
+#define trunc_float(pr, a)    *pr = fp_select(a, trunc)
+#define rint_float(pr, a)     *pr = fp_select(a, rint)
+#define sqrt_float(pr, a)     *pr = fp_select(a, sqrt)
+#define copysign_float(a, b)  fp_select2(a, b, copysign)
 
 un_fintrinsic(abs_float,abs_float)
 bi_fintrinsic(copysign_float,copysign_float)
@@ -888,6 +1111,7 @@ un_fintrinsic(floor_float,floor_llvm)
 un_fintrinsic(trunc_float,trunc_llvm)
 un_fintrinsic(rint_float,rint_llvm)
 un_fintrinsic(sqrt_float,sqrt_llvm)
+un_fintrinsic(sqrt_float,sqrt_llvm_fast)
 
 JL_DLLEXPORT jl_value_t *jl_arraylen(jl_value_t *a)
 {

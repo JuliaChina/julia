@@ -19,7 +19,7 @@ extern "C" {
 // 1: at least one sigint is pending, only the sigint page is enabled.
 // 2: at least one sigint is pending, both safepoint pages are enabled.
 JL_DLLEXPORT sig_atomic_t jl_signal_pending = 0;
-volatile uint32_t jl_gc_running = 0;
+uint32_t jl_gc_running = 0;
 char *jl_safepoint_pages = NULL;
 // The number of safepoints enabled on the three pages.
 // The first page, is the SIGINT page, only used by the master thread.
@@ -110,19 +110,19 @@ void jl_safepoint_init(void)
 
 int jl_safepoint_start_gc(void)
 {
-#ifdef JULIA_ENABLE_THREADING
     if (jl_n_threads == 1) {
         jl_gc_running = 1;
         return 1;
     }
     // The thread should have set this already
-    assert(jl_get_ptls_states()->gc_state == JL_GC_STATE_WAITING);
+    assert(jl_current_task->ptls->gc_state == JL_GC_STATE_WAITING);
     jl_mutex_lock_nogc(&safepoint_lock);
     // In case multiple threads enter the GC at the same time, only allow
     // one of them to actually run the collection. We can't just let the
     // master thread do the GC since it might be running unmanaged code
     // and can take arbitrarily long time before hitting a safe point.
-    if (jl_atomic_compare_exchange(&jl_gc_running, 0, 1) != 0) {
+    uint32_t running = 0;
+    if (!jl_atomic_cmpswap(&jl_gc_running, &running, 1)) {
         jl_mutex_unlock_nogc(&safepoint_lock);
         jl_safepoint_wait_gc();
         return 0;
@@ -131,19 +131,11 @@ int jl_safepoint_start_gc(void)
     jl_safepoint_enable(2);
     jl_mutex_unlock_nogc(&safepoint_lock);
     return 1;
-#else
-    // For single thread, GC should not call itself (in finalizers) before
-    // setting `jl_gc_running` to false so this should never happen.
-    assert(!jl_gc_running);
-    jl_gc_running = 1;
-    return 1;
-#endif
 }
 
 void jl_safepoint_end_gc(void)
 {
     assert(jl_gc_running);
-#ifdef JULIA_ENABLE_THREADING
     if (jl_n_threads == 1) {
         jl_gc_running = 0;
         return;
@@ -160,24 +152,17 @@ void jl_safepoint_end_gc(void)
     jl_mach_gc_end();
 #  endif
     jl_mutex_unlock_nogc(&safepoint_lock);
-#else
-    jl_gc_running = 0;
-#endif
 }
 
 void jl_safepoint_wait_gc(void)
 {
-#ifdef JULIA_ENABLE_THREADING
     // The thread should have set this is already
-    assert(jl_get_ptls_states()->gc_state != 0);
-    // Use normal volatile load in the loop.
-    // Use a acquire load to make sure the GC result is visible on this thread.
-    while (jl_gc_running || jl_atomic_load_acquire(&jl_gc_running)) {
+    assert(jl_current_task->ptls->gc_state != 0);
+    // Use normal volatile load in the loop for speed until GC finishes.
+    // Then use an acquire load to make sure the GC result is visible on this thread.
+    while (jl_atomic_load_relaxed(&jl_gc_running) || jl_atomic_load_acquire(&jl_gc_running)) {
         jl_cpu_pause(); // yield?
     }
-#else
-    assert(0 && "No one should wait for the GC on another thread");
-#endif
 }
 
 void jl_safepoint_enable_sigint(void)
