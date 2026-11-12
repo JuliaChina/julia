@@ -7,8 +7,9 @@ module SharedArrays
 
 using Mmap, Distributed, Random
 
-import Base: length, size, ndims, IndexStyle, reshape, convert, deepcopy_internal,
-             show, getindex, setindex!, fill!, similar, reduce, map!, copyto!, unsafe_convert
+import Base: length, size, elsize, ndims, IndexStyle, reshape, convert, deepcopy_internal,
+             show, getindex, setindex!, fill!, similar, reduce, map!, copyto!, cconvert
+import Base: Array
 import Random
 using Serialization
 using Serialization: serialize_cycle_header, serialize_type, writetag, UNDEFREF_TAG, serialize, deserialize
@@ -16,7 +17,7 @@ import Serialization: serialize, deserialize
 import Distributed: RRID, procs, remotecall_fetch
 import Base.Filesystem: JL_O_CREAT, JL_O_RDWR, S_IRUSR, S_IWUSR
 
-export SharedArray, SharedVector, SharedMatrix, sdata, indexpids, localindices
+export SharedArray, SharedVector, SharedMatrix, sdata, indexpids, localindices, unshare!
 
 mutable struct SharedArray{T,N} <: DenseArray{T,N}
     id::RRID
@@ -106,26 +107,32 @@ function SharedArray{T,N}(dims::Dims{N}; init=false, pids=Int[]) where {T,N}
 
     pids, onlocalhost = shared_pids(pids)
 
-    local shm_seg_name = ""
     local s = Array{T}(undef, ntuple(d->0,N))
+    local io = nothing
     local S
     local shmmem_create_pid
     try
         # On OSX, the shm_seg_name length must be <= 31 characters (including the terminating NULL character)
-        shm_seg_name = "/jl$(lpad(string(getpid() % 10^6), 6, "0"))$(randstring(20))"
+        # Name only needs to be unique for the time it takes to instantiate the arrays; most likely case for
+        # collision is during unit testing when RNG state is re-used.
+        seg_name = "/jl" *
+            "$(lpad(string(getpid() % 10^6), 6, "0"))" *                               # Ensure uniqueness from other processes
+            "$(randstring(12))" *                                                      # Ensure uniqueness within process
+            "$(bytes2hex(reverse(reinterpret(NTuple{4, UInt8}, time_ns() % UInt32))))" # Guard against RNG reset over ~4 s
+
         if onlocalhost
             shmmem_create_pid = myid()
-            s = shm_mmap_array(T, dims, shm_seg_name, JL_O_CREAT | JL_O_RDWR)
+            s, io = shm_mmap_array(T, dims, seg_name, JL_O_CREAT | JL_O_RDWR, false)
         else
             # The shared array is created on a remote machine
             shmmem_create_pid = pids[1]
-            remotecall_fetch(pids[1]) do
-                shm_mmap_array(T, dims, shm_seg_name, JL_O_CREAT | JL_O_RDWR)
-                nothing
+            io = remotecall(pids[1]) do
+                last(shm_mmap_array(T, dims, seg_name, JL_O_CREAT | JL_O_RDWR, false))
             end
+            wait(io)
         end
 
-        func_mapshmem = () -> shm_mmap_array(T, dims, shm_seg_name, JL_O_RDWR)
+        func_mapshmem = () -> first(shm_mmap_array(T, dims, seg_name, JL_O_RDWR, true))
 
         refs = Vector{Future}(undef, length(pids))
         for (i, p) in enumerate(pids)
@@ -140,24 +147,33 @@ function SharedArray{T,N}(dims::Dims{N}; init=false, pids=Int[]) where {T,N}
         # All good, immediately unlink the segment.
         if (prod(dims) > 0) && (sizeof(T) > 0)
             if onlocalhost
-                rc = shm_unlink(shm_seg_name)
+                close(io)
             else
-                rc = remotecall_fetch(shm_unlink, shmmem_create_pid, shm_seg_name)
+                remotecall_fetch(shmmem_create_pid, io) do fut
+                    close(fetch(fut))
+                end
             end
-            systemerror("Error unlinking shmem segment " * shm_seg_name, rc != 0)
         end
-        S = SharedArray{T,N}(dims, pids, refs, shm_seg_name, s)
+        S = SharedArray{T,N}(dims, pids, refs, seg_name, s)
         initialize_shared_array(S, onlocalhost, init, pids)
-        shm_seg_name = ""
+        io = nothing
 
     finally
-        if !isempty(shm_seg_name)
-            remotecall_fetch(shm_unlink, shmmem_create_pid, shm_seg_name)
+        if io !== nothing && @isdefined shmmem_create_pid
+            if onlocalhost
+                close(io)
+            else
+                remotecall_fetch(shmmem_create_pid, io) do fut
+                    close(fetch(fut))
+                end
+            end
         end
     end
     S
 end
 
+SharedArray{T,N}(d::NTuple{N,Integer}; kwargs...) where {T,N} =
+    SharedArray{T,N}(map(Int, d); kwargs...)
 SharedArray{T,N}(I::Integer...; kwargs...) where {T,N} =
     SharedArray{T,N}(I; kwargs...)
 SharedArray{T}(d::NTuple; kwargs...) where {T} =
@@ -184,39 +200,37 @@ function SharedArray{T,N}(filename::AbstractString, dims::NTuple{N,Int}, offset:
 
     # If not supplied, determine the appropriate mode
     have_file = onlocalhost ? isfile(filename) : remotecall_fetch(isfile, pids[1], filename)
-    if mode === nothing
-        mode = have_file ? "r+" : "w+"
-    end
-    workermode = mode == "w+" ? "r+" : mode  # workers don't truncate!
+    mode_val = mode === nothing ? (have_file ? "r+" : "w+") : mode
+    workermode = mode_val == "w+" ? "r+" : mode_val  # workers don't truncate!
 
     # Ensure the file will be readable
-    if !(mode in ("r", "r+", "w+", "a+"))
-        throw(ArgumentError("mode must be readable, but $mode is not"))
+    if !(mode_val in ("r", "r+", "w+", "a+"))
+        throw(ArgumentError("mode must be readable, but $mode_val is not"))
     end
     if init !== false
         typeassert(init, Function)
-        if !(mode in ("r+", "w+", "a+"))
-            throw(ArgumentError("cannot initialize unwritable array (mode = $mode)"))
+        if !(mode_val in ("r+", "w+", "a+"))
+            throw(ArgumentError("cannot initialize unwritable array (mode = $mode_val)"))
         end
     end
-    if mode == "r" && !isfile(filename)
-        throw(ArgumentError("file $filename does not exist, but mode $mode cannot create it"))
+    if mode_val == "r" && !isfile(filename)
+        throw(ArgumentError("file $filename does not exist, but mode $mode_val cannot create it"))
     end
 
     # Create the file if it doesn't exist, map it if it does
     refs = Vector{Future}(undef, length(pids))
     func_mmap = mode -> open(filename, mode) do io
-        Mmap.mmap(io, Array{T,N}, dims, offset; shared=true)
+        mmap(io, Array{T,N}, dims, offset; shared=true)
     end
     s = Array{T}(undef, ntuple(d->0,N))
     if onlocalhost
-        s = func_mmap(mode)
+        s = func_mmap(mode_val)
         refs[1] = remotecall(pids[1]) do
             func_mmap(workermode)
         end
     else
         refs[1] = remotecall_wait(pids[1]) do
-            func_mmap(mode)
+            func_mmap(mode_val)
         end
     end
 
@@ -262,27 +276,44 @@ function initialize_shared_array(S, onlocalhost, init, pids)
 end
 
 function finalize_refs(S::SharedArray{T,N}) where T where N
-    if length(S.pids) > 0
-        for r in S.refs
-            finalize(r)
-        end
-        empty!(S.pids)
-        empty!(S.refs)
-        init_loc_flds(S)
-        S.s = Array{T}(undef, ntuple(d->0,N))
-        delete!(sa_refs, S.id)
+    for r in S.refs
+        finalize(r)
     end
+    empty!(S.pids)
+    empty!(S.refs)
+    init_loc_flds(S)
+    S.s = Array{T}(undef, ntuple(d->0,N))
+    S.dims = ntuple(d->0,N)
+    delete!(sa_refs, S.id)
     S
 end
 
+"""
+    SharedVector
 
+A one-dimensional [`SharedArray`](@ref).
+"""
 const SharedVector{T} = SharedArray{T,1}
+"""
+    SharedMatrix
+
+A two-dimensional [`SharedArray`](@ref).
+"""
 const SharedMatrix{T} = SharedArray{T,2}
 
-length(S::SharedArray) = prod(S.dims)
+SharedVector(A::Vector) = SharedArray(A)
+SharedMatrix(A::Matrix) = SharedArray(A)
+
 size(S::SharedArray) = S.dims
-ndims(S::SharedArray) = length(S.dims)
+elsize(::Type{SharedArray{T,N}}) where {T,N} = elsize(Array{T,N}) # aka fieldtype(T, :s)
 IndexStyle(::Type{<:SharedArray}) = IndexLinear()
+
+function local_array_by_id(refid)
+    if isa(refid, Future)
+        refid = remoteref_id(refid)
+    end
+    fetch(channel_from_id(refid))
+end
 
 function reshape(a::SharedArray{T}, dims::NTuple{N,Int}) where {T,N}
     if length(a) != prod(dims)
@@ -290,8 +321,8 @@ function reshape(a::SharedArray{T}, dims::NTuple{N,Int}) where {T,N}
     end
     refs = Vector{Future}(undef, length(a.pids))
     for (i, p) in enumerate(a.pids)
-        refs[i] = remotecall(p, a.refs[i], dims) do r,d
-            reshape(fetch(r),d)
+        refs[i] = remotecall(p, a.refs[i], dims) do r, d
+            reshape(local_array_by_id(r), d)
         end
     end
 
@@ -310,7 +341,7 @@ procs(S::SharedArray) = S.pids
 """
     indexpids(S::SharedArray)
 
-Returns the current worker's index in the list of workers
+Return the current worker's index in the list of workers
 mapping the `SharedArray` (i.e. in the same list returned by `procs(S)`), or
 0 if the `SharedArray` is not mapped locally.
 """
@@ -319,7 +350,7 @@ indexpids(S::SharedArray) = S.pidx
 """
     sdata(S::SharedArray)
 
-Returns the actual `Array` object backing `S`.
+Return the actual `Array` object backing `S`.
 """
 sdata(S::SharedArray) = S.s
 sdata(A::AbstractArray) = A
@@ -327,7 +358,7 @@ sdata(A::AbstractArray) = A
 """
     localindices(S::SharedArray)
 
-Returns a range describing the "default" indices to be handled by the
+Return a range describing the "default" indices to be handled by the
 current process.  This range should be interpreted in the sense of
 linear indexing, i.e., as a sub-range of `1:length(S)`.  In
 multi-process contexts, returns an empty range in the parent process
@@ -340,8 +371,8 @@ for each worker process.
 """
 localindices(S::SharedArray) = S.pidx > 0 ? range_1dim(S, S.pidx) : 1:0
 
-unsafe_convert(::Type{Ptr{T}}, S::SharedArray{T}) where {T} = unsafe_convert(Ptr{T}, sdata(S))
-unsafe_convert(::Type{Ptr{T}}, S::SharedArray   ) where {T} = unsafe_convert(Ptr{T}, sdata(S))
+cconvert(::Type{Ptr{T}}, S::SharedArray{T}) where {T} = cconvert(Ptr{T}, sdata(S))
+cconvert(::Type{Ptr{T}}, S::SharedArray   ) where {T} = cconvert(Ptr{T}, sdata(S))
 
 function SharedArray(A::Array)
     S = SharedArray{eltype(A),ndims(A)}(size(A))
@@ -356,12 +387,17 @@ function SharedArray{TS,N}(A::Array{TA,N}) where {TS,TA,N}
     copyto!(S, A)
 end
 
-convert(T::Type{<:SharedArray}, a::Array) = T(a)
+convert(T::Type{<:SharedArray}, a::Array) = T(a)::T
 
-function deepcopy_internal(S::SharedArray, stackdict::IdDict)
+function deepcopy_internal(S::SharedArray{T,N}, stackdict::IdDict) where {T,N}
     haskey(stackdict, S) && return stackdict[S]
-    R = SharedArray{eltype(S),ndims(S)}(size(S); pids = S.pids)
-    copyto!(sdata(R), sdata(S))
+    if isempty(procs(S))
+        R = SharedArray{T,N}(size(S), Int[], Future[], S.segname, copy(S.s))
+        finalizer(finalize_refs, R)
+    else
+        R = SharedArray{T,N}(size(S); pids = procs(S))
+        copyto!(sdata(R), sdata(S))
+    end
     stackdict[S] = R
     return R
 end
@@ -371,7 +407,7 @@ function shared_pids(pids)
         # only use workers on the current host
         pids = procs(myid())
         if length(pids) > 1
-            pids = filter(x -> x != 1, pids)
+            pids = filter(!=(1), pids)
         end
 
         onlocalhost = true
@@ -408,13 +444,7 @@ sub_1dim(S::SharedArray, pidx) = view(S.s, range_1dim(S, pidx))
 function init_loc_flds(S::SharedArray{T,N}, empty_local=false) where T where N
     if myid() in S.pids
         S.pidx = findfirst(isequal(myid()), S.pids)
-        if isa(S.refs[1], Future)
-            refid = remoteref_id(S.refs[S.pidx])
-        else
-            refid = S.refs[S.pidx]
-        end
-        c = channel_from_id(refid)
-        S.s = fetch(c)
+        S.s = local_array_by_id(S.refs[S.pidx])
         S.loc_subarr_1d = sub_1dim(S, S.pidx)
     else
         S.pidx = 0
@@ -432,7 +462,7 @@ function serialize(s::AbstractSerializer, S::SharedArray)
     serialize_cycle_header(s, S) && return
 
     destpid = worker_id_from_socket(s.io)
-    if S.id.whence == destpid
+    if S.id.whence == destpid && !isempty(S.pids)
         # The shared array was created from destpid, hence a reference to it
         # must be available at destpid.
         serialize(s, true)
@@ -444,9 +474,9 @@ function serialize(s::AbstractSerializer, S::SharedArray)
     for n in fieldnames(SharedArray)
         if n in [:s, :pidx, :loc_subarr_1d]
             writetag(s.io, UNDEFREF_TAG)
-        elseif n == :refs
+        elseif n === :refs
             v = getfield(S, n)
-            if isa(v[1], Future)
+            if !isempty(v) && isa(v[1], Future)
                 # convert to ids to avoid distributed GC overhead
                 ids = [remoteref_id(x) for x in v]
                 serialize(s, ids)
@@ -475,7 +505,7 @@ function deserialize(s::AbstractSerializer, t::Type{<:SharedArray})
 end
 
 function show(io::IO, S::SharedArray)
-    if length(S.s) > 0
+    if length(S.s) > 0 || isempty(S.pids)
         invoke(show, Tuple{IO,DenseArray}, io, S)
     else
         show(io, remotecall_fetch(sharr->sharr.s, S.pids[1], S))
@@ -483,11 +513,11 @@ function show(io::IO, S::SharedArray)
 end
 
 function show(io::IO, mime::MIME"text/plain", S::SharedArray)
-    if length(S.s) > 0
+    if length(S.s) > 0 || isempty(S.pids)
         invoke(show, Tuple{IO,MIME"text/plain",DenseArray}, io, MIME"text/plain"(), S)
     else
         # retrieve from the first worker mapping the array.
-        println(io, summary(S), ":")
+        summary(io, S); println(io, ":")
         Base.print_array(io, remotecall_fetch(sharr->sharr.s, S.pids[1], S))
     end
 end
@@ -495,9 +525,9 @@ end
 Array(S::SharedArray) = S.s
 
 # pass through getindex and setindex! - unlike DArrays, these always work on the complete array
-getindex(S::SharedArray, i::Real) = getindex(S.s, i)
+Base.@propagate_inbounds getindex(S::SharedArray, i::Real) = getindex(S.s, i)
 
-setindex!(S::SharedArray, x, i::Real) = setindex!(S.s, x, i)
+Base.@propagate_inbounds setindex!(S::SharedArray, x, i::Real) = setindex!(S.s, x, i)
 
 function fill!(S::SharedArray, v)
     vT = convert(eltype(S), v)
@@ -554,8 +584,12 @@ similar(S::SharedArray, T::Type) = similar(S.s, T, size(S))
 similar(S::SharedArray, dims::Dims) = similar(S.s, eltype(S), dims)
 similar(S::SharedArray) = similar(S.s, eltype(S), size(S))
 
-reduce(f, S::SharedArray) =
-    mapreduce(fetch, f, Any[ @spawnat p reduce(f, S.loc_subarr_1d) for p in procs(S) ])
+function reduce(f, S::SharedArray)
+    isempty(S) && return reduce(f, S.s)
+    # skip workers holding no elements, since many functions can't reduce an empty collection
+    return mapreduce(fetch, f, Any[ @spawnat p reduce(f, S.loc_subarr_1d)
+                                    for (i, p) in enumerate(procs(S)) if !isempty(range_1dim(S, i)) ])
+end
 
 reduce(::typeof(vcat), S::SharedVector) = invoke(reduce, Tuple{Any,SharedArray}, vcat, S)
 reduce(::typeof(hcat), S::SharedVector) = invoke(reduce, Tuple{Any,SharedArray}, hcat, S)
@@ -578,6 +612,7 @@ copyto!(S::SharedArray, A::Array) = (copyto!(S.s, A); S)
 
 function copyto!(S::SharedArray, R::SharedArray)
     length(S) == length(R) || throw(BoundsError())
+    isempty(S) && return S
     ps = intersect(procs(S), procs(R))
     isempty(ps) && throw(ArgumentError("source and destination arrays don't share any process"))
     l = length(S)
@@ -596,15 +631,71 @@ function copyto!(S::SharedArray, R::SharedArray)
     return S
 end
 
+"""
+    unshare!(S::SharedArray)
+
+Release resources from workers and make the memory no longer available to them. The array is still usable
+on the host process.
+
+Must be called from the process that created `S`; calling it from any other process throws an `ArgumentError`.
+
+!!! warning
+     The workers' mappings are revoked eagerly. Accessing the array's data on a worker
+     afterwards is undefined behavior.
+
+!!! note
+     Relying on the finalizers to perform cleanup requires multiple GC rounds to release the underlying
+     mmap. Call this function proactively to ensure a single GC round is sufficient.
+
+To also release the current process's own mapping, use `close(S)`.
+"""
+function unshare!(S::SharedArray)
+    if !isempty(S.pids)
+        myid() == S.id.whence || throw(ArgumentError("unshare! must be called from the process that created the SharedArray"))
+        @sync begin
+            for i in eachindex(S.pids)
+                S.pidx == i && continue
+                @async remotecall_wait(S.pids[i], S.refs[i]) do r
+                    Mmap.munmap!(local_array_by_id(r))
+                end
+            end
+        end
+        empty!(S.pids)
+        empty!(S.refs)
+        init_loc_flds(S)
+        return nothing
+    end
+end
+
+"""
+    close(S::SharedArray)
+
+Eagerly release the resources referenced through `S`, unmapping its shared memory on every
+mapped process, including the current one. Afterwards `S` no longer refers to that data and
+neither it nor any alias (e.g. from [`sdata`](@ref)) may be used on any process. Garbage
+collection performs the same cleanup once the array and all aliases are unreachable; use
+`close` when the release must be deterministic, e.g. before deleting the file backing a
+file-backed `SharedArray`.
+
+Like [`unshare!`](@ref), must be called from the process that created `S`. To revoke only
+the workers' access, keeping the array usable on the current process, use `unshare!` instead.
+"""
+function Base.close(S::SharedArray)
+    unshare!(S)
+    isempty(S.s) || Mmap.munmap!(S.s)
+    finalize_refs(S)
+    return nothing
+end
+
 function print_shmem_limits(slen)
     try
         if Sys.islinux()
-            pfx = "kernel"
+            return # Not relevant to Linux, which uses a tmpfs-backed system
         elseif Sys.isapple()
             pfx = "kern.sysv"
-        elseif Sys.KERNEL == :FreeBSD || Sys.KERNEL == :DragonFly
+        elseif Sys.KERNEL === :FreeBSD || Sys.KERNEL === :DragonFly
             pfx = "kern.ipc"
-        elseif Sys.KERNEL == :OpenBSD
+        elseif Sys.KERNEL === :OpenBSD
             pfx = "kern.shminfo"
         else
             # seems NetBSD does not have *.shmall
@@ -622,68 +713,34 @@ function print_shmem_limits(slen)
             "\nIf not, increase system limits and try again."
         )
     catch e
-        nothing # Ignore any errors in this
+        @warn "Unable to print shared memory limits."
     end
 end
 
 # utilities
-function shm_mmap_array(T, dims, shm_seg_name, mode)
-    local s = nothing
-    local A = nothing
-
+function shm_mmap_array(T, dims, shm_seg_name, mode, closeio)
     if (prod(dims) == 0) || (sizeof(T) == 0)
-        return Array{T}(undef, dims)
+        return Array{T}(undef, dims), nothing
     end
-
     try
-        A = _shm_mmap_array(T, dims, shm_seg_name, mode)
-    catch e
+        return _shm_mmap_array(T, dims, shm_seg_name, mode, closeio)
+    catch
         print_shmem_limits(prod(dims)*sizeof(T))
-        rethrow(e)
-
-    finally
-        if s !== nothing
-            close(s)
-        end
+        rethrow()
     end
-    A
 end
 
-
-# platform-specific code
-
-if Sys.iswindows()
-function _shm_mmap_array(T, dims, shm_seg_name, mode)
+function _shm_mmap_array(T, dims, shm_seg_name, mode, closeio)
     readonly = !((mode & JL_O_RDWR) == JL_O_RDWR)
     create = (mode & JL_O_CREAT) == JL_O_CREAT
-    s = Mmap.Anonymous(shm_seg_name, readonly, create)
-    Mmap.mmap(s, Array{T,length(dims)}, dims, zero(Int64))
-end
-
-# no-op in windows
-shm_unlink(shm_seg_name) = 0
-
-else # !windows
-function _shm_mmap_array(T, dims, shm_seg_name, mode)
-    fd_mem = shm_open(shm_seg_name, mode, S_IRUSR | S_IWUSR)
-    systemerror("shm_open() failed for " * shm_seg_name, fd_mem < 0)
-
-    s = fdio(fd_mem, true)
-
-    # On OSX, ftruncate must to used to set size of segment, just lseek does not work.
-    # and only at creation time
-    if (mode & JL_O_CREAT) == JL_O_CREAT
-        rc = ccall(:jl_ftruncate, Cint, (Cint, Int64), fd_mem, prod(dims)*sizeof(T))
-        systemerror("ftruncate() failed for shm segment " * shm_seg_name, rc != 0)
+    io = open(Mmap.SharedMemory, shm_seg_name, prod(dims) * sizeof(T); readonly, create)
+    A = mmap(io, Array{T,length(dims)}, dims, zero(Int64))
+    # Workers can immediately close the virtual file after mapping
+    if closeio
+        close(io)
+        io = nothing
     end
-
-    Mmap.mmap(s, Array{T,length(dims)}, dims, zero(Int64); grow=false)
+    return A, io
 end
-
-shm_unlink(shm_seg_name) = ccall(:shm_unlink, Cint, (Cstring,), shm_seg_name)
-shm_open(shm_seg_name, oflags, permissions) = ccall(:shm_open, Cint,
-    (Cstring, Cint, Base.Cmode_t), shm_seg_name, oflags, permissions)
-
-end # os-test
 
 end # module

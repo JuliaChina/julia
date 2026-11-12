@@ -2,102 +2,549 @@
 
 ## shell-like command parsing ##
 
-const shell_special = "#{}()[]<>|&*?~;"
+const shell_special = "#()[]<>|&*?;"
 
-# strips the end but respects the space when the string ends with "\\ "
+# Characters that need quoting in backtick display.  Includes {} so that a Cmd
+# with literal braces round-trips correctly (they would otherwise be
+# brace-expanded when the displayed string is re-parsed).
+const _shell_display_special = shell_special * "{}"
+
+(@doc raw"""
+    rstrip_shell(s::AbstractString)
+
+Strip trailing whitespace from a shell command string, while respecting a trailing backslash followed by a space ("\\ ").
+
+```jldoctest
+julia> Base.rstrip_shell("echo 'Hello World' \\ ")
+"echo 'Hello World' \\ "
+
+julia> Base.rstrip_shell("echo 'Hello World'    ")
+"echo 'Hello World'"
+```
+"""
 function rstrip_shell(s::AbstractString)
     c_old = nothing
     for (i, c) in Iterators.reverse(pairs(s))
+        i::Int; c::AbstractChar
         ((c == '\\') && c_old == ' ') && return SubString(s, 1, i+1)
         isspace(c) || return SubString(s, 1, i)
         c_old = c
     end
     SubString(s, 1, 0)
+end)
+
+# Scan from position `start` in string `s` (after an opening `{`) to find the
+# matching `}`. Returns `(found_close, has_comma, has_dotdot, has_space)`.
+function _scan_brace(s, start)
+    depth = 1
+    has_comma = false
+    has_dotdot = false
+    has_space = false
+    pos = start
+    @inbounds while pos <= lastindex(s)
+        c = s[pos]
+        if c == '\\'
+            pos = nextind(s, pos)  # skip escaped char
+        elseif c == '\''
+            # skip single-quoted content
+            pos = nextind(s, pos)
+            while pos <= lastindex(s) && s[pos] != '\''
+                pos = nextind(s, pos)
+            end
+        elseif c == '"'
+            # skip double-quoted content
+            pos = nextind(s, pos)
+            while pos <= lastindex(s)
+                s[pos] == '"' && break
+                s[pos] == '\\' && (pos = nextind(s, pos))
+                pos = nextind(s, pos)
+            end
+        elseif c == '$' && pos < lastindex(s) && s[nextind(s, pos)] == '('
+            # skip $(expr) — count parentheses
+            pos = nextind(s, nextind(s, pos))
+            pdepth = 1
+            while pos <= lastindex(s) && pdepth > 0
+                s[pos] == '(' && (pdepth += 1)
+                s[pos] == ')' && (pdepth -= 1)
+                pdepth > 0 && (pos = nextind(s, pos))
+            end
+        elseif isspace(c)
+            has_space = true
+        elseif c == '.' && depth == 1 && pos < lastindex(s) && s[nextind(s, pos)] == '.'
+            has_dotdot = true
+            pos = nextind(s, pos)  # skip second dot
+        elseif c == '{'
+            depth += 1
+        elseif c == '}'
+            depth -= 1
+            depth == 0 && return (true, has_comma, has_dotdot, has_space)
+        elseif c == ',' && depth == 1
+            has_comma = true
+        end
+        pos = nextind(s, pos)
+    end
+    return (false, false, false, false)
 end
 
+# Expand a brace range pattern like "1..10", "a..z", "1..10..2", or "01..10".
+# Returns a `Vector{String}`, or `nothing` if the content is not a valid range.
+# As in bash, the sign of the step is ignored: the direction comes from the endpoints.
+# The vector is spliced into the parsed expression as a value, so that a range of any
+# length takes the same `arg_gen` method instead of specializing on a tuple type.
+function _brace_range_expand(content::AbstractString)
+    parts = split(content, "..")
+    (length(parts) == 2 || length(parts) == 3) || return nothing
+    a_str, b_str = parts[1], parts[2]
+    step_str = length(parts) == 3 ? parts[3] : nothing
 
-# needs to be factored out so depwarn only warns once
-# when removed, also need to update shell_escape for a Cmd to pass shell_special
-# and may want to use it in the test for #10120 (currently the implementation is essentially copied there)
-@noinline warn_shell_special(special) =
-    depwarn("special characters \"$special\" should now be quoted in commands", :warn_shell_special)
+    # Character range: single ASCII letter endpoints, both same case
+    if length(a_str) == 1 && length(b_str) == 1
+        a_ch, b_ch = a_str[1], b_str[1]
+        if isletter(a_ch) && isletter(b_ch) && isascii(a_ch) && isascii(b_ch)
+            if isuppercase(a_ch) != isuppercase(b_ch)
+                return nothing  # cross-case ranges like {a..Z} are an error
+            end
+            step = 1
+            if step_str !== nothing
+                step = tryparse(Int, step_str)
+                step === nothing && return nothing
+                step == 0 && return nothing
+            end
+            step = a_ch <= b_ch ? abs(step) : -abs(step)
+            return String[string(c) for c in a_ch:step:b_ch]
+        end
+    end
 
-function shell_parse(str::AbstractString, interpolate::Bool=true;
-                     special::AbstractString="")
-    s::SubString = SubString(str, firstindex(str))
+    # Integer range
+    a = tryparse(Int, a_str)
+    b = tryparse(Int, b_str)
+    (a === nothing || b === nothing) && return nothing
+    step = 1
+    if step_str !== nothing
+        step = tryparse(Int, step_str)
+        step === nothing && return nothing
+        step == 0 && return nothing
+    end
+    step = a <= b ? abs(step) : -abs(step)
+
+    # Explicit plus sign: if either endpoint starts with +, show + on positive values.
+    show_plus = (a_str[1] == '+') || (b_str[1] == '+')
+
+    # Zero-padding: if either endpoint has leading zeros (including after a
+    # sign character), pad all values to the same total width (matching bash/zsh).
+    _has_leading_zero(s) = (length(s) > 1 && s[1] == '0') ||
+                           (length(s) > 2 && s[1] in ('-', '+') && s[2] == '0')
+    pad = (_has_leading_zero(a_str) || _has_leading_zero(b_str)) ?
+        max(length(a_str), length(b_str)) : 0
+
+    if pad > 0
+        return String[let s = string(abs(n))
+            if n < 0
+                "-" * lpad(s, pad - 1, '0')
+            elseif show_plus
+                "+" * lpad(s, pad - 1, '0')
+            else
+                lpad(s, pad, '0')
+            end
+        end for n in a:step:b]
+    elseif show_plus
+        return String[(n < 0 ? string(n) : "+" * string(n)) for n in a:step:b]
+    else
+        return String[string(n) for n in a:step:b]
+    end
+end
+
+# Convert a list of parts (strings and expressions) for one brace alternative
+# into a single expression suitable for inclusion in a tuple.
+function _brace_alt_expr(parts)
+    if isempty(parts)
+        return ""
+    end
+    all_strings = all(p -> isa(p, AbstractString), parts)
+    if all_strings
+        return String(join(parts))
+    elseif length(parts) == 1
+        return parts[1]
+    else
+        cleaned = Any[isa(p, AbstractString) ? String(p) : p for p in parts]
+        return Expr(:call, GlobalRef(Base, :cmd_interpolate), cleaned...)
+    end
+end
+
+shell_parse(str::AbstractString, interpolate::Bool=true;
+            special::AbstractString="", filename="none") =
+    __repl_entry_shell_parse(str, interpolate, special, filename)
+
+# N.B.: Any functions starting with __repl_entry cut off backtraces when printing in the REPL.
+function __repl_entry_shell_parse(str::AbstractString, interpolate::Bool, special::AbstractString, filename)
+    last_arg = firstindex(str) # N.B.: This is used by REPLCompletions
+    s = SubString(str, last_arg)
     s = rstrip_shell(lstrip(s))
 
-    # N.B.: This is used by REPLCompletions
-    last_parse = 0:-1
-    isempty(s) && return interpolate ? (Expr(:tuple,:()),last_parse) : ([],last_parse)
+    isempty(s) && return interpolate ? (Expr(:tuple,:()), last_arg) : ([], last_arg)
 
     in_single_quotes = false
     in_double_quotes = false
 
-    args::Vector{Any} = []
-    arg::Vector{Any} = []
+    args = []
+    arg = []
     i = firstindex(s)
     st = Iterators.Stateful(pairs(s))
+    update_last_arg = false # true after spaces or interpolate
+    word_has_special = false # true if current word contains any quoted/escaped content
 
-    function update_arg(x)
+    # Pipeline/redirection state (used only when interpolate=true).
+    # pipeline_parts accumulates completed segments as (seg_tuple, stdin, stdout, stdout_append, stderr, stderr_append).
+    pipeline_parts = []
+    seg_stdin = nothing        # stdin redirect expression for current segment
+    seg_stdout = nothing       # stdout redirect expression for current segment
+    seg_stdout_append = false  # true if stdout redirect is >> (append mode)
+    seg_stderr = nothing       # stderr redirect expression for current segment
+    seg_stderr_append = false  # true if stderr redirect is >> (append mode)
+    redirect_mode = :none      # :none | :stdin | :stdout | :stderr
+
+    function push_nonempty!(list, x)
         if !isa(x,AbstractString) || !isempty(x)
-            push!(arg, x)
+            push!(list, x)
         end
+        return nothing
     end
-    function consume_upto(j)
-        update_arg(s[i:prevind(s, j)])
-        i = something(peek(st), (lastindex(s)+1,'\0'))[1]
+    function consume_upto!(list, s, i, j)
+        push_nonempty!(list, s[i:prevind(s, j)::Int])
+        something(peek(st), lastindex(s)::Int+1 => '\0').first::Int
     end
-    function append_arg()
-        if isempty(arg); arg = Any["",]; end
-        push!(args, arg)
-        arg = []
+    function append_2to1!(list, innerlist)
+        if isempty(innerlist); push!(innerlist, ""); end
+        push!(list, copy(innerlist))
+        empty!(innerlist)
+    end
+
+    C = eltype(str)
+    P = Pair{Int,C}
+
+    # Parse the expression following a `$` interpolation marker.
+    # Pops the first char of the expression from `st`, parses the atom, advances
+    # `s` past it, and resets `st`. Returns `(expr, new_s, interp_pos)` where
+    # `interp_pos` is the absolute position in `str` (for REPLCompletions).
+    function parse_dollar_interp(st, s)
+        isempty(st) && error("\$ right before end of command")
+        stpos, c = popfirst!(st)::P
+        isspace(c) && error("space not allowed right after \$")
+        if startswith(SubString(s, stpos), "var\"")
+            # Disallow var"#" syntax in cmd interpolations.
+            # TODO: Allow only identifiers after the $ for consistency with
+            # string interpolation syntax (see #3150)
+            atom, j = :var, stpos+3
+        else
+            # use parseatom instead of parse to respect filename (#28188)
+            atom, j = Meta.parseatom(s, stpos, filename=filename, mod=Base)
+        end
+        interp_pos = stpos + s.offset
+        s = SubString(s, j)
+        Iterators.reset!(st, pairs(s))
+        return atom, s, interp_pos
+    end
+
+    # Convert a word (list of string/expr parts) to a redirect filename expression.
+    function redirect_word_expr(word)
+        if length(word) == 1 && isa(word[1], AbstractString)
+            return String(word[1])
+        elseif length(word) == 1
+            return Expr(:call, GlobalRef(Base, :cmd_redirect_target), word[1])
+        else
+            return Expr(:call, GlobalRef(Base, :cmd_interpolate), word...)
+        end
     end
 
     for (j, c) in st
+        j, c = j::Int, c::C
         if !in_single_quotes && !in_double_quotes && isspace(c)
-            consume_upto(j)
-            append_arg()
+            update_last_arg = true
+            i = consume_upto!(arg, s, i, j)
+            if redirect_mode != :none && (!isempty(arg) || word_has_special)
+                # This word is the redirect filename.
+                re = redirect_word_expr(arg)
+                if redirect_mode === :stdin; seg_stdin = re
+                elseif redirect_mode === :stdout; seg_stdout = re
+                else; seg_stderr = re; end
+                empty!(arg)
+                redirect_mode = :none
+            elseif redirect_mode == :none && (!isempty(arg) || word_has_special)
+                append_2to1!(args, arg)
+            end
+            word_has_special = false
+            # else: in redirect_mode but arg empty — still waiting for the filename.
             while !isempty(st)
                 # We've made sure above that we don't end in whitespace,
                 # so updating `i` here is ok
-                (i, c) = peek(st)
+                (i, c) = peek(st)::P
                 isspace(c) || break
                 popfirst!(st)
             end
         elseif interpolate && !in_single_quotes && c == '$'
-            consume_upto(j)
-            isempty(st) && error("\$ right before end of command")
-            stpos, c = popfirst!(st)
-            isspace(c) && error("space not allowed right after \$")
-            ex, j = Meta.parse(s,stpos,greedy=false)
-            last_parse = (stpos:prevind(s, j)) .+ s.offset
-            update_arg(ex);
-            s = SubString(s, j)
-            Iterators.reset!(st, pairs(s))
+            consume_upto!(arg, s, i, j)
+            result = parse_dollar_interp(st, s)
+            s = result[2]
+            last_arg = result[3]
+            update_last_arg = true
+            push!(arg, result[1])
             i = firstindex(s)
+        elseif interpolate && !in_single_quotes && !in_double_quotes && c == '|'
+            # Pipeline operator: finalize current word/redirect, then save segment.
+            i = consume_upto!(arg, s, i, j)
+            if redirect_mode != :none && (!isempty(arg) || word_has_special)
+                re = redirect_word_expr(arg)
+                if redirect_mode === :stdin; seg_stdin = re
+                elseif redirect_mode === :stdout; seg_stdout = re
+                else; seg_stderr = re; end
+                empty!(arg)
+            elseif redirect_mode == :none && (!isempty(arg) || word_has_special)
+                append_2to1!(args, arg)
+            end
+            seg_tuple = Expr(:tuple)
+            for a in args; push!(seg_tuple.args, Expr(:tuple, a...)); end
+            push!(pipeline_parts, (seg_tuple, seg_stdin, seg_stdout, seg_stdout_append,
+                                   seg_stderr, seg_stderr_append))
+            empty!(args)
+            seg_stdin = nothing; seg_stdout = nothing; seg_stdout_append = false
+            seg_stderr = nothing; seg_stderr_append = false; redirect_mode = :none
+            word_has_special = false
+            update_last_arg = true
+        elseif interpolate && !in_single_quotes && !in_double_quotes && (c == '<' || c == '>')
+            # Redirection operator: finalize any pending word, then set redirect mode.
+            # A pure-integer word immediately before the operator is an fd number (e.g. 2>).
+            i = consume_upto!(arg, s, i, j)
+            fd = nothing
+            if !word_has_special && length(arg) == 1 && isa(arg[1], AbstractString) &&
+                    !isempty(arg[1]::AbstractString) && all(isdigit, arg[1]::AbstractString)
+                fd = parse(Int, String(arg[1]::AbstractString)::String)
+                empty!(arg)
+                word_has_special = false
+            elseif !isempty(arg)
+                append_2to1!(args, arg)
+            end
+            if c == '>'
+                append = false
+                if !isempty(st) && (peek(st)::P).second == '>'
+                    popfirst!(st)  # consume second >
+                    append = true
+                    i = something(peek(st), lastindex(s)::Int+1 => '\0').first::Int
+                end
+                if fd === nothing || fd == 1
+                    redirect_mode = :stdout; seg_stdout_append = append
+                elseif fd == 2
+                    redirect_mode = :stderr; seg_stderr_append = append
+                else
+                    error("parsing command `$str`: unsupported fd $fd in redirection")
+                end
+            else  # '<'
+                (fd === nothing || fd == 0) ||
+                    error("parsing command `$str`: unsupported fd $fd in redirection")
+                redirect_mode = :stdin
+            end
+            update_last_arg = true
         else
+            if update_last_arg
+                last_arg = i + s.offset
+                update_last_arg = false
+            end
             if !in_double_quotes && c == '\''
                 in_single_quotes = !in_single_quotes
-                consume_upto(j)
+                word_has_special = true
+                i = consume_upto!(arg, s, i, j)
             elseif !in_single_quotes && c == '"'
                 in_double_quotes = !in_double_quotes
-                consume_upto(j)
-            elseif c == '\\'
-                if in_double_quotes
-                    isempty(st) && error("unterminated double quote")
-                    k, c′ = peek(st)
-                    if c′ == '"' || c′ == '$' || c′ == '\\'
-                        consume_upto(j)
+                word_has_special = true
+                i = consume_upto!(arg, s, i, j)
+            elseif !in_single_quotes && c == '\\'
+                word_has_special = true
+                if !isempty(st) && (peek(st)::P)[2] in ('\n', '\r')
+                    i = consume_upto!(arg, s, i, j) + 1
+                    if popfirst!(st)[2] == '\r' && (peek(st)::P)[2] == '\n'
+                        i += 1
+                        popfirst!(st)
+                    end
+                    while !isempty(st) && (peek(st)::P)[2] in (' ', '\t')
+                        i = nextind(str, i)
                         _ = popfirst!(st)
                     end
-                elseif !in_single_quotes
+                elseif in_double_quotes
+                    isempty(st) && error("unterminated double quote")
+                    _, c′ = peek(st)::P
+                    if c′ == '"' || c′ == '$' || c′ == '\\'
+                        i = consume_upto!(arg, s, i, j)
+                        _ = popfirst!(st)
+                    end
+                else
                     isempty(st) && error("dangling backslash")
-                    consume_upto(j)
+                    i = consume_upto!(arg, s, i, j)
                     _ = popfirst!(st)
                 end
+            elseif interpolate && !in_single_quotes && !in_double_quotes &&
+                    c == '~' && i == j && isempty(arg)
+                # Tilde expansion: `~` or `~username` at start of a word.
+                # Collect the username, which may include $interpolations (e.g. `~$user`).
+                # Stop at /, whitespace, uninterpolable chars (quotes, backslash), or operators.
+                i = consume_upto!(arg, s, i, j)  # i now points past the ~
+                user_parts = []
+                user_lit_start = i
+                while !isempty(st)
+                    nxt = peek(st)::P
+                    nc = nxt[2]
+                    if nc == '\\' && nextind(s, nxt[1]) <= lastindex(s) && s[nextind(s, nxt[1])] in ('\n', '\r')
+                        # A line continuation joins the lines without ending the user name.
+                        push_nonempty!(user_parts, s[user_lit_start:prevind(s, nxt[1])])
+                        popfirst!(st)
+                        if popfirst!(st)[2] == '\r' && !isempty(st) && (peek(st)::P)[2] == '\n'
+                            popfirst!(st)
+                        end
+                        while !isempty(st) && (peek(st)::P)[2] in (' ', '\t')
+                            popfirst!(st)
+                        end
+                        user_lit_start = something(peek(st), (lastindex(s) + 1) => '\0').first
+                        continue
+                    end
+                    (nc == '/' || isspace(nc) || nc == '\'' || nc == '"' || nc == '\\' ||
+                     nc == '|' || nc == '<' || nc == '>') && break
+                    if nc == '$'
+                        push_nonempty!(user_parts, s[user_lit_start:prevind(s, nxt[1])])
+                        popfirst!(st)  # consume $
+                        result = parse_dollar_interp(st, s)
+                        push!(user_parts, result[1])
+                        s = result[2]
+                        i = firstindex(s)
+                        user_lit_start = i
+                    else
+                        popfirst!(st)
+                    end
+                end
+                user_end = something(peek(st), (lastindex(s) + 1) => '\0').first
+                push_nonempty!(user_parts, s[user_lit_start:prevind(s, user_end)])
+                if !isempty(st) && (peek(st)::P)[2] in ('\'', '"', '\\')
+                    # As in POSIX shells, a quoted character before the first `/` disables expansion.
+                    push!(arg, "~")
+                    append!(arg, user_parts)
+                elseif isempty(user_parts)
+                    push!(arg, :(expanduser("~")))
+                elseif length(user_parts) == 1 && (u = user_parts[1]; u isa AbstractString)
+                    push!(arg, :(expanduser($("~" * u))))
+                else
+                    push!(arg, :(let _u = string($(user_parts...)); isempty(_u) ? "~" : expanduser(string('~', _u)) end))
+                end
+                i = user_end
+            elseif interpolate && !in_single_quotes && !in_double_quotes && c == '{'
+                # Brace expansion: {alt1,alt2,...} produces a tuple of alternatives.
+                # The tuple integrates with arg_gen's Cartesian product, so
+                # `pre{a,b}suf` generates arguments "preasuf" and "prebsuf".
+                i = consume_upto!(arg, s, i, j)
+                found_close, has_comma, has_dotdot, has_space = _scan_brace(s, i)
+                if found_close && has_dotdot && !has_comma
+                    # Range expansion: {1..10}, {a..z}, {1..10..2}, {01..10}
+                    # Extract the raw content between { and }, advance past }.
+                    brace_content = ""
+                    while !isempty(st)
+                        (bp, bc) = peek(st)::P
+                        if bc == '}'
+                            brace_content = String(s[i:prevind(s, bp)::Int])
+                            popfirst!(st)
+                            break
+                        end
+                        popfirst!(st)
+                    end
+                    i = something(peek(st), (lastindex(s)::Int+1) => '\0').first::Int
+                    expanded = _brace_range_expand(brace_content)
+                    if expanded === nothing
+                        error("parsing command `$str`: invalid brace range expansion {$brace_content}")
+                    end
+                    push!(arg, expanded)
+                    word_has_special = true
+                elseif found_close && has_comma && has_space
+                    error("parsing command `$str`: unquoted space inside braces")
+                elseif !(found_close && has_comma)
+                    # Not a valid brace expansion (no matching } or no comma):
+                    # treat the { as a literal character.
+                    push!(arg, "{")
+                else
+                    word_has_special = true
+                    alts = Any[]
+                    alt_parts = Any[]
+                    alt_i = i   # start of current literal segment
+                    bsq = false # single quotes within brace content
+                    bdq = false # double quotes within brace content
+                    bdepth = 0  # nested brace depth
+                    while !isempty(st)
+                        (bp, bc) = peek(st)::P
+                        if bsq
+                            # In single quotes: everything is literal until closing '
+                            popfirst!(st)
+                            if bc == '\''
+                                push_nonempty!(alt_parts, s[alt_i:prevind(s, bp)::Int])
+                                bsq = false
+                                alt_i = something(peek(st), (lastindex(s)::Int+1) => '\0').first::Int
+                            end
+                        elseif !bdq && bc == '\''
+                            push_nonempty!(alt_parts, s[alt_i:prevind(s, bp)::Int])
+                            popfirst!(st)
+                            bsq = true
+                            alt_i = something(peek(st), (lastindex(s)::Int+1) => '\0').first::Int
+                        elseif bc == '"'
+                            push_nonempty!(alt_parts, s[alt_i:prevind(s, bp)::Int])
+                            popfirst!(st)
+                            bdq = !bdq
+                            alt_i = something(peek(st), (lastindex(s)::Int+1) => '\0').first::Int
+                        elseif !bsq && bc == '$'
+                            push_nonempty!(alt_parts, s[alt_i:prevind(s, bp)::Int])
+                            popfirst!(st)
+                            result = parse_dollar_interp(st, s)
+                            push!(alt_parts, result[1])
+                            last_arg = result[3]
+                            update_last_arg = true
+                            s = result[2]
+                            alt_i = firstindex(s)
+                        elseif !bsq && bc == '\\'
+                            push_nonempty!(alt_parts, s[alt_i:prevind(s, bp)::Int])
+                            popfirst!(st)  # consume \
+                            if bdq
+                                if !isempty(st) && (peek(st)::P).second in ('"', '$', '\\')
+                                    alt_i = (peek(st)::P).first::Int
+                                    popfirst!(st)
+                                else
+                                    push!(alt_parts, "\\")
+                                    alt_i = something(peek(st), (lastindex(s)::Int+1) => '\0').first::Int
+                                end
+                            else
+                                isempty(st) && error("parsing command `$str`: dangling backslash in brace expansion")
+                                alt_i = (peek(st)::P).first::Int
+                                popfirst!(st)
+                            end
+                        elseif !bsq && !bdq && bc == '{'
+                            bdepth += 1
+                            popfirst!(st)
+                        elseif !bsq && !bdq && bc == '}' && bdepth > 0
+                            bdepth -= 1
+                            popfirst!(st)
+                        elseif !bsq && !bdq && bc == '}' && bdepth == 0
+                            # End of brace expansion
+                            push_nonempty!(alt_parts, s[alt_i:prevind(s, bp)::Int])
+                            push!(alts, _brace_alt_expr(alt_parts))
+                            popfirst!(st)
+                            break
+                        elseif !bsq && !bdq && bc == ',' && bdepth == 0
+                            # Alternative separator
+                            push_nonempty!(alt_parts, s[alt_i:prevind(s, bp)::Int])
+                            push!(alts, _brace_alt_expr(alt_parts))
+                            empty!(alt_parts)
+                            popfirst!(st)
+                            alt_i = something(peek(st), (lastindex(s)::Int+1) => '\0').first::Int
+                        else
+                            popfirst!(st)
+                        end
+                    end
+                    i = something(peek(st), (lastindex(s)::Int+1) => '\0').first::Int
+                    push!(arg, Expr(:tuple, alts...))
+                end
             elseif !in_single_quotes && !in_double_quotes && c in special
-                warn_shell_special(special) # noinline depwarn
+                error("parsing command `$str`: special characters \"$special\" must be quoted in commands")
             end
         end
     end
@@ -105,32 +552,100 @@ function shell_parse(str::AbstractString, interpolate::Bool=true;
     if in_single_quotes; error("unterminated single quote"); end
     if in_double_quotes; error("unterminated double quote"); end
 
-    update_arg(s[i:end])
-    append_arg()
-
-    interpolate || return args, last_parse
-
-    # construct an expression
-    ex = Expr(:tuple)
-    for arg in args
-        push!(ex.args, Expr(:tuple, arg...))
+    push_nonempty!(arg, s[i:end])
+    if interpolate && redirect_mode != :none
+        isempty(arg) && error("parsing command `$str`: redirect operator without filename")
+        re = redirect_word_expr(arg)
+        if redirect_mode === :stdin; seg_stdin = re
+        elseif redirect_mode === :stdout; seg_stdout = re
+        else; seg_stderr = re; end
+        empty!(arg)
+    elseif !isempty(arg) || word_has_special
+        append_2to1!(args, arg)
     end
-    return ex, last_parse
+
+    interpolate || return args, last_arg
+
+    # If no pipeline operators and no redirects: return existing tuple format (backward compat).
+    if isempty(pipeline_parts) && seg_stdin === nothing && seg_stdout === nothing &&
+            seg_stderr === nothing
+        ex = Expr(:tuple)
+        for arg in args
+            push!(ex.args, Expr(:tuple, arg...))
+        end
+        return ex, last_arg
+    end
+
+    # Build a cmd_gen(seg_tuple) expression, wrapped in pipeline() calls for each redirect.
+    # stdin and stdout (with its append flag) are combined into one call; stderr is separate
+    # so that different append modes can be handled independently.
+    function build_seg_expr(seg_tuple, s_in, s_out, s_out_app, s_err, s_err_app)
+        cmd_ex = Expr(:call, GlobalRef(Base, :cmd_gen), seg_tuple)
+        if s_in !== nothing || s_out !== nothing
+            kwargs = Any[]
+            s_in !== nothing && push!(kwargs, Expr(:kw, :stdin, s_in))
+            s_out !== nothing && push!(kwargs, Expr(:kw, :stdout, s_out))
+            s_out_app && push!(kwargs, Expr(:kw, :append, true))
+            cmd_ex = Expr(:call, GlobalRef(Base, :pipeline), Expr(:parameters, kwargs...), cmd_ex)
+        end
+        if s_err !== nothing
+            kwargs = Any[Expr(:kw, :stderr, s_err)]
+            s_err_app && push!(kwargs, Expr(:kw, :append, true))
+            cmd_ex = Expr(:call, GlobalRef(Base, :pipeline), Expr(:parameters, kwargs...), cmd_ex)
+        end
+        return cmd_ex
+    end
+
+    # Build the final segment's tuple.
+    final_seg_tuple = Expr(:tuple)
+    for a in args; push!(final_seg_tuple.args, Expr(:tuple, a...)); end
+
+    if isempty(pipeline_parts)
+        # Only redirects, no pipes.
+        return build_seg_expr(final_seg_tuple, seg_stdin, seg_stdout, seg_stdout_append,
+                              seg_stderr, seg_stderr_append), last_arg
+    end
+
+    # Chain pipeline segments left-to-right: pipeline(seg1, pipeline(seg2, seg3, ...)).
+    (s0_args, s0_in, s0_out, s0_out_app, s0_err, s0_err_app) = pipeline_parts[1]
+    result = build_seg_expr(s0_args, s0_in, s0_out, s0_out_app, s0_err, s0_err_app)
+    for k in 2:length(pipeline_parts)
+        (sk_args, sk_in, sk_out, sk_out_app, sk_err, sk_err_app) = pipeline_parts[k]
+        result = Expr(:call, GlobalRef(Base, :pipeline), result,
+                      build_seg_expr(sk_args, sk_in, sk_out, sk_out_app, sk_err, sk_err_app))
+    end
+    result = Expr(:call, GlobalRef(Base, :pipeline), result,
+                  build_seg_expr(final_seg_tuple, seg_stdin, seg_stdout, seg_stdout_append,
+                                 seg_stderr, seg_stderr_append))
+
+    return result, last_arg
 end
 
+"""
+    shell_split(command::AbstractString)
+
+Split a shell command string into its individual components.
+
+# Examples
+```jldoctest
+julia> Base.shell_split("git commit -m 'Initial commit'")
+4-element Vector{String}:
+ "git"
+ "commit"
+ "-m"
+ "Initial commit"
+```
+"""
 function shell_split(s::AbstractString)
     parsed = shell_parse(s, false)[1]
     args = String[]
     for arg in parsed
-        push!(args, string(arg...))
+        push!(args, string(arg...)::String)
     end
     args
 end
 
 function print_shell_word(io::IO, word::AbstractString, special::AbstractString = "")
-    if isempty(word)
-        print(io, "''")
-    end
     has_single = false
     has_special = false
     for c in word
@@ -141,20 +656,23 @@ function print_shell_word(io::IO, word::AbstractString, special::AbstractString 
             end
         end
     end
-    if !has_special
+    if isempty(word)
+        print(io, "''")
+    elseif !has_special
         print(io, word)
     elseif !has_single
         print(io, '\'', word, '\'')
     else
         print(io, '"')
         for c in word
-            if c == '"' || c == '$'
+            if c == '"' || c == '$' || c == '\\'
                 print(io, '\\')
             end
             print(io, c)
         end
         print(io, '"')
     end
+    nothing
 end
 
 function print_shell_escaped(io::IO, cmd::AbstractString, args::AbstractString...;
@@ -170,9 +688,9 @@ print_shell_escaped(io::IO; special::String="") = nothing
 """
     shell_escape(args::Union{Cmd,AbstractString...}; special::AbstractString="")
 
-The unexported `shell_escape` function is the inverse of the unexported `shell_split` function:
+The unexported `shell_escape` function is the inverse of the unexported [`Base.shell_split()`](@ref) function:
 it takes a string or command object and escapes any special characters in such a way that calling
-`shell_split` on it would give back the array of words in the original command. The `special`
+[`Base.shell_split()`](@ref) on it would give back the array of words in the original command. The `special`
 keyword argument controls what characters in addition to whitespace, backslashes, quotes and
 dollar signs are considered to be special (default: none).
 
@@ -186,7 +704,7 @@ julia> Base.shell_escape("echo", "this", "&&", "that")
 ```
 """
 shell_escape(args::AbstractString...; special::AbstractString="") =
-    sprint(io->print_shell_escaped(io, args..., special=special))
+    sprint((io, args...) -> print_shell_escaped(io, args..., special=special), args...)
 
 
 function print_shell_escaped_posixly(io::IO, args::AbstractString...)
@@ -195,32 +713,40 @@ function print_shell_escaped_posixly(io::IO, args::AbstractString...)
         first || print(io, ' ')
         # avoid printing quotes around simple enough strings
         # that any (reasonable) shell will definitely never consider them to be special
-        have_single = false
-        have_double = false
-        function isword(c::AbstractChar)
-            if '0' <= c <= '9' || 'a' <= c <= 'z' || 'A' <= c <= 'Z'
-                # word characters
-            elseif c == '_' || c == '/' || c == '+' || c == '-'
-                # other common characters
-            elseif c == '\''
-                have_single = true
-            elseif c == '"'
-                have_double && return false # switch to single quoting
-                have_double = true
-            elseif !first && c == '='
-                # equals is special if it is first (e.g. `env=val ./cmd`)
-            else
-                # anything else
-                return false
-            end
-            return true
-        end
-        if all(isword, arg)
-            have_single && (arg = replace(arg, '\'' => "\\'"))
-            have_double && (arg = replace(arg, '"' => "\\\""))
-            print(io, arg)
+        if isempty(arg)
+            print(io, "''")
         else
-            print(io, '\'', replace(arg, '\'' => "'\\''"), '\'')
+            have_single = false
+            have_double = false
+            isword = true
+            for c in arg
+                if '0' <= c <= '9' || 'a' <= c <= 'z' || 'A' <= c <= 'Z'
+                    # word characters
+                elseif c == '_' || c == '/' || c == '+' || c == '-' || c == '.'
+                    # other common characters
+                elseif c == '\''
+                    have_single = true
+                elseif c == '"'
+                    if have_double
+                        isword = false
+                        break # switch to single quoting
+                    end
+                    have_double = true
+                elseif !first && c == '='
+                    # equals is special if it is first (e.g. `env=val ./cmd`)
+                else
+                    # anything else
+                    isword = false
+                    break
+                end
+            end
+            if isword
+                have_single && (arg = replace(arg, '\'' => "\\'"))
+                have_double && (arg = replace(arg, '"' => "\\\""))
+                print(io, arg)
+            else
+                print(io, '\'', replace(arg, '\'' => "'\\''"), '\'')
+            end
         end
         first = false
     end
@@ -233,6 +759,8 @@ The unexported `shell_escape_posixly` function
 takes a string or command object and escapes any special characters in such a way that
 it is safe to pass it as an argument to a posix shell.
 
+See also: [`Base.shell_escape()`](@ref)
+
 # Examples
 ```jldoctest
 julia> Base.shell_escape_posixly("cat", "/foo/bar baz", "&&", "echo", "done")
@@ -243,4 +771,202 @@ julia> Base.shell_escape_posixly("echo", "this", "&&", "that")
 ```
 """
 shell_escape_posixly(args::AbstractString...) =
-    sprint(io->print_shell_escaped_posixly(io, args...))
+    sprint(print_shell_escaped_posixly, args...)
+
+"""
+    shell_escape_csh(args::Union{Cmd,AbstractString...})
+    shell_escape_csh(io::IO, args::Union{Cmd,AbstractString...})
+
+This function quotes any metacharacters in the string arguments such
+that the string returned can be inserted into a command-line for
+interpretation by the Unix C shell (csh, tcsh), where each string
+argument will form one word.
+
+In contrast to a POSIX shell, csh does not support the use of the
+backslash as a general escape character in double-quoted strings.
+Therefore, this function wraps strings that might contain
+metacharacters in single quotes, except for parts that contain single
+quotes, which it wraps in double quotes instead. It switches between
+these types of quotes as needed. Linefeed characters are escaped with
+a backslash.
+
+This function should also work for a POSIX shell, except if the input
+string contains a linefeed (`"\\n"`) character.
+
+See also: [`Base.shell_escape_posixly()`](@ref)
+"""
+function shell_escape_csh(io::IO, args::AbstractString...)
+    first = true
+    for arg in args
+        first || write(io, ' ')
+        first = false
+        i = 1
+        while true
+            for (r,e) = (r"^[A-Za-z0-9/\._-]+\z"sa => "",
+                         r"^[^']*\z"sa => "'", r"^[^\$\`\"]*\z"sa => "\"",
+                         r"^[^']+"sa  => "'", r"^[^\$\`\"]+"sa  => "\"")
+                if ((m = match(r, SubString(arg, i))) !== nothing)
+                    write(io, e)
+                    write(io, replace(m.match, '\n' => "\\\n"))
+                    write(io, e)
+                    i += ncodeunits(m.match)
+                    break
+                end
+            end
+            i <= lastindex(arg) || break
+        end
+    end
+end
+shell_escape_csh(args::AbstractString...) =
+    sprint(shell_escape_csh, args...;
+           sizehint = sum(sizeof, args) + length(args) * 3)
+
+"""
+    shell_escape_wincmd(s::AbstractString)
+    shell_escape_wincmd(io::IO, s::AbstractString)
+
+The unexported `shell_escape_wincmd` function escapes Windows `cmd.exe` shell
+meta characters. It escapes `()!^<>&|` by placing a `^` in front. An `@` is
+only escaped at the start of the string. Pairs of `"` characters and the
+strings they enclose are passed through unescaped. Any remaining `"` is escaped
+with `^` to ensure that the number of unescaped `"` characters in the result
+remains even.
+
+Since `cmd.exe` substitutes variable references (like `%USER%`) _before_
+processing the escape characters `^` and `"`, this function makes no attempt to
+escape the percent sign (`%`), the presence of `%` in the input may cause
+severe breakage, depending on where the result is used.
+
+Input strings with ASCII control characters that cannot be escaped (NUL, CR,
+LF) will cause an `ArgumentError` exception.
+
+The result is safe to pass as an argument to a command call being processed by
+`CMD.exe /S /C " ... "` (with surrounding double-quote pair) and will be
+received verbatim by the target application if the input does not contain `%`
+(else this function will fail with an ArgumentError). The presence of `%` in
+the input string may result in command injection vulnerabilities and may
+invalidate any claim of suitability of the output of this function for use as
+an argument to cmd (due to the ordering described above), so use caution when
+assembling a string from various sources.
+
+This function may be useful in concert with the `windows_verbatim` flag to
+[`Cmd`](@ref) when constructing process pipelines.
+
+```julia
+wincmd(c::String) =
+   run(Cmd(Cmd(["cmd.exe", "/s /c \\" \$c \\""]);
+           windows_verbatim=true))
+wincmd_echo(s::String) =
+   wincmd("echo " * Base.shell_escape_wincmd(s))
+wincmd_echo("hello \$(ENV["USERNAME"]) & the \\"whole\\" world! (=^I^=)")
+```
+
+But take note that if the input string `s` contains a `%`, the argument list
+and echo'ed text may get corrupted, resulting in arbitrary command execution.
+The argument can alternatively be passed as an environment variable, which
+avoids the problem with `%` and the need for the `windows_verbatim` flag:
+
+```julia
+cmdargs = Base.shell_escape_wincmd("Passing args with %cmdargs% works 100%!")
+run(setenv(`cmd /C echo %cmdargs%`, "cmdargs" => cmdargs))
+```
+
+!!! warning
+    The argument parsing done by CMD when calling batch files (either inside
+    `.bat` files or as arguments to them) is not fully compatible with the
+    output of this function. In particular, the processing of `%` is different.
+
+!!! important
+    Due to a peculiar behavior of the CMD parser/interpreter, each command
+    after a literal `|` character (indicating a command pipeline) must have
+    `shell_escape_wincmd` applied twice since it will be parsed twice by CMD.
+    This implies ENV variables would also be expanded twice!
+    For example:
+    ```julia
+    to_print = "All for 1 & 1 for all!"
+    to_print_esc = Base.shell_escape_wincmd(Base.shell_escape_wincmd(to_print))
+    run(Cmd(Cmd(["cmd", "/S /C \\" break | echo \$(to_print_esc) \\""]), windows_verbatim=true))
+    ```
+
+With an I/O stream parameter `io`, the result will be written there,
+rather than returned as a string.
+
+See also [`Base.escape_microsoft_c_args()`](@ref), [`Base.shell_escape_posixly()`](@ref).
+
+# Examples
+```jldoctest
+julia> Base.shell_escape_wincmd("a^\\"^o\\"^u\\"")
+"a^^\\"^o\\"^^u^\\""
+```
+"""
+function shell_escape_wincmd(io::IO, s::AbstractString)
+    # https://stackoverflow.com/a/4095133/1990689
+    occursin(r"[\r\n\0]"sa, s) &&
+        throw(ArgumentError("control character unsupported by CMD.EXE"))
+    i = 1
+    len = ncodeunits(s)
+    if len > 0 && s[1] == '@'
+        write(io, '^')
+    end
+    while i <= len
+        c = s[i]
+        if c == '"' && (j = findnext('"', s, nextind(s,i))) !== nothing
+            write(io, SubString(s,i,j))
+            i = j
+        else
+            if c in ('"', '(', ')', '!', '^', '<', '>', '&', '|')
+                write(io, '^', c)
+            else
+                write(io, c)
+            end
+        end
+        i = nextind(s,i)
+    end
+end
+shell_escape_wincmd(s::AbstractString) = sprint(shell_escape_wincmd, s;
+                                                sizehint = 2*sizeof(s))
+
+"""
+    escape_microsoft_c_args(args::Union{Cmd,AbstractString...})
+    escape_microsoft_c_args(io::IO, args::Union{Cmd,AbstractString...})
+
+Convert a collection of string arguments into a string that can be
+passed to many Windows command-line applications.
+
+Microsoft Windows passes the entire command line as a single string to
+the application (unlike POSIX systems, where the shell splits the
+command line into a list of arguments). Many Windows API applications
+(including julia.exe), use the conventions of the [Microsoft C/C++
+runtime](https://docs.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments)
+to split that command line into a list of strings.
+
+This function implements an inverse for a parser compatible with these rules.
+It joins command-line arguments to be passed to a Windows
+C/C++/Julia application into a command line, escaping or quoting the
+meta characters space, TAB, double quote and backslash where needed.
+
+See also [`Base.shell_escape_wincmd()`](@ref), [`Base.escape_raw_string()`](@ref).
+"""
+function escape_microsoft_c_args(io::IO, args::AbstractString...)
+    # http://daviddeley.com/autohotkey/parameters/parameters.htm#WINCRULES
+    first = true
+    for arg in args
+        if first
+            first = false
+        else
+            write(io, ' ')  # separator
+        end
+        if isempty(arg) || occursin(r"[ \t\"]"sa, arg)
+            # Julia raw strings happen to use the same escaping convention
+            # as the argv[] parser in Microsoft's C runtime library.
+            write(io, '"')
+            escape_raw_string(io, arg)
+            write(io, '"')
+        else
+            write(io, arg)
+        end
+    end
+end
+escape_microsoft_c_args(args::AbstractString...) =
+    sprint(escape_microsoft_c_args, args...;
+           sizehint = (sum(sizeof, args) + 3*length(args)))

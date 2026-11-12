@@ -1,165 +1,438 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
-# Prevent this from being put into the Main namespace
-let
-M = Module()
-@eval M begin
-if !isdefined(Base, :uv_eventloop)
-    Base.reinit_stdio()
+# Prevent this from putting anything into the Main namespace
+@eval Base module __precompile_script
+
+if Threads.maxthreadid() != 1
+    @warn "Running this file with multiple Julia threads may lead to a build error" Threads.maxthreadid()
 end
-Base.include(@__MODULE__, joinpath(Sys.BINDIR, "..", "share", "julia", "test", "testhelpers", "FakePTYs.jl"))
-import .FakePTYs: open_fake_pty
 
-CTRL_C = '\x03'
-UP_ARROW = "\e[A"
-DOWN_ARROW = "\e[B"
+if Base.isempty(Base.ARGS) || Base.ARGS[1] !== "0"
+using Base.Meta
 
-precompile_script = """
-2+2
-print("")
-@time 1+1
-; pwd
-? reinterpret
-using Ra\t$CTRL_C
-\\alpha\t$CTRL_C
-\e[200~paste here ;)\e[201~"$CTRL_C
-$UP_ARROW$DOWN_ARROW$CTRL_C
-123\b\b\b$CTRL_C
-\b\b$CTRL_C
-f(x) = x03
-f(1,2)
-[][1]
-cd("complet_path\t\t$CTRL_C
+## Debugging options
+# View the code sent to the subprocesses by setting this to `stdout`
+const debug_output = devnull # or stdout
+##
+
+if Sys.isunix()
+    include(joinpath(@__DIR__, "..", "test", "testhelpers", "FakePTYs.jl"))
+    import .FakePTYs: open_fake_pty
+end
+
+hardcoded_precompile_statements = """
+precompile(Base.unsafe_string, (Ptr{UInt8},))
+precompile(Base.unsafe_string, (Ptr{Int8},))
+precompile(Base._atexit, (Cint,))
+
+# used by REPL
+precompile(Tuple{typeof(Base.getproperty), Base.Terminals.TTYTerminal, Symbol})
+precompile(Tuple{typeof(Base.reseteof), Base.Terminals.TTYTerminal})
+precompile(Tuple{typeof(Base.Terminals.width), Base.Terminals.TTYTerminal})
+precompile(Tuple{typeof(Base.Terminals.height), Base.Terminals.TTYTerminal})
+precompile(Tuple{typeof(Base.write), Base.Terminals.TTYTerminal, Array{UInt8, 1}})
+precompile(Tuple{typeof(Base.isempty), Base.AnnotatedString{String}})
+# The owner-carrying write paths (String/Array) call _unsafe_write_owned
+# directly, so the workload session does not compile the raw-pointer
+# unsafe_write entry points on its own; interactive startup still reaches
+# them through generic IO plumbing
+precompile(Tuple{typeof(Base.unsafe_write), Base.TTY, Ptr{UInt8}, UInt})
+precompile(Tuple{typeof(Base.unsafe_write), Base.GenericIOBuffer{Memory{UInt8}}, Ptr{UInt8}, UInt})
+
+# loading.jl - without these each precompile worker would precompile these because they're hit before pkgimages are loaded
+precompile(Base.__require, (Module, Symbol))
+precompile(Base.__require, (Base.PkgId,))
+precompile(Base.indexed_iterate, (Pair{Symbol, Union{Nothing, String}}, Int))
+precompile(Base.indexed_iterate, (Pair{Symbol, Union{Nothing, String}}, Int, Int))
+precompile(Tuple{typeof(Base.Threads.atomic_add!), Base.Threads.Atomic{Int}, Int})
+precompile(Tuple{typeof(Base.Threads.atomic_sub!), Base.Threads.Atomic{Int}, Int})
+precompile(Tuple{Type{Pair{A, B} where B where A}, Base.PkgId, UInt128})
+precompile(Tuple{typeof(Base.in!), Tuple{Module, String, UInt64, UInt32, Float64}, Base.Set{Any}})
+precompile(Tuple{typeof(Base.Compiler.ir_to_codeinf!), Base.Compiler.OptimizationState{Base.Compiler.NativeInterpreter}})
+precompile(Tuple{typeof(Base.getindex), Type{Pair{Base.PkgId, UInt128}}, Pair{Base.PkgId, UInt128}, Pair{Base.PkgId, UInt128}, Pair{Base.PkgId, UInt128}, Vararg{Pair{Base.PkgId, UInt128}}})
+precompile(Tuple{typeof(Base.Compiler.ir_to_codeinf!), Base.Compiler.OptimizationState{Base.Compiler.NativeInterpreter}, Core.SimpleVector})
+precompile(Base.include_package_for_output, (Base.PkgId, String, Tuple{Int, Int}, Vector{String}, Vector{String}, Vector{String}, typeof(Base._concrete_dependencies), Nothing))
+precompile(Base.include_package_for_output, (Base.PkgId, String, Tuple{Int, Int}, Vector{String}, Vector{String}, Vector{String}, typeof(Base._concrete_dependencies), String))
+precompile(Base.create_expr_cache, (Base.PkgId, Base.PkgLoadSpec, String, String, typeof(Base._concrete_dependencies), Cmd, Base.CacheFlags, IO, IO))
+precompile(Base.create_expr_cache, (Base.PkgId, Base.PkgLoadSpec, String, Nothing, typeof(Base._concrete_dependencies), Cmd, Base.CacheFlags, IO, IO))
+
+# LazyArtifacts (but more generally helpful)
+precompile(Tuple{Type{Base.Val{x} where x}, Module})
+precompile(Tuple{Type{NamedTuple{(:honor_overrides,), T} where T<:Tuple}, Tuple{Bool}})
+precompile(Tuple{typeof(Base.unique!), Array{String, 1}})
+# `unique!` checks whether the paths are sorted in reverse, and a JLL's library paths
+# often are, e.g. when the julia install sorts after the depot
+precompile(Tuple{typeof(Base.issorted), Array{String, 1}, Base.Order.ReverseOrdering{Base.Order.ForwardOrdering}})
+precompile(Tuple{typeof(Base.vcat), Array{String, 1}, Array{String, 1}})
+
+# Pkg loading
+precompile(Tuple{typeof(Base.Filesystem.normpath), String, String, Vararg{String}})
+precompile(Tuple{typeof(Base.append!), Array{String, 1}, Array{String, 1}})
+precompile(Tuple{typeof(Base.join), Array{String, 1}, Char})
+precompile(Tuple{typeof(Base.getindex), Base.Dict{Any, Any}, Char})
+precompile(Tuple{typeof(Base.delete!), Base.Set{Any}, Char})
+
+# REPL
+precompile(isequal, (String, String))
+precompile(Base.check_open, (Base.TTY,))
+precompile(Base.getproperty, (Base.TTY, Symbol))
+precompile(write, (Base.TTY, String))
+precompile(Tuple{typeof(Base.get), Base.TTY, Symbol, Bool})
+precompile(Tuple{typeof(Base.eof), Base.TTY})
+precompile(Tuple{typeof(Base.hashindex), String, Int})
+precompile(Tuple{typeof(Base.write), Base.GenericIOBuffer{Array{UInt8, 1}}, String})
+precompile(Tuple{typeof(Base.indexed_iterate), Tuple{Nothing, Int}, Int})
+precompile(Tuple{typeof(Base.indexed_iterate), Tuple{Nothing, Int}, Int, Int})
+precompile(Tuple{typeof(Base._typeddict), Base.Dict{String, Any}, Base.Dict{String, Any}, Vararg{Base.Dict{String, Any}}})
+precompile(Tuple{typeof(Base.promoteK), Type, Base.Dict{String, Any}, Base.Dict{String, Any}})
+precompile(Tuple{typeof(Base.promoteK), Type, Base.Dict{String, Any}})
+precompile(Tuple{typeof(Base.promoteV), Type, Base.Dict{String, Any}, Base.Dict{String, Any}})
+precompile(Tuple{typeof(Base.eval_user_input), Base.PipeEndpoint, Any, Bool})
+precompile(Tuple{typeof(Base.get), Base.PipeEndpoint, Symbol, Bool})
+precompile(Tuple{Core.TypeEgal{Base.IOContext{IO_t} where IO_t<:IO}, Base.PipeEndpoint, Pair{Symbol, Bool}})
+precompile(Tuple{typeof(Base.print), Base.IOContext{Base.PipeEndpoint}, String})
+precompile(Tuple{typeof(Base.HashArrayMappedTries.next), Base.HashArrayMappedTries.HashState{Base.ScopedValues.ScopedValue{Any}}})
+
+# used by Revise.jl
+precompile(Tuple{typeof(Base.parse_cache_header), String})
+precompile(Base.read_dependency_src, (String, String))
+
+# used by Requires.jl
+precompile(Tuple{typeof(get!), Type{Vector{Function}}, Dict{Base.PkgId,Vector{Function}}, Base.PkgId})
+precompile(Tuple{typeof(haskey), Dict{Base.PkgId,Vector{Function}}, Base.PkgId})
+precompile(Tuple{typeof(delete!), Dict{Base.PkgId,Vector{Function}}, Base.PkgId})
+precompile(Tuple{typeof(push!), Vector{Function}, Function})
+
+# preferences
+precompile(Base.get_preferences, (Base.UUID,))
+precompile(Base.record_compiletime_preference, (Base.UUID, String))
+
+# Threads.@threads
+# Not specialized on the loop body, so this one compile covers every `@threads` site
+precompile(Tuple{typeof(Base.Threads.threading_run), Any, Bool})
+
+# miscellaneous
+precompile(Tuple{typeof(Base.exit)})
+precompile(Tuple{typeof(Base.require), Base.PkgId})
+precompile(Tuple{typeof(Base.recursive_prefs_merge), Base.Dict{String, Any}, Vector{Base.Dict{String, Any}}})
+precompile(Tuple{typeof(Base.hashindex), Tuple{Base.PkgId, Nothing}, Int})
+precompile(Tuple{typeof(Base.hashindex), Tuple{Base.PkgId, String}, Int})
+precompile(Tuple{typeof(isassigned), Core.SimpleVector, Int})
+precompile(Tuple{typeof(getindex), Core.SimpleVector, Int})
+precompile(Tuple{typeof(Base.Experimental.register_error_hint), Any, Type})
+precompile(Tuple{typeof(Base.display_error), Base.ExceptionStack})
+precompile(Tuple{typeof(showerror), IO, MethodError})
+precompile(Tuple{typeof(Base.showerror_methoderror), IOContext{IOBuffer}, MethodError})
+precompile(Tuple{Core.kwftype(typeof(Type)), NamedTuple{(:sizehint,), Tuple{Int}}, Type{IOBuffer}})
+precompile(Base.CoreLogging.current_logger_for_env, (Base.CoreLogging.LogLevel, String, Module))
+precompile(Base.CoreLogging.current_logger_for_env, (Base.CoreLogging.LogLevel, Symbol, Module))
+precompile(Base.CoreLogging.env_override_minlevel, (Symbol, Module))
+precompile(Base.StackTraces.lookup, (Ptr{Nothing},))
+precompile(Tuple{typeof(Base.run_module_init), Module, Int})
+precompile(Tuple{Type{Base.VersionNumber}, Int32, Int32, Int32})
+
+# Presence tested in the tests
+precompile(Tuple{typeof(Base.print), Base.IOStream, String})
+
+# precompilepkgs
+precompile(Tuple{typeof(Base.get), Type{Array{String, 1}}, Base.Dict{String, Any}, String})
+precompile(Tuple{typeof(Base.get), Type{Base.Dict{String, Any}}, Base.Dict{String, Any}, String})
+precompile(Tuple{typeof(Base.haskey), Base.Dict{String, Any}, String})
+precompile(Tuple{typeof(Base.indexed_iterate), Tuple{Base.TTY, Bool}, Int, Int})
+precompile(Tuple{typeof(Base.indexed_iterate), Tuple{Base.TTY, Bool}, Int})
+precompile(Tuple{typeof(Base.open), Base.CmdRedirect, String, Base.TTY})
+precompile(Tuple{typeof(Base.Precompilation.precompilepkgs)})
+precompile(Tuple{typeof(Base.Precompilation.printpkgstyle), Base.TTY, Symbol, String})
+precompile(Tuple{typeof(Base.rawhandle), Base.TTY})
+precompile(Tuple{typeof(Base.setindex!), Base.Dict{String, Array{String, 1}}, Array{String, 1}, String})
+precompile(Tuple{typeof(Base.setindex!), GenericMemory{:not_atomic, Union{Base.Libc.RawFD, Base.SyncCloseFD, IO}, Core.AddrSpace{Core}(0x00)}, Base.TTY, Int})
+precompile(Tuple{typeof(Base.setup_stdio), Base.TTY, Bool})
+precompile(Tuple{typeof(Base.spawn_opts_inherit), Base.DevNull, Base.TTY, Base.TTY})
+precompile(Tuple{typeof(Core.kwcall), NamedTuple{(:context,), Tuple{Base.TTY}}, typeof(Base.sprint), Function})
+precompile(Tuple{Type{Base.UUID}, Base.UUID})
 """
 
-julia_cmd() = (julia = joinpath(Sys.BINDIR, Base.julia_exename()); `$julia`)
-have_repl =  haskey(Base.loaded_modules,
-                    Base.PkgId(Base.UUID("3fa0cd96-eef1-5676-8a61-b3b8758bbffb"), "REPL"))
-Pkg = get(Base.loaded_modules,
-          Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg"),
-          nothing)
-
-if Pkg !== nothing
-    precompile_script *= Pkg.precompile_script
+if Sys.iswindows()
+    # on Unix these are covered (with the real terminal types) by `tty_script` below
+    for T in (Float16, Float32, Float64), IO in (IOBuffer, IOContext{IOBuffer}, Base.TTY, IOContext{Base.TTY})
+        global hardcoded_precompile_statements
+        hardcoded_precompile_statements *= "precompile(Tuple{typeof(show), $IO, $T})\n"
+    end
 end
 
-push!(LOAD_PATH, Sys.STDLIB)
-using Sockets
-Sockets.__init__()
-using Libdl
-empty!(LOAD_PATH)
+# Precompiles for Revise and other packages
+precompile_script = """
+for match = Base._methods(+, (Int, Int), -1, Base.get_world_counter())
+    m = match.method
+    delete!(push!(Set{Method}(), m), m)
+    copy(Core.Compiler.retrieve_code_info(Core.Compiler.specialize_method(match), typemax(UInt)))
+    break   # only actually need to do this once
+end
+empty!(Set())
+push!(push!(Set{Union{GlobalRef,Symbol}}(), :two), GlobalRef(Base, :two))
+get!(ENV, "___DUMMY", "")
+ENV["___DUMMY"]
+delete!(ENV, "___DUMMY")
+(setindex!(Dict{String,Base.PkgId}(), Base.PkgId(Base), "file.jl"))["file.jl"]
+(setindex!(Dict{Symbol,Vector{Int}}(), [1], :two))[:two]
+(setindex!(Dict{Base.PkgId,String}(), "file.jl", Base.PkgId(Base)))[Base.PkgId(Base)]
+(setindex!(Dict{Union{GlobalRef,Symbol}, Vector{Int}}(), [1], :two))[:two]
+(setindex!(IdDict{Type, Union{Missing, Vector{Tuple{LineNumberNode, Expr}}}}(), missing, Int))[Int]
+Dict{Symbol, Union{Nothing, Bool, Symbol}}(:one => false)[:one]
+Dict(Base => [:(1+1)])[Base]
+Dict(:one => [1])[:one]
+Dict("abc" => Set())["abc"]
+pushfirst!([], sum)
+get(Base.pkgorigins, Base.PkgId(Base), nothing)
+sort!([1,2,3])
+unique!([1,2,3])
+cumsum([1,2,3])
+append!(Int[], BitSet())
+isempty(BitSet())
+delete!(BitSet([1,2]), 3)
+deleteat!(Int32[1,2,3], [1,3])
+deleteat!(Any[1,2,3], [1,3])
+Core.svec(1, 2) == Core.svec(3, 4)
+any(t->t[1].line > 1, [(LineNumberNode(2,:none), :(1+1))])
+
+# Code loading uses this
+sortperm(mtime.(readdir(".")), rev=true)
+# JLLWrappers uses these
+Dict{Base.UUID,Set{String}}()[Base.UUID("692b3bcd-3c85-4b1f-b108-f13ce0eb3210")] = Set{String}()
+get!(Set{String}, Dict{Base.UUID,Set{String}}(), Base.UUID("692b3bcd-3c85-4b1f-b108-f13ce0eb3210"))
+eachindex(IndexLinear(), Expr[])
+push!(Expr[], Expr(:return, false))
+vcat(String[], String[])
+k, v = (:hello => nothing)
+Base.print_time_imports_report(Base)
+Base.print_time_imports_report_init(Base)
+
+# Preferences uses these
+get(Dict{String,Any}(), "missing", nothing)
+delete!(Dict{String,Any}(), "missing")
+for (k, v) in Dict{String,Any}()
+    println(k)
+end
+
+# interactive startup uses this
+write(IOBuffer(), "")
+
+# precompile @time report generation and printing
+@time @eval Base.Experimental.@force_compile
+"""
+
+# Runs in a subprocess with stdout/stderr attached to a pty, so that the traced
+# signatures use the concrete `Base.TTY` types seen in a terminal session
+# (tracing these in the pipe-attached process above would compile the wrong
+# specializations). Ends by throwing, to trace the error-report path for an
+# uncaught exception in a script.
+tty_script = """
+for x in (Float16(1.0), 1.0f0, 1.0)
+    show(stdout, x); println()
+    show(IOContext(stdout, :compact => true), x); println()
+    buf = IOBuffer()
+    show(buf, x)
+    show(IOContext(buf, :compact => true), x)
+end
+# `@time_imports` report printing
+Base.print_time_imports_report(Base)
+Base.print_time_imports_report_init(Base)
+throw(InterruptException())
+"""
+
+julia_exepath() = Base.unsafe_string(Base.JLOptions().julia_bin)
+
+Artifacts = get(Base.loaded_modules,
+          Base.PkgId(Base.UUID("56f22d72-fd6d-98f1-02f0-08ddc0907c33"), "Artifacts"),
+          nothing)
+if Artifacts !== nothing
+    precompile_script *= """
+    using Artifacts, Base.BinaryPlatforms, Libdl
+    artifacts_toml = abspath(joinpath(Sys.STDLIB, "Artifacts", "test", "Artifacts.toml"))
+    artifact_hash("HelloWorldC", artifacts_toml)
+    artifacts = Artifacts.load_artifacts_toml(artifacts_toml)
+    platforms = [Artifacts.unpack_platform(e, "HelloWorldC", artifacts_toml) for e in artifacts["HelloWorldC"]]
+    best_platform = select_platform(Dict(p => triplet(p) for p in platforms))
+    if best_platform !== nothing
+      # @artifact errors for unsupported platforms
+      oldpwd = pwd(); cd(dirname(artifacts_toml))
+      macroexpand(Main, :(@artifact_str("HelloWorldC")))
+      cd(oldpwd)
+    end
+    dlopen("libjulia$(Base.isdebugbuild() ? "-debug" : "")", RTLD_LAZY | RTLD_DEEPBIND)
+    """
+    hardcoded_precompile_statements *= """
+    precompile(Tuple{typeof(Artifacts._artifact_str), Module, String, Base.SubString{String}, String, Base.Dict{String, Any}, Base.SHA1, Base.BinaryPlatforms.Platform, Base.Val{Artifacts}})
+    precompile(Tuple{typeof(Base.tryparse), Type{Base.BinaryPlatforms.Platform}, String})
+    """
+end
+
+FileWatching = get(Base.loaded_modules,
+          Base.PkgId(Base.UUID("7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"), "FileWatching"),
+          nothing)
+if FileWatching !== nothing
+    hardcoded_precompile_statements *= """
+    precompile(Tuple{typeof(FileWatching.watch_file), String, Float64})
+    precompile(Tuple{typeof(FileWatching.watch_file), String, Int})
+    precompile(Tuple{typeof(FileWatching._uv_hook_close), FileWatching.FileMonitor})
+    """
+end
+
+Libdl = get(Base.loaded_modules,
+          Base.PkgId(Base.UUID("8f399da3-3557-5675-b5ff-fb832c97cbdb"), "Libdl"),
+          nothing)
+if Libdl !== nothing
+    hardcoded_precompile_statements *= """
+    precompile(Tuple{typeof(Libc.Libdl.dlopen), String})
+    """
+end
+
+procenv = Dict{String,Any}(
+        "JULIA_LOAD_PATH" => "@$(Sys.iswindows() ? ";" : ":")@stdlib",
+        "JULIA_DEPOT_PATH" => Sys.iswindows() ? ";" : ":",
+        "TERM" => "",
+        # a piped-stdin child runs the REPL machinery; the REPL stdlib's pkgimage
+        # does not exist yet at sysimage-build time, so it must not be loaded
+        "JULIA_FALLBACK_REPL" => "true")
 
 function generate_precompile_statements()
-    start_time = time()
+    start_time = time_ns()
+    sysimg = Base.unsafe_string(Base.JLOptions().image_file)
 
-    # Precompile a package
+    statements = String[]
+    append!(statements, split(hardcoded_precompile_statements::String, '\n'))
+
+    # Collect statements from running the script in a fresh process: only such a
+    # process compiles (and therefore traces) the specializations that startup and
+    # code loading hit, since this process has already run them.
+    println("Collecting precompile statements")
     mktempdir() do prec_path
-        push!(DEPOT_PATH, prec_path)
-        push!(LOAD_PATH, prec_path)
+        # Also precompile a package here
         pkgname = "__PackagePrecompilationStatementModule"
-        mkpath(joinpath(prec_path, pkgname, "src"))
-        write(joinpath(prec_path, pkgname, "src", "$pkgname.jl"),
-              """
-              module $pkgname
-              end
-              """)
-        @eval using __PackagePrecompilationStatementModule
-        empty!(LOAD_PATH)
-        empty!(DEPOT_PATH)
-    end
-
-    print("Generating precompile statements...")
-    sysimg = isempty(ARGS) ? joinpath(dirname(Sys.BINDIR), "lib", "julia", "sys." * Libdl.dlext) : ARGS[1]
-
-    mktemp() do precompile_file, _
-        # Run a repl process and replay our script
-        repl_output_buffer = IOBuffer()
-        @static if Sys.iswindows()
-            # Fake being cygwin
-            pipename = """\\\\?\\pipe\\cygwin-$("0"^16)-pty10-abcdef"""
-            server = listen(pipename)
-            slave = connect(pipename)
-            @assert ccall(:jl_ispty, Cint, (Ptr{Cvoid},), slave.handle) == 1
-            master = accept(server)
-        else
-            slave, master = open_fake_pty()
-        end
-        done = false
-        withenv("JULIA_HISTORY" => tempname(), "JULIA_PROJECT" => nothing,
-                "TERM" => "") do
-            p = run(`$(julia_cmd()) -O0 --trace-compile=$precompile_file --sysimage $sysimg
-                    --compile=all --startup-file=no --color=yes
-                    -e 'import REPL; REPL.Terminals.is_precompiling[] = true'
-                    -i`,
-                    slave, slave, slave; wait=false)
-            readuntil(master, "julia>", keep=true)
-            @async begin
-                while true
-                    done && break
-                    write(repl_output_buffer, readavailable(master))
-                end
+        pkguuid = "824efdaf-a0e9-431c-8ee7-3d356b2531c2"
+        pkgpath = joinpath(prec_path, pkgname)
+        mkpath(joinpath(pkgpath, "src"))
+        write(joinpath(pkgpath, "src", "$pkgname.jl"),
+            """
+            module $pkgname
+            println("Precompiling $pkgname")
+            # like a package using Preferences.jl, so that writing the preferences into the cache is traced
+            Base.record_compiletime_preference(Base.UUID("$pkguuid"), "unset_preference")
             end
-            if have_repl
-                for l in split(precompile_script, '\n'; keepempty=false)
-                    write(master, l, '\n')
-                end
-            end
-            # TODO Figure out why exit() on Windows doesn't exit the process
-            if Sys.iswindows()
-                print(master, "ccall(:_exit, Cvoid, (Cint,), 0)\n")
-            else
-                write(master, "exit()\n")
-            end
-            wait(p)
-            done = true
-        end
-        close(master)
-
-        # Check what the REPL displayed
-        # repl_output = String(take!(repl_output_buffer))
-        # println(repl_output)
-
-        # Extract the precompile statements from stderr
-        statements = Set{String}()
-        for statement in split(read(precompile_file, String), '\n')
-            occursin("Main.", statement) && continue
-            push!(statements, statement)
-        end
-
-        if have_repl
-            # Seems like a reasonable number right now, adjust as needed
-            # comment out if debugging script
-            @assert length(statements) > 700
-        end
-
-        # Create a staging area where all the loaded packages are available
-        PrecompileStagingArea = Module()
-        for (_pkgid, _mod) in Base.loaded_modules
-            if !(_pkgid.name in ("Main", "Core", "Base"))
-                eval(PrecompileStagingArea, :($(Symbol(_mod)) = $_mod))
-            end
-        end
-
-        # Execute the collected precompile statements
-        include_time = @elapsed for statement in sort(collect(statements))
-            # println(statement)
+            """)
+        write(joinpath(pkgpath, "Project.toml"),
+            """
+            name = "$pkgname"
+            uuid = "$pkguuid"
+            """)
+        touch(joinpath(pkgpath, "Manifest.toml"))
+        tmp_prec = tempname(prec_path; cleanup=false)
+        tmp_proc = tempname(prec_path; cleanup=false)
+        tmp_tty = tempname(prec_path; cleanup=false)
+        s = """
+            pushfirst!(DEPOT_PATH, $(repr(joinpath(prec_path,"depot"))));
+            Base.PRECOMPILE_TRACE_COMPILE[] = $(repr(tmp_prec));
+            Base.Precompilation.precompilepkgs(;fancyprint=true);
+            $precompile_script
+            """
+        run(pipeline(addenv(`$(julia_exepath()) -O0 --trace-compile=$tmp_proc --sysimage $sysimg
+                --cpu-target=native --startup-file=no --color=yes --project=$(pkgpath)`, procenv),
+                 stdin=IOBuffer(s), stderr=debug_output, stdout=debug_output))
+        if Sys.isunix()
             try
-                Base.include_string(PrecompileStagingArea, statement)
+                script = joinpath(prec_path, "tty_script.jl")
+                write(script, tty_script)
+                pts, ptm = open_fake_pty()
+                outbuf = IOBuffer()
+                drain = @async try
+                    while !eof(ptm)
+                        write(outbuf, readavailable(ptm))
+                    end
+                catch # ignore EIO when the child exits
+                end
+                p = run(addenv(`$(julia_exepath()) -O0 --trace-compile=$tmp_tty --sysimage $sysimg
+                        --cpu-target=native --startup-file=no --color=yes $script`, procenv),
+                        devnull, pts, pts; wait=false)
+                Base.close_stdio(pts)
+                wait(p)
+                wait(drain)
+                close(ptm)
+                output = String(take!(outbuf))
+                # the script must reach its final `throw` for the error path to be traced
+                occursin("InterruptException", output) ||
+                    error("unexpected output from the pty-attached process:\n$output")
             catch ex
-                @error "Failed to precompile $statement"
-                rethrow(ex)
+                @warn "Failed to collect precompile statements from the pty-attached process" exception=(ex, catch_backtrace())
             end
         end
-        print(" $(length(statements)) generated in ")
-        tot_time = time() - start_time
-        Base.time_print(tot_time * 10^9)
-        print(" (overhead "); Base.time_print((tot_time - include_time) * 10^9); println(")")
+        for (name, f) in (("package precompilation", tmp_prec), ("script", tmp_proc))
+            n = isfile(f) ? countlines(f) : 0
+            if n == 0
+                # in a real sysimage build (bare sysimage) both processes trace plenty;
+                # when run standalone against a finished sysimage they may trace nothing
+                msg = "no precompile statements were traced from the $name process"
+                Base.get_bool_env("CI", false) ? error(msg) : @warn(msg)
+            end
+            n > 0 && append!(statements, eachline(f))
+        end
+        isfile(tmp_tty) && append!(statements, eachline(tmp_tty))
     end
 
+    # Create a staging area where all the loaded packages are available
+    PrecompileStagingArea = Module()
+    for (_pkgid, _mod) in Base.loaded_modules
+        if !(_pkgid.name in ("Main", "Core", "Base"))
+            Core.eval(PrecompileStagingArea, :(const $(Symbol(_mod)) = $_mod))
+        end
+    end
+    Core.eval(PrecompileStagingArea, :(const Compiler = Base.Compiler))
+
+    println("Executing precompile statements")
+    n_succeeded = 0
+    executed = Set{String}()
+    for statement in statements
+        # package precompilation traces put the compile time in a leading `#= ... =#`
+        statement = strip(replace(statement, r"^#=.*?=#" => ""))
+        # the hardcoded statements are written as a commented block
+        (isempty(statement) || startswith(statement, '#')) && continue
+        # Main should be completely clean
+        occursin("Main.", statement) && continue
+        Base.in!(statement, executed) && continue
+        try
+            ps = Meta.parse(statement; mod=Base)
+            isexpr(ps, :call) || error("statement does not parse to a call")
+            popfirst!(ps.args) # precompile(...)
+            ps.head = :tuple
+            ps = Core.eval(PrecompileStagingArea, ps)
+            precompile(ps...) || error("precompile returned false")
+            n_succeeded += 1
+        catch ex
+            # See #28808
+            Base.get_bool_env("CI", false) && error("Precompilation failed for $statement")
+            @warn "Failed to precompile expression" form=statement exception=(ex,catch_backtrace()) _module=nothing _file=nothing _line=0
+        end
+    end
+    failed = length(executed) - n_succeeded
+    println("Executed $n_succeeded precompile statements", failed > 0 ? " ($failed failed)" : "")
+
+    tot_time = time_ns() - start_time
+    println("Precompilation complete. Summary:")
+    print("Total ─────── "); Base.time_print(stdout, tot_time); println()
+    GC.gc(true); GC.gc(false); # reduce memory footprint
     return
 end
 
 generate_precompile_statements()
 
+println("Outputting sysimage file...")
+
+# Print report after sysimage has been saved so all time spent can be captured
+let pre_output_time = time_ns()
+    Base.postoutput() do
+        output_time = time_ns() - pre_output_time
+        print(Core.stdout, "Output ────── "); Base.time_print(Core.stdout, output_time); println(Core.stdout)
+    end
+end
+
+end # if
 end # @eval
-end # let

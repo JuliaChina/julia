@@ -38,6 +38,12 @@
 
 enum ArgClass { Integer, Sse, SseUp, X87, X87Up, ComplexX87, NoClass, Memory };
 
+static bool is_fp_scalar_type(jl_value_t *t)
+{
+    return t == (jl_value_t*)jl_float64_type || t == (jl_value_t*)jl_float32_type ||
+           t == (jl_value_t*)jl_float16_type || t == (jl_value_t*)jl_bfloat16_type;
+}
+
 struct ABI_x86_64Layout : AbiLayout {
 
 // used to track the state of the ABI generator during
@@ -115,10 +121,10 @@ struct Classification {
         // make sure other half knows about it too:
         accum.addField(offset+16, ComplexX87);
     } */
-void classifyType(Classification& accum, jl_datatype_t *dt, uint64_t offset) const
+void classifyType(Classification& accum, jl_datatype_t *dt, uint64_t offset) const JL_CANSAFEPOINT
 {
     // Floating point types
-    if (dt == jl_float64_type || dt == jl_float32_type) {
+    if (is_fp_scalar_type((jl_value_t*)dt)) {
         accum.addField(offset, Sse);
     }
     // Misc types
@@ -146,13 +152,26 @@ void classifyType(Classification& accum, jl_datatype_t *dt, uint64_t offset) con
     else if (is_native_simd_type(dt)) {
         accum.addField(offset, Sse);
     }
-    // Other struct types
-    else if (jl_datatype_size(dt) <= 16) {
+    // GCC passes one-element floating-point vectors in memory.
+    else if (is_vector_type(dt) && jl_datatype_nfields(dt) == 1 &&
+             is_fp_scalar_type(jl_tparam0(jl_field_type(dt, 0)))) {
+        accum.addField(offset, Memory);
+    }
+    // Other 64-bit vectors use class SSE.
+    else if (is_vector_type(dt) && jl_datatype_size(dt) == 8) {
+        accum.addField(offset, Sse);
+    }
+    // Other aggregates, including GCC's smaller multi-element vectors.
+    else if (jl_datatype_size(dt) <= 16 && dt->layout && !jl_is_layout_opaque(dt->layout)) {
         size_t i;
         for (i = 0; i < jl_datatype_nfields(dt); ++i) {
             jl_value_t *ty = jl_field_type(dt, i);
-            if (!jl_is_datatype(ty) || ((jl_datatype_t*)ty)->layout == NULL || jl_is_array_type(ty))
+            if (jl_field_isptr(dt, i))
                 ty = (jl_value_t*)jl_voidpointer_type;
+            else if (!jl_is_datatype(ty)) { // inline union
+                accum.addField(offset, Memory);
+                continue;
+            }
             classifyType(accum, (jl_datatype_t*)ty, offset + jl_field_offset(dt, i));
         }
     }
@@ -161,14 +180,14 @@ void classifyType(Classification& accum, jl_datatype_t *dt, uint64_t offset) con
     }
 }
 
-Classification classify(jl_datatype_t *dt) const
+Classification classify(jl_datatype_t *dt) const JL_CANSAFEPOINT
 {
     Classification cl;
     classifyType(cl, dt, 0);
     return cl;
 }
 
-bool use_sret(jl_datatype_t *dt) override
+bool use_sret(jl_datatype_t *dt, LLVMContext &ctx) override JL_CANSAFEPOINT
 {
     int sret = classify(dt).isMemory;
     if (sret) {
@@ -178,11 +197,11 @@ bool use_sret(jl_datatype_t *dt) override
     return sret;
 }
 
-bool needPassByRef(jl_datatype_t *dt, AttrBuilder &ab) override
+bool needPassByRef(jl_datatype_t *dt, AttrBuilder &ab, LLVMContext &ctx, Type *Ty) override JL_CANSAFEPOINT
 {
     Classification cl = classify(dt);
     if (cl.isMemory) {
-        ab.addAttribute(Attribute::ByVal);
+        ab.addByValAttr(Ty);
         return true;
     }
 
@@ -202,7 +221,7 @@ bool needPassByRef(jl_datatype_t *dt, AttrBuilder &ab) override
     else if (jl_is_structtype(dt)) {
         // spill to memory even though we would ordinarily pass
         // it in registers
-        ab.addAttribute(Attribute::ByVal);
+        ab.addByValAttr(Ty);
         return true;
     }
     return false;
@@ -210,7 +229,7 @@ bool needPassByRef(jl_datatype_t *dt, AttrBuilder &ab) override
 
 // Called on behalf of ccall to determine preferred LLVM representation
 // for an argument or return value.
-Type *preferred_llvm_type(jl_datatype_t *dt, bool isret) const override
+Type *preferred_llvm_type(jl_datatype_t *dt, bool isret, LLVMContext &ctx) const override JL_CANSAFEPOINT
 {
     (void) isret;
     // no need to rewrite these types (they are returned as pointers anyways)
@@ -218,7 +237,7 @@ Type *preferred_llvm_type(jl_datatype_t *dt, bool isret) const override
         return NULL;
 
     size_t size = jl_datatype_size(dt);
-    size_t nbits = jl_datatype_nbits(dt);
+    size_t nbits = size * 8;
     if (size > 16 || size == 0)
         return NULL;
 
@@ -230,15 +249,17 @@ Type *preferred_llvm_type(jl_datatype_t *dt, bool isret) const override
     switch (cl.classes[0]) {
         case Integer:
             if (size >= 8)
-                types[0] = T_int64;
+                types[0] = Type::getInt64Ty(ctx);
             else
-                types[0] = Type::getIntNTy(jl_LLVMContext, nbits);
+                types[0] = Type::getIntNTy(ctx, nbits);
             break;
         case Sse:
-            if (size <= 4)
-                types[0] = T_float32;
+            if (size <= 2)
+                types[0] = Type::getHalfTy(ctx);
+            else if (size <= 4)
+                types[0] = Type::getFloatTy(ctx);
             else
-                types[0] = T_float64;
+                types[0] = Type::getDoubleTy(ctx);
             break;
         default:
             assert(0 && "Unexpected cl.classes[0]");
@@ -248,14 +269,17 @@ Type *preferred_llvm_type(jl_datatype_t *dt, bool isret) const override
             return types[0];
         case Integer:
             assert(size > 8);
-            types[1] = Type::getIntNTy(jl_LLVMContext, (nbits-64));
-            return StructType::get(jl_LLVMContext,ArrayRef<Type*>(&types[0],2));
+            // Keep i128 intact so register exhaustion spills the whole argument.
+            if (size == 16 && jl_is_primitivetype(dt))
+                return Type::getInt128Ty(ctx);
+            types[1] = Type::getIntNTy(ctx, (nbits-64));
+            return StructType::get(ctx,ArrayRef<Type*>(&types[0],2));
         case Sse:
             if (size <= 12)
-                types[1] = T_float32;
+                types[1] = Type::getFloatTy(ctx);
             else
-                types[1] = T_float64;
-            return StructType::get(jl_LLVMContext,ArrayRef<Type*>(&types[0],2));
+                types[1] = Type::getDoubleTy(ctx);
+            return StructType::get(ctx,ArrayRef<Type*>(&types[0],2));
         default:
             assert(0 && "Unexpected cl.classes[0]");
     }

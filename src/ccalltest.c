@@ -1,26 +1,9 @@
 // This file is a part of Julia. License is MIT: https://julialang.org/license
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <complex.h>
-#include <stdint.h>
-#include <inttypes.h>
-
-#include "../src/support/platform.h"
-#include "../src/support/dtypes.h"
-
-#ifdef _P64
-#define jint int64_t
-#define PRIjint PRId64
-#else
-#define jint int32_t
-#define PRIjint PRId32
-#endif
+#include "ccalltest_common.h"
 
 int verbose = 1;
-
 int c_int = 0;
-
 
 //////////////////////////////////
 // Test for proper argument register truncation
@@ -28,12 +11,8 @@ int c_int = 0;
 int xs[300] = {0,0,0,1,0};
 
 //int testUcharX(unsigned char x);
-#ifdef _COMPILER_MICROSOFT_
-int __declspec(noinline)
-#else
 int __attribute__((noinline))
-#endif
-JL_DLLEXPORT testUcharX(unsigned char x) {
+DLLEXPORT testUcharX(unsigned char x) {
     return xs[x];
 }
 
@@ -47,41 +26,41 @@ typedef struct {
     jint imag;
 } complex_t;
 
-JL_DLLEXPORT complex_t ctest(complex_t a) {
+DLLEXPORT complex_t ctest(complex_t a) {
     a.real += 1;
     a.imag -= 2;
     return a;
 }
 
-JL_DLLEXPORT complex double cgtest(complex double a) {
+DLLEXPORT complex double cgtest(complex double a) {
     //Unpack a ComplexPair{Float64} struct
     if (verbose) fprintf(stderr,"%g + %g i\n", creal(a), cimag(a));
     a += 1 - (2.0*I);
     return a;
 }
 
-JL_DLLEXPORT complex double *cgptest(complex double *a) {
-    //Unpack a ComplexPair{Float64} struct
+DLLEXPORT complex double *cgptest(complex double *a) {
+    //Unpack a ComplexPair{Float64} struct pointer
     if (verbose) fprintf(stderr,"%g + %g i\n", creal(*a), cimag(*a));
     *a += 1 - (2.0*I);
     return a;
 }
 
-JL_DLLEXPORT complex float cftest(complex float a) {
+DLLEXPORT complex float cftest(complex float a) {
     //Unpack a ComplexPair{Float32} struct
     if (verbose) fprintf(stderr,"%g + %g i\n", creal(a), cimag(a));
     a += 1 - (2.0*I);
     return a;
 }
 
-JL_DLLEXPORT complex float *cfptest(complex float *a) {
-    //Unpack a ComplexPair{Float64} struct
+DLLEXPORT complex float *cfptest(complex float *a) {
+    //Unpack a ComplexPair{Float32} struct pointer
     if (verbose) fprintf(stderr,"%g + %g i\n", creal(*a), cimag(*a));
     *a += 1 - (2.0*I);
     return a;
 }
 
-JL_DLLEXPORT complex_t *cptest(complex_t *a) {
+DLLEXPORT complex_t *cptest(complex_t *a) {
     //Unpack a ComplexPair{Int} struct pointer
     if (verbose) fprintf(stderr,"%" PRIjint " + %" PRIjint " i\n", a->real, a->imag);
     a->real += 1;
@@ -89,9 +68,9 @@ JL_DLLEXPORT complex_t *cptest(complex_t *a) {
     return a;
 }
 
-JL_DLLEXPORT complex_t *cptest_static(complex_t *a) {
+DLLEXPORT complex_t *cptest_static(complex_t *a) {
     if (verbose) fprintf(stderr,"%" PRIjint " + %" PRIjint " i\n", a->real, a->imag);
-    complex_t *b = (complex_t*)malloc(sizeof(complex_t));
+    complex_t *b = (complex_t*)malloc_s(sizeof(complex_t));
     b->real = a->real;
     b->imag = a->imag;
     return b;
@@ -331,7 +310,7 @@ typedef struct {
 #endif // _COMPILER_INTEL_
 
 
-JL_DLLEXPORT struct1 test_1(struct1 a, float b) {
+DLLEXPORT struct1 test_1(struct1 a, float b) {
     //Unpack a "small" struct { float, double }
     if (verbose) fprintf(stderr,"%g + %g i & %g\n", a.x, a.y, b);
     a.x += b * 1;
@@ -339,7 +318,7 @@ JL_DLLEXPORT struct1 test_1(struct1 a, float b) {
     return a;
 }
 
-JL_DLLEXPORT struct1 test_1long_a(jint x1, jint x2, jint x3, struct1 a, float b) {
+DLLEXPORT struct1 test_1long_a(jint x1, jint x2, jint x3, struct1 a, float b) {
     //Unpack a "small" struct { float, double }
     if (verbose) fprintf(stderr,"(%" PRIjint ", %" PRIjint ", %" PRIjint ") & %g + %g i & %g\n", x1, x2, x3, a.x, a.y, b);
     a.x += b + x1 + x2 + x3;
@@ -347,7 +326,7 @@ JL_DLLEXPORT struct1 test_1long_a(jint x1, jint x2, jint x3, struct1 a, float b)
     return a;
 }
 
-JL_DLLEXPORT struct1 test_1long_b(jint x1, double x2, jint x3, struct1 a, float b) {
+DLLEXPORT struct1 test_1long_b(jint x1, double x2, jint x3, struct1 a, float b) {
     //Unpack a "small" struct { float, double }
     if (verbose) fprintf(stderr,"(%" PRIjint ", %g, %" PRIjint ") & %g + %g i & %g\n", x1, x2, x3, a.x, a.y, b);
     a.x += b + x1 + x2 + x3;
@@ -355,7 +334,7 @@ JL_DLLEXPORT struct1 test_1long_b(jint x1, double x2, jint x3, struct1 a, float 
     return a;
 }
 
-JL_DLLEXPORT struct1 test_1long_c(jint x1, double x2, jint x3, jint x4, struct1 a, float b) {
+DLLEXPORT struct1 test_1long_c(jint x1, double x2, jint x3, jint x4, struct1 a, float b) {
     //Unpack a "small" struct { float, double }
     if (verbose) fprintf(stderr,"(%" PRIjint ", %g, %" PRIjint ", %" PRIjint ") & %g + %g i & %g\n", x1, x2, x3, x4, a.x, a.y, b);
     a.x += b + x1 + x2 + x3 + x4;
@@ -363,7 +342,7 @@ JL_DLLEXPORT struct1 test_1long_c(jint x1, double x2, jint x3, jint x4, struct1 
     return a;
 }
 
-JL_DLLEXPORT struct2a test_2a(struct2a a, int32_t b) {
+DLLEXPORT struct2a test_2a(struct2a a, int32_t b) {
     //Unpack a ComplexPair{Int32} struct
     if (verbose) fprintf(stderr,"%" PRId32 " + %" PRId32 " i & %" PRId32 "\n", a.x.x, a.y.y, b);
     a.x.x += b*1;
@@ -371,7 +350,7 @@ JL_DLLEXPORT struct2a test_2a(struct2a a, int32_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct2b test_2b(struct2b a, int32_t b) {
+DLLEXPORT struct2b test_2b(struct2b a, int32_t b) {
     //Unpack a ComplexPair{Int32} struct
     if (verbose) fprintf(stderr,"%" PRId32 " + %" PRId32 " i & %" PRId32 "\n", a.x, a.y, b);
     a.x += b*1;
@@ -379,7 +358,7 @@ JL_DLLEXPORT struct2b test_2b(struct2b a, int32_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct3a test_3a(struct3a a, int64_t b) {
+DLLEXPORT struct3a test_3a(struct3a a, int64_t b) {
     //Unpack a ComplexPair{Int64} struct
     if (verbose) fprintf(stderr,"%" PRId64 " + %" PRId64 " i & %" PRId64 "\n", a.x.x, a.y.y, b);
     a.x.x += b*1;
@@ -387,7 +366,7 @@ JL_DLLEXPORT struct3a test_3a(struct3a a, int64_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct3b test_3b(struct3b a, int64_t b) {
+DLLEXPORT struct3b test_3b(struct3b a, int64_t b) {
     //Unpack a ComplexPair{Int64} struct
     if (verbose) fprintf(stderr,"%" PRId64 " + %" PRId64 " i & %" PRId64 "\n", a.x, a.y, b);
     a.x += b*1;
@@ -395,7 +374,7 @@ JL_DLLEXPORT struct3b test_3b(struct3b a, int64_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct4 test_4(struct4 a, int32_t b) {
+DLLEXPORT struct4 test_4(struct4 a, int32_t b) {
     if (verbose) fprintf(stderr,"%" PRId32 ",%" PRId32 ",%" PRId32 " & %" PRId32 "\n", a.x, a.y, a.z, b);
     a.x += b*1;
     a.y -= b*2;
@@ -403,7 +382,7 @@ JL_DLLEXPORT struct4 test_4(struct4 a, int32_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct5 test_5(struct5 a, int32_t b) {
+DLLEXPORT struct5 test_5(struct5 a, int32_t b) {
     if (verbose) fprintf(stderr,"%" PRId32 ",%" PRId32 ",%" PRId32 ",%" PRId32 " & %" PRId32 "\n", a.x, a.y, a.z, a.a, b);
     a.x += b*1;
     a.y -= b*2;
@@ -413,7 +392,7 @@ JL_DLLEXPORT struct5 test_5(struct5 a, int32_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct6 test_6(struct6 a, int64_t b) {
+DLLEXPORT struct6 test_6(struct6 a, int64_t b) {
     if (verbose) fprintf(stderr,"%" PRId64 ",%" PRId64 ",%" PRId64 " & %" PRId64 "\n", a.x, a.y, a.z, b);
     a.x += b*1;
     a.y -= b*2;
@@ -421,28 +400,28 @@ JL_DLLEXPORT struct6 test_6(struct6 a, int64_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct7 test_7(struct7 a, int8_t b) {
+DLLEXPORT struct7 test_7(struct7 a, int8_t b) {
     if (verbose) fprintf(stderr,"%" PRId64 ",%" PRId8 " & %" PRId8 "\n", a.x, a.y, b);
     a.x += b*1;
     a.y -= b*2;
     return a;
 }
 
-JL_DLLEXPORT struct8 test_8(struct8 a, int8_t b) {
+DLLEXPORT struct8 test_8(struct8 a, int8_t b) {
     if (verbose) fprintf(stderr,"%" PRId32 ",%" PRId8 " & %" PRId8 "\n", a.x, a.y, b);
     a.x += b*1;
     a.y -= b*2;
     return a;
 }
 
-JL_DLLEXPORT struct9 test_9(struct9 a, int16_t b) {
+DLLEXPORT struct9 test_9(struct9 a, int16_t b) {
     if (verbose) fprintf(stderr,"%" PRId32 ",%" PRId16 " & %" PRId16 "\n", a.x, a.y, b);
     a.x += b*1;
     a.y -= b*2;
     return a;
 }
 
-JL_DLLEXPORT struct10 test_10(struct10 a, int8_t b) {
+DLLEXPORT struct10 test_10(struct10 a, int8_t b) {
     if (verbose) fprintf(stderr,"%" PRId8 ",%" PRId8 ",%" PRId8 ",%" PRId8 " & %" PRId8 "\n", a.x, a.y, a.z, a.a, b);
     a.x += b*1;
     a.y -= b*2;
@@ -452,14 +431,14 @@ JL_DLLEXPORT struct10 test_10(struct10 a, int8_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct11 test_11(struct11 a, float b) {
+DLLEXPORT struct11 test_11(struct11 a, float b) {
     //Unpack a nested ComplexPair{Float32} struct
     if (verbose) fprintf(stderr,"%g + %g i & %g\n", creal(a.x), cimag(a.x), b);
     a.x += b*1 - (b*2.0*I);
     return a;
 }
 
-JL_DLLEXPORT struct12 test_12(struct12 a, float b) {
+DLLEXPORT struct12 test_12(struct12 a, float b) {
     //Unpack two nested ComplexPair{Float32} structs
     if (verbose) fprintf(stderr,"%g + %g i & %g + %g i & %g\n",
                          creal(a.x), cimag(a.x), creal(a.y), cimag(a.y), b);
@@ -468,14 +447,14 @@ JL_DLLEXPORT struct12 test_12(struct12 a, float b) {
     return a;
 }
 
-JL_DLLEXPORT struct13 test_13(struct13 a, double b) {
+DLLEXPORT struct13 test_13(struct13 a, double b) {
     //Unpack a nested ComplexPair{Float64} struct
     if (verbose) fprintf(stderr,"%g + %g i & %g\n", creal(a.x), cimag(a.x), b);
     a.x += b*1 - (b*2.0*I);
     return a;
 }
 
-JL_DLLEXPORT struct14 test_14(struct14 a, float b) {
+DLLEXPORT struct14 test_14(struct14 a, float b) {
     //The C equivalent of a  ComplexPair{Float32} struct (but without special complex ABI)
     if (verbose) fprintf(stderr,"%g + %g i & %g\n", a.x, a.y, b);
     a.x += b*1;
@@ -483,7 +462,7 @@ JL_DLLEXPORT struct14 test_14(struct14 a, float b) {
     return a;
 }
 
-JL_DLLEXPORT struct15 test_15(struct15 a, double b) {
+DLLEXPORT struct15 test_15(struct15 a, double b) {
     //The C equivalent of a  ComplexPair{Float64} struct (but without special complex ABI)
     if (verbose) fprintf(stderr,"%g + %g i & %g\n", a.x, a.y, b);
     a.x += b*1;
@@ -491,7 +470,7 @@ JL_DLLEXPORT struct15 test_15(struct15 a, double b) {
     return a;
 }
 
-JL_DLLEXPORT struct16 test_16(struct16 a, float b) {
+DLLEXPORT struct16 test_16(struct16 a, float b) {
     //Unpack a struct with non-obvious packing requirements
     if (verbose) fprintf(stderr,"%g %g %g %g %g %g & %g\n", a.x, a.y, a.z, a.a, a.b, a.c, b);
     a.x += b*1;
@@ -503,7 +482,7 @@ JL_DLLEXPORT struct16 test_16(struct16 a, float b) {
     return a;
 }
 
-JL_DLLEXPORT struct17 test_17(struct17 a, int8_t b) {
+DLLEXPORT struct17 test_17(struct17 a, int8_t b) {
     //Unpack a struct with non-obvious packing requirements
     if (verbose) fprintf(stderr,"%d %d & %d\n", (int)a.a, (int)a.b, (int)b);
     a.a += b*1;
@@ -511,7 +490,7 @@ JL_DLLEXPORT struct17 test_17(struct17 a, int8_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct18 test_18(struct18 a, int8_t b) {
+DLLEXPORT struct18 test_18(struct18 a, int8_t b) {
     //Unpack a struct with non-obvious packing requirements
     if (verbose) fprintf(stderr,"%d %d %d & %d\n",
                          (int)a.a, (int)a.b, (int)a.c, (int)b);
@@ -526,7 +505,7 @@ JL_DLLEXPORT struct18 test_18(struct18 a, int8_t b) {
 // However, it happens to have the same calling convention with `[2 x i64]`
 // when used as first argument or return value.
 #define int128_t struct3b
-JL_DLLEXPORT int128_t test_128(int128_t a, int64_t b) {
+DLLEXPORT int128_t test_128(int128_t a, int64_t b) {
     //Unpack a Int128
     if (verbose) fprintf(stderr,"0x%016" PRIx64 "%016" PRIx64 " & %" PRId64 "\n", a.y, a.x, b);
     a.x += b*1;
@@ -535,7 +514,7 @@ JL_DLLEXPORT int128_t test_128(int128_t a, int64_t b) {
     return a;
 }
 
-JL_DLLEXPORT struct_big test_big(struct_big a) {
+DLLEXPORT struct_big test_big(struct_big a) {
     //Unpack a "big" struct { int, int, char }
     if (verbose) fprintf(stderr,"%" PRIjint " %" PRIjint " %c\n", a.x, a.y, a.z);
     a.x += 1;
@@ -544,7 +523,7 @@ JL_DLLEXPORT struct_big test_big(struct_big a) {
     return a;
 }
 
-JL_DLLEXPORT struct_big test_big_long(jint x1, jint x2, jint x3, struct_big a) {
+DLLEXPORT struct_big test_big_long(jint x1, jint x2, jint x3, struct_big a) {
     //Unpack a "big" struct { int, int, char }
     if (verbose) fprintf(stderr,"(%" PRIjint ", %" PRIjint ", %" PRIjint ") %" PRIjint " %" PRIjint " %c\n", x1, x2, x3, a.x, a.y, a.z);
     a.x += 1 + x1 + x2 + x3;
@@ -554,7 +533,7 @@ JL_DLLEXPORT struct_big test_big_long(jint x1, jint x2, jint x3, struct_big a) {
 }
 
 #define test_huge(suffix, reg) \
-JL_DLLEXPORT struct_huge##suffix test_huge##suffix(char a, struct_huge##suffix b, char c) { \
+DLLEXPORT struct_huge##suffix test_huge##suffix(char a, struct_huge##suffix b, char c) { \
     if (verbose) fprintf(stderr,"%c-%c\n", a, c); \
     b.reg *= 39; \
     return b; \
@@ -577,7 +556,7 @@ test_huge(5b, r1);
 
 // Enough arguments for architectures that uses registers for integer or
 // floating point arguments to spill.
-JL_DLLEXPORT int test_long_args_intp(int *a1, int *a2, int *a3, int *a4,
+DLLEXPORT int test_long_args_intp(int *a1, int *a2, int *a3, int *a4,
                                      int *a5, int *a6, int *a7, int *a8,
                                      int *a9, int *a10, int *a11, int *a12,
                                      int *a13, int *a14)
@@ -586,7 +565,7 @@ JL_DLLEXPORT int test_long_args_intp(int *a1, int *a2, int *a3, int *a4,
             *a11 + *a12 + *a13 + *a14);
 }
 
-JL_DLLEXPORT int test_long_args_int(int a1, int a2, int a3, int a4,
+DLLEXPORT int test_long_args_int(int a1, int a2, int a3, int a4,
                                     int a5, int a6, int a7, int a8,
                                     int a9, int a10, int a11, int a12,
                                     int a13, int a14)
@@ -595,7 +574,7 @@ JL_DLLEXPORT int test_long_args_int(int a1, int a2, int a3, int a4,
             a11 + a12 + a13 + a14);
 }
 
-JL_DLLEXPORT float test_long_args_float(float a1, float a2, float a3,
+DLLEXPORT float test_long_args_float(float a1, float a2, float a3,
                                         float a4, float a5, float a6,
                                         float a7, float a8, float a9,
                                         float a10, float a11, float a12,
@@ -605,7 +584,7 @@ JL_DLLEXPORT float test_long_args_float(float a1, float a2, float a3,
             a11 + a12 + a13 + a14);
 }
 
-JL_DLLEXPORT double test_long_args_double(double a1, double a2, double a3,
+DLLEXPORT double test_long_args_double(double a1, double a2, double a3,
                                           double a4, double a5, double a6,
                                           double a7, double a8, double a9,
                                           double a10, double a11, double a12,
@@ -620,59 +599,59 @@ typedef struct {
     int *b;
 } struct_spill_pint;
 
-JL_DLLEXPORT int test_spill_int1(int *v1, struct_spill_pint s)
+DLLEXPORT int test_spill_int1(int *v1, struct_spill_pint s)
 {
     return *v1 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int2(int *v1, int *v2, struct_spill_pint s)
+DLLEXPORT int test_spill_int2(int *v1, int *v2, struct_spill_pint s)
 {
     return *v1 + *v2 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int3(int *v1, int *v2, int *v3, struct_spill_pint s)
+DLLEXPORT int test_spill_int3(int *v1, int *v2, int *v3, struct_spill_pint s)
 {
     return *v1 + *v2 + *v3 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int4(int *v1, int *v2, int *v3, int *v4,
+DLLEXPORT int test_spill_int4(int *v1, int *v2, int *v3, int *v4,
                                  struct_spill_pint s)
 {
     return *v1 + *v2 + *v3 + *v4 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int5(int *v1, int *v2, int *v3, int *v4, int *v5,
+DLLEXPORT int test_spill_int5(int *v1, int *v2, int *v3, int *v4, int *v5,
                                  struct_spill_pint s)
 {
     return *v1 + *v2 + *v3 + *v4 + *v5 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int6(int *v1, int *v2, int *v3, int *v4, int *v5,
+DLLEXPORT int test_spill_int6(int *v1, int *v2, int *v3, int *v4, int *v5,
                                  int *v6, struct_spill_pint s)
 {
     return *v1 + *v2 + *v3 + *v4 + *v5 + *v6 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int7(int *v1, int *v2, int *v3, int *v4, int *v5,
+DLLEXPORT int test_spill_int7(int *v1, int *v2, int *v3, int *v4, int *v5,
                                  int *v6, int *v7, struct_spill_pint s)
 {
     return *v1 + *v2 + *v3 + *v4 + *v5 + *v6 + *v7 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int8(int *v1, int *v2, int *v3, int *v4, int *v5,
+DLLEXPORT int test_spill_int8(int *v1, int *v2, int *v3, int *v4, int *v5,
                                  int *v6, int *v7, int *v8, struct_spill_pint s)
 {
     return *v1 + *v2 + *v3 + *v4 + *v5 + *v6 + *v7 + *v8 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int9(int *v1, int *v2, int *v3, int *v4, int *v5,
+DLLEXPORT int test_spill_int9(int *v1, int *v2, int *v3, int *v4, int *v5,
                                  int *v6, int *v7, int *v8, int *v9,
                                  struct_spill_pint s)
 {
     return *v1 + *v2 + *v3 + *v4 + *v5 + *v6 + *v7 + *v8 + *v9 + *s.a + *s.b;
 }
 
-JL_DLLEXPORT int test_spill_int10(int *v1, int *v2, int *v3, int *v4, int *v5,
+DLLEXPORT int test_spill_int10(int *v1, int *v2, int *v3, int *v4, int *v5,
                                   int *v6, int *v7, int *v8, int *v9, int *v10,
                                   struct_spill_pint s)
 {
@@ -685,79 +664,79 @@ typedef struct {
     float b;
 } struct_spill_float;
 
-JL_DLLEXPORT float test_spill_float1(float v1, struct_spill_float s)
+DLLEXPORT float test_spill_float1(float v1, struct_spill_float s)
 {
     return v1 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float2(float v1, float v2, struct_spill_float s)
+DLLEXPORT float test_spill_float2(float v1, float v2, struct_spill_float s)
 {
     return v1 + v2 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float3(float v1, float v2, float v3,
+DLLEXPORT float test_spill_float3(float v1, float v2, float v3,
                                      struct_spill_float s)
 {
     return v1 + v2 + v3 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float4(float v1, float v2, float v3, float v4,
+DLLEXPORT float test_spill_float4(float v1, float v2, float v3, float v4,
                                      struct_spill_float s)
 {
     return v1 + v2 + v3 + v4 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float5(float v1, float v2, float v3, float v4,
+DLLEXPORT float test_spill_float5(float v1, float v2, float v3, float v4,
                                      float v5, struct_spill_float s)
 {
     return v1 + v2 + v3 + v4 + v5 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float6(float v1, float v2, float v3, float v4,
+DLLEXPORT float test_spill_float6(float v1, float v2, float v3, float v4,
                                      float v5, float v6, struct_spill_float s)
 {
     return v1 + v2 + v3 + v4 + v5 + v6 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float7(float v1, float v2, float v3, float v4,
+DLLEXPORT float test_spill_float7(float v1, float v2, float v3, float v4,
                                      float v5, float v6, float v7,
                                      struct_spill_float s)
 {
     return v1 + v2 + v3 + v4 + v5 + v6 + v7 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float8(float v1, float v2, float v3, float v4,
+DLLEXPORT float test_spill_float8(float v1, float v2, float v3, float v4,
                                      float v5, float v6, float v7, float v8,
                                      struct_spill_float s)
 {
     return v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float9(float v1, float v2, float v3, float v4,
+DLLEXPORT float test_spill_float9(float v1, float v2, float v3, float v4,
                                      float v5, float v6, float v7, float v8,
                                      float v9, struct_spill_float s)
 {
     return v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + s.a + s.b;
 }
 
-JL_DLLEXPORT float test_spill_float10(float v1, float v2, float v3, float v4,
+DLLEXPORT float test_spill_float10(float v1, float v2, float v3, float v4,
                                       float v5, float v6, float v7, float v8,
                                       float v9, float v10, struct_spill_float s)
 {
     return (v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + s.a + s.b);
 }
 
-JL_DLLEXPORT int get_c_int(void)
+DLLEXPORT int get_c_int(void)
 {
     return c_int;
 }
 
-JL_DLLEXPORT void set_c_int(int i)
+DLLEXPORT void set_c_int(int i)
 {
     c_int = i;
 }
 
-JL_DLLEXPORT void finalizer_cptr(void* v)
+DLLEXPORT void finalizer_cptr(void* v)
 {
     set_c_int(-1);
 }
@@ -766,7 +745,7 @@ JL_DLLEXPORT void finalizer_cptr(void* v)
 //////////////////////////////////
 // Turn off verbose for automated tests, leave on for debugging
 
-JL_DLLEXPORT void set_verbose(int level) {
+DLLEXPORT void set_verbose(int level) {
     verbose = level;
 }
 
@@ -774,15 +753,16 @@ JL_DLLEXPORT void set_verbose(int level) {
 //////////////////////////////////
 // Other tests
 
-JL_DLLEXPORT void *test_echo_p(void *p) {
+DLLEXPORT void *test_echo_p(void *p) {
     return p;
 }
 
-#if defined(_CPU_X86_64_)
+#if defined(_CPU_X86_64_) || defined(_CPU_X86_)
 
 #include <xmmintrin.h>
 
-JL_DLLEXPORT __m128i test_m128i(__m128i a, __m128i b, __m128i c, __m128i d)
+DLLEXPORT __attribute__((target("sse2")))
+__m128i test_m128i(__m128i a, __m128i b, __m128i c, __m128i d)
 {
     // 64-bit x86 has only level 2 SSE, which does not have a <4 x int32> multiplication,
     // so we use floating-point instead, and assume caller knows about the hack.
@@ -791,16 +771,31 @@ JL_DLLEXPORT __m128i test_m128i(__m128i a, __m128i b, __m128i c, __m128i d)
                                                     _mm_cvtepi32_ps(_mm_sub_epi32(c,d)))));
 }
 
-JL_DLLEXPORT __m128 test_m128(__m128 a, __m128 b, __m128 c, __m128 d)
+DLLEXPORT __attribute__((target("sse2")))
+__m128 test_m128(__m128 a, __m128 b, __m128 c, __m128 d)
 {
     return _mm_add_ps(a, _mm_mul_ps(b, _mm_sub_ps(c, d)));
+}
+
+DLLEXPORT __attribute__((target("sse2")))
+__m128 test_m128_cb(__m128 (*f)(__m128, __m128, __m128, __m128),
+                    __m128 a, __m128 b, __m128 c, __m128 d)
+{
+    return f(a, b, c, d);
+}
+
+DLLEXPORT __attribute__((target("sse2")))
+__m128i test_m128i_cb(__m128i (*f)(__m128i, __m128i, __m128i, __m128i),
+                      __m128i a, __m128i b, __m128i c, __m128i d)
+{
+    return f(a, b, c, d);
 }
 
 #endif
 
 #ifdef _CPU_AARCH64_
 
-JL_DLLEXPORT __int128 test_aa64_i128_1(int64_t v1, __int128 v2)
+DLLEXPORT __int128 test_aa64_i128_1(int64_t v1, __int128 v2)
 {
     return v1 * 2 - v2;
 }
@@ -810,7 +805,7 @@ typedef struct {
     __int128 v2;
 } struct_aa64_1;
 
-JL_DLLEXPORT struct_aa64_1 test_aa64_i128_2(int64_t v1, __int128 v2,
+DLLEXPORT struct_aa64_1 test_aa64_i128_2(int64_t v1, __int128 v2,
                                             struct_aa64_1 v3)
 {
     struct_aa64_1 x = {(int32_t)v1 / 2 + 1 - v3.v1, v2 * 2 - 1 - v3.v2};
@@ -822,12 +817,12 @@ typedef struct {
     double v2;
 } struct_aa64_2;
 
-JL_DLLEXPORT __fp16 test_aa64_fp16_1(int v1, float v2, double v3, __fp16 v4)
+DLLEXPORT __fp16 test_aa64_fp16_1(int v1, float v2, double v3, __fp16 v4)
 {
     return (__fp16)(v1 + v2 * 2 + v3 * 3 + v4 * 4);
 }
 
-JL_DLLEXPORT struct_aa64_2 test_aa64_fp16_2(int v1, float v2,
+DLLEXPORT struct_aa64_2 test_aa64_fp16_2(int v1, float v2,
                                             double v3, __fp16 v4)
 {
     struct_aa64_2 x = {v4 / 2 + 1, v1 * 2 + v2 * 4 - v3};
@@ -836,7 +831,7 @@ JL_DLLEXPORT struct_aa64_2 test_aa64_fp16_2(int v1, float v2,
 
 #include <arm_neon.h>
 
-JL_DLLEXPORT int64x2_t test_aa64_vec_1(int32x2_t v1, float _v2, int32x2_t v3)
+DLLEXPORT int64x2_t test_aa64_vec_1(int32x2_t v1, float _v2, int32x2_t v3)
 {
     int v2 = (int)_v2;
     return vmovl_s32(v1 * v2 + v3);
@@ -854,9 +849,11 @@ typedef struct {
     int16x8_t v1;
 } struct_aa64_4;
 
-JL_DLLEXPORT struct_aa64_3 test_aa64_vec_2(struct_aa64_3 v1, struct_aa64_4 v2)
+DLLEXPORT struct_aa64_3 test_aa64_vec_2(struct_aa64_3 v1, struct_aa64_4 v2)
 {
-    struct_aa64_3 x = {v1.v1 + vmovn_s16(v2.v1), v1.v2 - v2.v2};
+    // The cast below is to workaround GCC issue.
+    // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=96990
+    struct_aa64_3 x = {(int8x8_t)(v1.v1 + vmovn_s16(v2.v1)), (float32x2_t)(v1.v2 - v2.v2)};
     return x;
 }
 
@@ -943,21 +940,21 @@ test_huge(3_ppc64_hva, vf1[0]);
 test_huge(4_ppc64_hva, v1[0]);
 test_huge(5_ppc64_hva, v1[0]);
 
-JL_DLLEXPORT int64_t test_ppc64_vec1long(
+DLLEXPORT int64_t test_ppc64_vec1long(
         int64_t d1, int64_t d2, int64_t d3, int64_t d4, int64_t d5, int64_t d6,
         int64_t d7, int64_t d8, int64_t d9, struct_huge1_ppc64 vs)
 {
     return d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9 + vs.m + vs.v[0] + vs.v[1] + vs.v[2] + vs.v[3];
 }
 
-JL_DLLEXPORT int64_t test_ppc64_vec1long_vec(
+DLLEXPORT int64_t test_ppc64_vec1long_vec(
         int64_t d1, int64_t d2, int64_t d3, int64_t d4, int64_t d5, int64_t d6,
         int64_t d7, int64_t d8, int64_t d9, float32x4_t vs)
 {
     return d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9 + vs[0] + vs[1] + vs[2] + vs[3];
 }
 
-JL_DLLEXPORT float32x4_t test_ppc64_vec2(int64_t d1, float32x4_t a, float32x4_t b, float32x4_t c, float32x4_t d,
+DLLEXPORT float32x4_t test_ppc64_vec2(int64_t d1, float32x4_t a, float32x4_t b, float32x4_t c, float32x4_t d,
                                          float32x4_t e, float32x4_t f, float32x4_t g, float32x4_t h, float32x4_t i,
                                          float32x4_t j, float32x4_t k, float32x4_t l, float32x4_t m, float32x4_t n)
 {
@@ -971,13 +968,221 @@ JL_DLLEXPORT float32x4_t test_ppc64_vec2(int64_t d1, float32x4_t a, float32x4_t 
 
 #endif
 
-JL_DLLEXPORT int threadcall_args(int a, int b) {
+DLLEXPORT int threadcall_args(int a, int b) {
     return a + b;
 }
 
-JL_DLLEXPORT void c_exit_finalizer(void* v) {
+DLLEXPORT void c_exit_finalizer(void* v) {
     printf("c_exit_finalizer: %d, %u", *(int*)v, (unsigned)((uintptr_t)v & (uintptr_t)1));
 }
 
+// Test helpers for `@ccall cancel_handler=(fn, state) ...`: a foreign
+// computation that spins until cancelled, and a matching handler.
+// `cell` points at two int64 slots: [0] the stop flag, [1] a scratch slot
+// the handler fills. The handler runs asynchronously on the thread blocked
+// in cancelspin_wait, like a signal handler.
+DLLEXPORT int64_t cancelspin_wait(volatile int64_t *cell) {
+    int64_t iters = 0;
+    while (!cell[0])
+        iters++;
+    return iters;
+}
+
+// The handler runs under signal-handler discipline; the delivery machinery
+// preserves the complete interrupted register state around it.
+DLLEXPORT void cancelspin_handler(void *state, uint8_t sev) {
+    volatile int64_t *cell = (volatile int64_t*)state;
+    cell[1] = (int64_t)sev + 1; // distinguish sev 0 from "never ran"
+    cell[0] = 1;
+}
+
+// Use a wider prototype to observe the caller's XLEN extension.
+DLLEXPORT int64_t test_reg_32(int64_t x) {
+    return x;
+}
+
+DLLEXPORT int64_t test_reg_32_va(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int64_t x = va_arg(ap, int64_t);
+    va_end(ap);
+    return x;
+}
+
+// Exercise ABI classification at register boundaries; sentinels detect miscounts.
+typedef struct {
+    int64_t i[8];
+    double d[8];
+    int64_t s1;
+    double s2;
+    char buf[32];
+} abi_probe_t;
+DLLEXPORT abi_probe_t abi_probe;
+// GCC and Clang disagree on one-element floating-point vectors on x86-64.
+#ifdef __clang__
+DLLEXPORT int abi_probe_clang = 1;
+#else
+DLLEXPORT int abi_probe_clang = 0;
+#endif
+// GCC before 8.4 and 9.3 loads a variadic `__int128` from the register save
+// area with an aligned 16-byte load, which faults when the value starts at an
+// odd register slot (e.g. `rsi:rdx`).
+#if defined(_CPU_X86_64_) && !defined(_OS_WINDOWS_) && defined(__GNUC__) && !defined(__clang__) && \
+    (__GNUC__ < 8 || (__GNUC__ == 8 && __GNUC_MINOR__ < 4) || \
+     (__GNUC__ == 9 && __GNUC_MINOR__ < 3))
+DLLEXPORT int abi_probe_va_i128_regs = 0;
+#else
+DLLEXPORT int abi_probe_va_i128_regs = 1;
+#endif
+
+#define ABI_P0I
+#define ABI_P0D
+#define ABI_A0I
+#define ABI_A0D
+#define ABI_S0I
+#define ABI_S0D
+#define ABI_P5I int64_t i0, int64_t i1, int64_t i2, int64_t i3, int64_t i4,
+#define ABI_P7I ABI_P5I int64_t i5, int64_t i6,
+#define ABI_P8I ABI_P7I int64_t i7,
+#define ABI_P7D double d0, double d1, double d2, double d3, double d4, double d5, double d6,
+#define ABI_P8D ABI_P7D double d7,
+// Values used by the C caller.
+#define ABI_A5I 1000, 1001, 1002, 1003, 1004,
+#define ABI_A7I ABI_A5I 1005, 1006,
+#define ABI_A8I ABI_A7I 1007,
+#define ABI_A7D 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5,
+#define ABI_A8D ABI_A7D 7.5,
+#define ABI_S5I abi_probe.i[0] = i0; abi_probe.i[1] = i1; abi_probe.i[2] = i2; abi_probe.i[3] = i3; \
+                abi_probe.i[4] = i4;
+#define ABI_S7I ABI_S5I abi_probe.i[5] = i5; abi_probe.i[6] = i6;
+#define ABI_S8I ABI_S7I abi_probe.i[7] = i7;
+#define ABI_S7D abi_probe.d[0] = d0; abi_probe.d[1] = d1; abi_probe.d[2] = d2; abi_probe.d[3] = d3; \
+                abi_probe.d[4] = d4; abi_probe.d[5] = d5; abi_probe.d[6] = d6;
+#define ABI_S8D ABI_S7D abi_probe.d[7] = d7;
+
+// GCC (13 to at least 16) passes a `_Float16` that it loads directly from a
+// locally bound symbol, under -fPIC, in a floating-point register without
+// NaN-boxing it, which RISC-V CPUs with Zfh then read as NaN
+// (JuliaLang/julia#63880). Hide the buffer's address from it.
+static inline const char *abi_probe_src(void)
+{
+    const char *buf = abi_probe.buf;
+    __asm__("" : "+r"(buf));
+    return buf;
+}
+#define ABI_PROBE(name, T, G, F) \
+    DLLEXPORT void test_abi_arg_##name##_##G##_##F(ABI_P##G##I ABI_P##F##D T x, int64_t s1, double s2) { \
+        ABI_S##G##I ABI_S##F##D \
+        memcpy(abi_probe.buf, &x, sizeof(x)); abi_probe.s1 = s1; abi_probe.s2 = s2; } \
+    DLLEXPORT T test_abi_ret_##name##_##G##_##F(ABI_P##G##I ABI_P##F##D int64_t s1) { \
+        ABI_S##G##I ABI_S##F##D abi_probe.s1 = s1; \
+        T r; memcpy(&r, abi_probe.buf, sizeof(r)); return r; } \
+    DLLEXPORT void test_abi_cbarg_##name##_##G##_##F(void (*cb)(ABI_P##G##I ABI_P##F##D T, int64_t, double)) { \
+        T x; memcpy(&x, abi_probe_src(), sizeof(x)); cb(ABI_A##G##I ABI_A##F##D x, -77, 3.25); } \
+    DLLEXPORT void test_abi_cbret_##name##_##G##_##F(T (*cb)(ABI_P##G##I ABI_P##F##D int64_t)) { \
+        T r = cb(ABI_A##G##I ABI_A##F##D -77); memcpy(abi_probe.buf, &r, sizeof(r)); }
+// Vary the leading arguments to exercise register-pair alignment and spills.
+#define ABI_VA(name, T, G) \
+    DLLEXPORT void test_abi_va_##name##_##G(int n, ...) { \
+        va_list ap; va_start(ap, n); \
+        for (int k = 0; k < G; k++) abi_probe.i[k] = va_arg(ap, int64_t); \
+        T x = va_arg(ap, T); memcpy(abi_probe.buf, &x, sizeof(x)); \
+        abi_probe.s1 = va_arg(ap, int64_t); abi_probe.s2 = va_arg(ap, double); va_end(ap); }
+#define ABI_BASIC(name, T) ABI_PROBE(name, T, 0, 0)
+#define ABI_FP1(name, T) ABI_BASIC(name, T) ABI_PROBE(name, T, 0, 8)
+#define ABI_FP2(name, T) \
+    ABI_BASIC(name, T) ABI_PROBE(name, T, 0, 7) ABI_PROBE(name, T, 0, 8)
+#define ABI_MIXED(name, T) \
+    ABI_BASIC(name, T) ABI_PROBE(name, T, 7, 7) \
+    ABI_PROBE(name, T, 8, 7) ABI_PROBE(name, T, 7, 8)
+#define ABI_I128(name, T) \
+    ABI_BASIC(name, T) ABI_PROBE(name, T, 5, 0) \
+    ABI_PROBE(name, T, 7, 0) ABI_PROBE(name, T, 8, 0)
+#define ABI_VA_BASIC(name, T) ABI_VA(name, T, 0)
+#define ABI_VA_I128(name, T) \
+    ABI_VA_BASIC(name, T) ABI_VA(name, T, 4) ABI_VA(name, T, 5) ABI_VA(name, T, 7)
+
+#ifdef _P64
+typedef struct { float x; } abi_S_f;
+typedef struct { double x; } abi_S_d;
+typedef struct { abi_S_d s; } abi_N_d;
+typedef struct { double v[1]; } abi_T1d;
+typedef struct { float a; float b; } abi_S_ff;
+typedef struct { float a; double b; } abi_S_fd;
+typedef struct { float v[2]; } abi_T2f;
+typedef struct { float a; int32_t b; } abi_S_fi;
+typedef struct { int32_t a; float b; } abi_S_if;
+typedef struct { double a; int64_t b; } abi_S_di;
+typedef struct { abi_S_f s; int32_t i; } abi_M_fi;
+typedef struct { int64_t x; } abi_S_l;
+typedef struct { double d; abi_S_l s; } abi_M_dl;
+typedef struct { float a; void *b; } abi_S_fp;
+typedef double abi_V1d __attribute__((vector_size(8)));
+typedef float abi_V2f __attribute__((vector_size(8)));
+typedef int32_t abi_V2i __attribute__((vector_size(8)));
+typedef int64_t abi_V1l __attribute__((vector_size(8)));
+typedef float abi_V1f __attribute__((vector_size(4)));
+typedef double abi_V2d __attribute__((vector_size(16)));
+typedef struct { double d; abi_V1d v; } abi_S_dV1;
+typedef struct { double d; abi_V2i v; } abi_S_dV2i;
+typedef struct { abi_V1f v; } abi_S_V1f;
+typedef struct { __int128 x; } abi_A16;
+ABI_FP1(Float32, float)
+ABI_FP1(Float64, double)
+ABI_I128(Int128, __int128)
+ABI_BASIC(Ptr, void*)
+ABI_FP1(S_f, abi_S_f)
+ABI_BASIC(S_d, abi_S_d)
+ABI_BASIC(N_d, abi_N_d)
+ABI_BASIC(T1d, abi_T1d)
+ABI_FP2(S_ff, abi_S_ff)
+ABI_FP2(S_fd, abi_S_fd)
+ABI_BASIC(T2f, abi_T2f)
+ABI_MIXED(S_fi, abi_S_fi)
+ABI_BASIC(S_if, abi_S_if)
+ABI_BASIC(S_di, abi_S_di)
+ABI_BASIC(M_fi, abi_M_fi)
+ABI_BASIC(S_l, abi_S_l)
+ABI_BASIC(M_dl, abi_M_dl)
+ABI_BASIC(S_fp, abi_S_fp)
+ABI_BASIC(V1d, abi_V1d)
+ABI_BASIC(V2f, abi_V2f)
+ABI_BASIC(V2i, abi_V2i)
+ABI_BASIC(V1l, abi_V1l)
+ABI_BASIC(V1f, abi_V1f)
+ABI_BASIC(V2d, abi_V2d)
+ABI_BASIC(S_dV1, abi_S_dV1)
+ABI_BASIC(S_dV2i, abi_S_dV2i)
+ABI_BASIC(S_V1f, abi_S_V1f)
+ABI_I128(A16, abi_A16)
+ABI_VA_I128(Int128, __int128)
+ABI_VA_BASIC(S_f, abi_S_f)
+ABI_VA_BASIC(S_ff, abi_S_ff)
+ABI_VA_BASIC(S_fi, abi_S_fi)
+ABI_VA_I128(A16, abi_A16)
+// Unions and pointer fields use the integer convention.
+typedef struct { double x; int32_t y; uint8_t sel; } abi_SU;
+typedef struct { double x; void *y; } abi_SA;
+DLLEXPORT double test_abi_union(abi_SU s) { memcpy(abi_probe.buf, &s, sizeof(s)); return s.x; }
+DLLEXPORT double test_abi_boxed(abi_SA s) { abi_probe.s1 = (int64_t)(uintptr_t)s.y; return s.x; }
+#endif
+// These bit-copying probes are also used for `BFloat16`.
+#if defined(__FLT16_MANT_DIG__)
+DLLEXPORT int abi_probe_float16 = 1;
+typedef struct { _Float16 x; } abi_S_h;
+typedef struct { _Float16 a; _Float16 b; } abi_S_hh;
+typedef struct { _Float16 a; double b; } abi_S_hd;
+typedef struct { _Float16 a; int32_t b; } abi_S_hi;
+ABI_FP1(Float16, _Float16)
+ABI_BASIC(S_h, abi_S_h)
+ABI_FP2(S_hh, abi_S_hh)
+ABI_FP2(S_hd, abi_S_hd)
+ABI_MIXED(S_hi, abi_S_hi)
+// `_Float16` is not promoted through `...`.
+ABI_VA_BASIC(Float16, _Float16)
+#else
+DLLEXPORT int abi_probe_float16 = 0;
+#endif
+
 // global variable for cglobal testing
-JL_DLLEXPORT const int global_var = 1;
+DLLEXPORT const int global_var = 1;

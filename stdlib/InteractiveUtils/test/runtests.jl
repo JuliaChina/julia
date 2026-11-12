@@ -2,6 +2,12 @@
 
 using Test, InteractiveUtils
 
+@test isempty(Test.detect_closure_boxes(InteractiveUtils))
+
+@testset "highlighting" begin
+    include("highlighting.jl")
+end
+
 # test methodswith
 # `methodswith` relies on exported symbols
 export func4union, Base
@@ -23,6 +29,12 @@ struct B20086{T,N} <: A20086{T,N} end
 @test subtypes(A20086{T,3} where T) == [B20086{T,3} where T]
 @test subtypes(A20086{Int,3}) == [B20086{Int,3}]
 
+# supertypes
+@test supertypes(B20086) == (B20086, A20086, Any)
+@test supertypes(B20086{Int}) == (B20086{Int}, A20086{Int}, Any)
+@test supertypes(B20086{Int,2}) == (B20086{Int,2}, A20086{Int,2}, Any)
+@test supertypes(Any) == (Any,)
+
 # code_warntype
 module WarnType
 using Test, Random, InteractiveUtils
@@ -41,6 +53,23 @@ tag = "UNION"
 @test warntype_hastag(pos_unstable, Tuple{Float64}, tag)
 @test !warntype_hastag(pos_stable, Tuple{Float64}, tag)
 
+for u in Any[
+    Union{Int, UInt},
+    Union{Nothing, Vector{Tuple{String, Tuple{Char, Char}}}},
+    Union{Char, UInt8, UInt},
+    Union{Tuple{Int, Int}, Tuple{Char, Int}, Nothing},
+    Union{Missing, Nothing}
+]
+    @test Base.Compiler.IRShow.is_expected_union(u)
+end
+
+for u in Any[
+    Union{Nothing, Tuple{Vararg{Char}}},
+    Union{Missing, Array},
+    Union{Int, Tuple{Any, Int}}
+]
+    @test !Base.Compiler.IRShow.is_expected_union(u)
+end
 mutable struct Stable{T,N}
     A::Array{T,N}
 end
@@ -50,7 +79,7 @@ end
 Base.getindex(A::Stable, i) = A.A[i]
 Base.getindex(A::Unstable, i) = A.A[i]
 
-tag = "ARRAY{FLOAT64,N}"
+tag = "ARRAY"
 @test warntype_hastag(getindex, Tuple{Unstable{Float64},Int}, tag)
 @test !warntype_hastag(getindex, Tuple{Stable{Float64,2},Int}, tag)
 @test warntype_hastag(getindex, Tuple{Stable{Float64},Int}, tag)
@@ -69,11 +98,6 @@ has_unused() = (a = rand(5))
 # some of this info with debug info.
 #@test warntype_hastag(has_unused, Tuple{}, "<optimized out>")
 
-# Make sure that "expected" unions are highlighted with warning color instead of error color
-iob = IOBuffer()
-code_warntype(IOContext(iob, :color => true), x -> (x > 1 ? "foo" : nothing), Tuple{Int64})
-str = String(take!(iob))
-@test occursin(Base.text_colors[Base.warn_color()], str)
 
 # Make sure getproperty and setproperty! works with @code_... macros
 struct T1234321
@@ -83,6 +107,10 @@ Base.getproperty(t::T1234321, ::Symbol) = "foo"
 @test (@code_typed T1234321(1).f).second == String
 Base.setproperty!(t::T1234321, ::Symbol, ::Symbol) = "foo"
 @test (@code_typed T1234321(1).f = :foo).second == String
+
+# Make sure `do` block works with `@code_...` macros
+@test (@code_typed map(1:1) do x; x; end).second == Vector{Int}
+@test (@code_typed open(`cat`; read=true) do _; 1; end).second == Int
 
 module ImportIntrinsics15819
 # Make sure changing the lookup path of an intrinsic doesn't break
@@ -97,6 +125,7 @@ end # module ImportIntrinsics15819
 foo11122(x) = @fastmath x - 1.0
 
 # issue #11122, #13568 and #15819
+tag = "ANY"
 @test !warntype_hastag(+, Tuple{Int,Int}, tag)
 @test !warntype_hastag(-, Tuple{Int,Int}, tag)
 @test !warntype_hastag(*, Tuple{Int,Int}, tag)
@@ -110,6 +139,11 @@ foo11122(x) = @fastmath x - 1.0
 @test !warntype_hastag(^, Tuple{Float32,Int32}, tag)
 @test !warntype_hastag(ImportIntrinsics15819.sqrt15819, Tuple{Float64}, tag)
 @test !warntype_hastag(ImportIntrinsics15819.sqrt15819, Tuple{Float32}, tag)
+
+@testset "code_warntype OpaqueClosure" begin
+    g = Base.Experimental.@opaque Tuple{Float64}->_ x -> 0.0
+    @test warntype_hastag(g, Tuple{Float64}, "::Float64")
+end
 
 end # module WarnType
 
@@ -144,15 +178,54 @@ mktemp() do f, io
 end
 
 module _test_varinfo_
-export x
-x = 1.0
+module inner_mod
+inner_x = 1
 end
+import Test: @test
+export x_exported
+x_exported = 1.0
+y_not_exp = 1.0
+z_larger = Vector{Float64}(undef, 3)
+a_smaller = Vector{Float64}(undef, 2)
+end
+
+using Test
+
 @test repr(varinfo(Main, r"^$")) == """
 | name | size | summary |
 |:---- | ----:|:------- |
 """
 let v = repr(varinfo(_test_varinfo_))
-    @test occursin("| x              |   8 bytes | Float64 |", v)
+    @test occursin("| x_exported     |   8 bytes | Float64 |", v)
+    @test !occursin("y_not_exp", v)
+    @test !occursin("@test", v)
+    @test !occursin("inner_x", v)
+end
+let v = repr(varinfo(_test_varinfo_, all = true))
+    @test occursin("x_exported", v)
+    @test occursin("y_not_exp", v)
+    @test !occursin("@test", v)
+    @test findfirst("a_smaller", v)[1] < findfirst("z_larger", v)[1] # check for alphabetical
+    @test !occursin("inner_x", v)
+end
+let v = repr(varinfo(_test_varinfo_, imported = true))
+    @test occursin("x_exported", v)
+    @test !occursin("y_not_exp", v)
+    @test occursin("@test", v)
+    @test !occursin("inner_x", v)
+end
+let v = repr(varinfo(_test_varinfo_, all = true, sortby = :size))
+    @test findfirst("z_larger", v)[1] < findfirst("a_smaller", v)[1] # check for size order
+end
+let v = repr(varinfo(_test_varinfo_, sortby = :summary))
+    @test findfirst("Float64", v)[1] < findfirst("Module", v)[1] # check for summary order
+end
+let v = repr(varinfo(_test_varinfo_, all = true, recursive = true))
+    @test occursin("inner_x", v)
+end
+let v = repr(varinfo(_test_varinfo_, all = true, minsize = 9))
+    @test !occursin("x_exported", v) # excluded: 8 bytes
+    @test occursin("a_smaller", v)
 end
 
 # Issue 14173
@@ -163,7 +236,7 @@ module Tmp14173
 end
 varinfo(Tmp14173) # warm up
 const MEMDEBUG = ccall(:jl_is_memdebug, Bool, ())
-@test @allocated(varinfo(Tmp14173)) < (MEMDEBUG ? 60000 : 20000)
+@test @allocated(varinfo(Tmp14173)) < (MEMDEBUG ? 300000 : 125000)
 
 # PR #24997: test that `varinfo` doesn't fail when encountering `missing`
 module A
@@ -180,13 +253,21 @@ end
         versioninfo(buf, verbose=true)
         ver = read(buf, String)
         @test startswith(ver, "Julia Version $VERSION")
+        @test startswith(ver, "Julia Version $(Base.version_with_build_variant())\n")
         @test occursin("Environment:", ver)
-    end
-    let exename = `$(Base.julia_cmd()) --startup-file=no`
-        @test !occursin("Environment:", read(setenv(`$exename -e 'using InteractiveUtils; versioninfo()'`,
-                                                    String[]), String))
-        @test  occursin("Environment:", read(setenv(`$exename -e 'using InteractiveUtils; versioninfo()'`,
-                                                    String["JULIA_CPU_THREADS=1"]), String))
+
+        let exename = `$(Base.julia_cmd()) --startup-file=no`,
+            home = Sys.iswindows() ? "USERPROFILE=$dir" : "HOME=$dir"
+            @test !occursin("Environment:", read(setenv(
+                `$exename -e 'using InteractiveUtils; versioninfo()'`, [home]), String))
+            @test occursin("Environment:", read(setenv(
+                `$exename -e 'using InteractiveUtils; versioninfo()'`,
+                [home, "JULIA_CPU_THREADS=1"]), String))
+            # when Sys.EFFECTIVE_CPU_THREADS < Sys.CPU_THREADS, both counts are reported
+            @test occursin(r"99999 virtual cores; \d+ effective\)", read(setenv(
+                `$exename -e 'using InteractiveUtils; versioninfo()'`,
+                [home, "JULIA_CPU_THREADS=99999"]), String))
+        end
     end
 end
 
@@ -196,41 +277,253 @@ const curmod_str = curmod === Main ? "Main" : join(curmod_name, ".")
 
 @test_throws ErrorException("\"this_is_not_defined\" is not defined in module $curmod_str") @which this_is_not_defined
 # issue #13264
-@test (@which vcat(1...)).name == :vcat
+@test (@which vcat(1...)).name === :vcat
 
-# PR #28122
+@testset "@methods" begin
+    ms = @methods sort(::AbstractVector)
+    @test ms isa Base.MethodList
+    @test ms == methods(sort, (AbstractVector,))
+    # arguments are interpreted as values, like `@which`
+    @test (@methods sort([1, 2, 3])) == methods(sort, (Vector{Int},))
+    # qualified callable
+    @test (@methods Base.sort(::AbstractVector)) == methods(sort, (AbstractVector,))
+    # unlike `@which`, lists every matching method when types are abstract
+    @test length(@methods +(::Integer, ::Integer)) > 1
+end
+
+# PR #28122, issue #25474
 @test (@which [1][1]).name === :getindex
-@test (@which [1 2]).name == :hcat
-@test (@which [1; 2]).name == :vcat
-@test (@which [1]).name == :vect
+@test (@which [1][1] = 2).name === :setindex!
+@test (@which [1]).name === :vect
+@test (@which [1 2]).name === :hcat
+@test (@which [1; 2]).name === :vcat
+@test (@which Int[1 2]).name === :typed_hcat
+@test (@which Int[1; 2]).name === :typed_vcat
+@test (@which [1 2;3 4]).name === :hvcat
+@test (@which Int[1 2;3 4]).name === :typed_hvcat
+# issue #39426
+let x..y = 0
+    @test (@which 1..2).name === :..
+end
 
-# issue #13464
-let t13464 = "hey there sailor"
-    try
-        @which t13464[1,1] = (1.0,true)
-        error("unexpected")
-    catch err13464
-        @test startswith(err13464.msg, "expression is not a function call, or is too complex")
+# issue #53691
+let a = -1
+    @test (@which 2^a).name === :^
+    @test (@which 2^0x1).name === :^
+end
+
+let w = Vector{Any}(undef, 9)
+    @testset "@which x^literal" begin
+        w[1] = @which 2^0
+        w[2] = @which 2^1
+        w[3] = @which 2^2
+        w[4] = @which 2^3
+        w[5] = @which 2^-1
+        w[6] = @which 2^-2
+        w[7] = @which 2^10
+        w[8] = @which big(2.0)^1
+        w[9] = @which big(2.0)^-1
+        @test all(getproperty.(w, :name) .=== :literal_pow)
+        @test length(Set(w)) == length(w) # all methods distinct
     end
 end
 
-module MacroTest
-export @macrotest
-macro macrotest(x::Int, y::Symbol) end
-macro macrotest(x::Int, y::Int)
-    nothing #This is here because of #15280
+# PR 53713
+if Int === Int64
+    # literal_pow only for exponents x: -2^63 <= x < 2^63 #53860 (all Int)
+    @test (@which 2^-9223372036854775809).name === :^
+    @test (@which 2^-9223372036854775808).name === :literal_pow
+    @test (@which 2^9223372036854775807).name === :literal_pow
+    @test (@which 2^9223372036854775808).name === :^
+elseif Int === Int32
+    # literal_pow only for exponents x: -2^31 <= x < 2^31 #53860 (all Int)
+    @test (@which 2^-2147483649).name === :^
+    @test (@which 2^-2147483648).name === :literal_pow
+    @test (@which 2^2147483647).name === :literal_pow
+    @test (@which 2^2147483648).name === :^
 end
+
+# issue #13464
+try
+    @which x = 1
+    error("unexpected")
+catch err13464
+    @test startswith(err13464.msg, "expression is not a function call")
+end
+
+@testset "Single-argument forms" begin
+    a = which(+, (Int, Int))
+    b = which((typeof(+), Int, Int))
+    c = which(Tuple{typeof(+), Int, Int})
+    @test a == b == c
+
+    a = functionloc(+, (Int, Int))
+    b = functionloc((typeof(+), Int, Int))
+    c = functionloc(Tuple{typeof(+), Int, Int})
+    @test a == b == c
+end
+
+# PR 57909
+@testset "Support for type annotations as arguments" begin
+    @testset "`getindex`/`setindex!`" begin
+        @test (@which (::Vector{Int})[::Int]).name === :getindex
+        @test (@which [1, 2][::Int]).name === :getindex
+        @test (@which [1 2][begin, ::Int]).name === :getindex
+        @test (@which [1 2][::Int, end]).name === :getindex
+        @test (@which [1 2][begin, end]).name === :getindex
+        @test (@which [1 2][1:end]).name === :getindex
+        @test (@which [1 2][begin:end]).name === :getindex
+        @test_throws "`begin` or `end` cannot be used" (@which (::Vector{Int})[begin])
+        @test_throws "`begin` or `end` cannot be used" (@which (::Vector{Int})[end])
+        @test (@which (::Vector{Int})[::Int] = ::Int).name === :setindex!
+    end
+
+    @testset "`getproperty`/`setproperty!`" begin
+        @test (@which (::Base.RefValue{Int}).x).name === :getproperty
+        @test (@which (::Base.RefValue{Int}).x = ::Int).name === :setproperty!
+    end
+
+    @testset "Array syntax" begin
+        @test (@which [::Int]).name === :vect
+        @test (@which [undef_var::Int]).name === :vect
+        @test (@which [::Int 2]).name === :hcat
+        @test (@which [::Int; 2]).name === :vcat
+        @test (@which Int[::Int 2]).name === :typed_hcat
+        @test (@which Int[::Int; 2]).name === :typed_vcat
+        @test (@which [::Int 2;3 (::Int)]).name === :hvcat
+        @test (@which Int[::Int 2;3 (::Int)]).name === :typed_hvcat
+        @test (@which (::Type{Int})[::Int 2;3 (::Int)]).name === :typed_hvcat
+        @test (@which (::Type{T})[::T 2;3 (::T)] where {T<:Real}).name === :typed_hvcat
+    end
+
+    @test (@which (::Float64)^2).name === :literal_pow
+    @test (@which (::Vector{Float64})').name === :adjoint
+    @test (@which "$(::Symbol) is a symbol").sig === Tuple{typeof(string), Vararg{Union{Char, String, Symbol}}}
+    @test (@which (::Int)^4).name === :literal_pow
+    @test (@which +(some_x::Int, some_y::Float64)).name === :+
+    @test (@which +(::Any, ::Any, ::Any, ::Any...)).sig === Tuple{typeof(+), Any, Any, Any, Vararg{Any}}
+    @test (@which +(::Any, ::Any, ::Any, ::Vararg{Any})).sig === Tuple{typeof(+), Any, Any, Any, Vararg{Any}}
+    n = length(@code_typed +(::Float64, ::Vararg{Float64}))
+    @test n ≥ 2
+    @test length(@code_typed +(::Float64, ::Float64...)) == n
+    @test (@which +(1, ::Float64)).sig === Tuple{typeof(+), Number, Number}
+    @test (@which +((1, 2)...)).name === :+
+    @test (@which (::typeof(+))(::Int, ::Float64)).sig === Tuple{typeof(+), Number, Number}
+    @test (@code_typed .+(::Float64, ::Vector{Float64})) isa Pair
+    @test (@code_typed .+(::Float64, .*(::Vector{Float64}, ::Int))) isa Pair
+    @test (@which +(::T, ::T) where {T<:Number}).sig === Tuple{typeof(+), T, T} where {T<:Number}
+
+    @testset "Keyword arguments" begin
+        @test (@which round(::Float64; digits=3)).name === :round
+        @test (@which round(1.2; digits = ::Int)).name === :round
+        @test (@which round(1.2; digits::Int)).name === :round
+        @test (@code_typed round(::T; digits = ::T) where {T<:Float64})[2] === Union{}
+        @test (@code_typed round(::T; digits = ::T) where {T<:Int})[2] === Float64
+        base = 10
+        kwargs_1 = (; digits = 3)
+        kwargs_2 = (; sigdigits = 3)
+        @test (@which round(1.2; kwargs_1...)).name === :round
+        @test (@which round(1.2; digits = 1, kwargs_1...)).name === :round
+        @test (@code_typed round(1.2; digits = ::Float64, kwargs_1...))[2] === Float64 # picks `3::Int` from `kwargs_1`
+        @test (@code_typed round(1.2; kwargs_1..., digits = ::Float64))[2] === Union{} # picks `::Float64` from parameters
+        @test (@which round(1.2; digits = ::Float64, kwargs_1...)).name === :round
+        @test (@which round(1.2; sigdigits = ::Int, kwargs_1...)).name === :round
+        @test (@which round(1.2; kwargs_1..., kwargs_2..., base)).name === :round
+    end
+
+    @testset "Broadcasting" begin
+        @test (@code_typed optimize=false round.([1.0, 2.0]; digits = ::Int64))[2] == Vector{Float64}
+        @test (@code_typed optimize=false round.(::Vector{Float64}, base = 2; digits = ::Int64))[2] == Vector{Float64}
+        @test (@code_typed optimize=false round.(base = ::Int64, ::Vector{Float64}; digits = ::Int64))[2] == Vector{Float64}
+        @test (@code_typed optimize=false [1, 2] .= ::Int)[2] == Vector{Int}
+        @test (@code_typed optimize=false ::Vector{Int} .= ::Int)[2] == Vector{Int}
+        @test (@code_typed optimize=false ::Vector{Float64} .= 1 .+ ::Vector{Int})[2] == Vector{Float64}
+        @test (@code_typed optimize=false ::Vector{Float64} .= 1 .+ round.(base = ::Int, ::Vector{Int}; digits = 3))[2] == Vector{Float64}
+    end
+
+    @testset "Callable objects" begin
+        @test (@code_typed (::Base.Fix2{typeof(+), Float64})(3))[2] === Float64
+        @test (@code_typed optimize=false (::Returns{Float64})(::Int64; name::String))[2] === Float64
+        @test (@code_typed (::Returns{T})(3.0) where {T<:Real})[2] === Real
+    end
+
+    @testset "Opaque closures" begin
+        opaque_f(@nospecialize(x::Type), @nospecialize(y::Type)) = sizeof(x) == sizeof(y)
+        src, _ = only(code_typed(opaque_f, (Type, Type)))
+        src.slottypes[1] = Tuple{}
+
+        # from CodeInfo
+        oc = Core.OpaqueClosure(src; sig = Tuple{Type, Type}, rettype = Bool, nargs = 2)
+        ret = @code_typed oc(Int64, Float64)
+        @test [ret] == code_typed(oc)
+        _, rt = ret
+        @test rt === Bool
+
+        # from optimized IR
+        ir = Core.Compiler.inflate_ir(src)
+        oc = Core.OpaqueClosure(ir)
+        ret = @code_typed oc(Int64, Float64)
+        @test [ret] == code_typed(oc)
+        _, rt = ret
+        @test rt === Bool
+    end
+
+    @testset "Vararg handling" begin
+        @test_throws "More than one `Core.Vararg`" @eval @code_typed +(1, 2::Vararg{Int}, 3, 4::Vararg{Float64})
+        @test_throws "Inconsistent type `Float64`" @eval @code_typed +(1, 2, 3, 4::Vararg{Int}, 5.0)
+        @test_throws "Inconsistent type `Float64`" @eval @code_typed +(1, 2, 3, 4::Int..., 5.0)
+        @test_throws "Inconsistent type `Float64`" @eval @code_typed +(1, 2, 3, 4::Vararg{Int}, ::Float64)
+        @test_throws "Inconsistent type `Any`" @eval @code_typed +(1, 2, 3, 4::Vararg{Int}, ::Any)
+        @test_throws r"at most 2 types .* found 3 instead" @eval @code_typed +(1, 2, 3, 4::Vararg{Int,2}, 5, 6)
+        @test (@code_typed +(1, 2, 3, 4::Vararg{Int}))[2] === Int
+        @test (@code_typed +(1, 2, 3, 4::Vararg{Int}, 5))[2] === Int
+        @test (@code_typed +(1, 2, 3, 4::Vararg{Int, 3}))[2] === Int
+        @test (@code_typed +(1, 2, 3, 4::Vararg{Int, 3}, 5))[2] === Int
+        @test (@code_typed +(1, 2, 3, 4::Vararg{Int, 3}, 5, 6))[2] === Int
+        @test (@code_typed +(1, 2, 3, 4::Vararg))[2] === Any
+        @test (@code_typed +(1, 2, 3, 4::Vararg, 5.0))[2] === Any
+        @test (@code_typed +(1, 2, 3, ::Int...))[2] === Int
+        @test (@code_typed +(1, 2, 3, ::Int..., 5))[2] === Int
+        # We just ignore the checks with `where` parameters for simplicity of implementation.
+        @test isa((@code_typed +(::T, ::Vararg{T}, ::T) where {T}), Vector{Any})
+        @test isa((@code_typed +(::T, ::Vararg{T}, ::Float64) where {T<:Real}), Vector{Any})
+        @test isa((@code_typed +(::T, ::Vararg{T}, ::Float64) where {T<:Real}), Vector{Any})
+        @test isa((@code_typed +(::T, ::Vararg{T}, ::Int) where {T<:Real}), Vector{Any})
+        @test isa((@code_typed +(::T, ::Vararg{Vector{T}}, ::Int) where {T<:Real}), Vector{Any})
+        @test isa((@code_typed +(::T, ::Vararg{Int}, ::T) where {T<:Real}), Vector{Any})
+    end
+end
+
+module HygieneTest
+const Int = Float64
+using InteractiveUtils: @code_typed
+macro escape_argument(ex) :(@code_typed $(esc(ex)) * 2.0) end
+macro escape_type_annotation(ex) :(@code_typed identity(::(typeof($(esc(ex)))))) end
+macro escape_all(ex) esc(:(@__MODULE__().@code_typed $ex)) end
+end # module
+
+(; var"@escape_argument", var"@escape_type_annotation", var"@escape_all") = HygieneTest
+@testset "Macro hygiene interactions" begin
+    _f = sum
+    @test (@escape_argument _f(Int[]))[2] == Float64
+    @test (@escape_type_annotation _f(Int[]))[2] == Int
+    @test (@escape_all _f(Int[]))[2] == Int
+end
+
+module MacroTest
+var"@which" = parentmodule(@__MODULE__).var"@which"
+macro macrotest(x::Int, y::Symbol) end
+macro macrotest(x::Int, y::Int) end
 end
 
 let
-    using .MacroTest
     a = 1
-    m = getfield(@__MODULE__, Symbol("@macrotest"))
-    @test which(m, Tuple{LineNumberNode, Module, Int, Symbol}) == @which @macrotest 1 a
-    @test which(m, Tuple{LineNumberNode, Module, Int, Int}) == @which @macrotest 1 1
+    m = MacroTest.var"@macrotest"
+    @test which(m, Tuple{LineNumberNode, Module, Int, Symbol}) == @eval MacroTest @which @macrotest 1 a
+    @test which(m, Tuple{LineNumberNode, Module, Int, Int}) == @eval MacroTest @which @macrotest 1 1
 
     @test first(methods(m, Tuple{LineNumberNode, Module, Int, Int})) == @which MacroTest.@macrotest 1 1
-    @test functionloc(@which @macrotest 1 1) == @functionloc @macrotest 1 1
+    @test functionloc(@eval MacroTest @which @macrotest 1 1) == @functionloc MacroTest.@macrotest 1 1
 end
 
 mutable struct A18434
@@ -249,11 +542,136 @@ end
 @test counter18434 == 2
 
 let _true = Ref(true), f, g, h
-    @noinline f() = ccall((:time, "error_library_doesnt_exist\0"), Cvoid, ()) # some expression that throws an error in codegen
+    @noinline f() = ccall((:time, "error_library_doesnt_exist\0"), Cvoid, ()) # should throw error during runtime
     @noinline g() = _true[] ? 0 : h()
     @noinline h() = (g(); f())
-    @test_throws ErrorException @code_native h() # due to a failure to compile f()
     @test g() == 0
+    @test_throws ErrorException h()
+end
+
+# manually generate a broken function, which will break codegen
+# and make sure Julia doesn't crash (when using a non-asserts build)
+is_asserts() = ccall(:jl_is_assertsbuild, Cint, ()) == 1
+if !is_asserts()
+@eval @noinline Base.@constprop :none f_broken_code() = 0
+let m = which(f_broken_code, ())
+   let src = Base.uncompressed_ast(m)
+       src.code = Any[
+           Expr(:meta, :noinline)
+           Core.ReturnNode(Expr(:invalid))
+       ]
+       m.source = src
+   end
+end
+_true = true
+# and show that we can still work around it
+@noinline g_broken_code() = _true ? 0 : h_broken_code()
+@noinline h_broken_code() = (g_broken_code(); f_broken_code())
+let errf = tempname(),
+    old_stderr = stderr,
+    new_stderr = open(errf, "w")
+    try
+        redirect_stderr(new_stderr)
+        @test occursin("f_broken_code", sprint(code_native, h_broken_code, ()))
+        Libc.flush_cstdio()
+        println(new_stderr, "start")
+        flush(new_stderr)
+        @test_throws "could not compile the specified method" sprint(io -> code_native(io, f_broken_code, (), dump_module=true))
+        Libc.flush_cstdio()
+        println(new_stderr, "middle")
+        flush(new_stderr)
+        @test !isempty(sprint(io -> code_native(io, f_broken_code, (), dump_module=false)))
+        Libc.flush_cstdio()
+        println(new_stderr, "later")
+        flush(new_stderr)
+        @test invokelatest(g_broken_code) == 0
+        Libc.flush_cstdio()
+        println(new_stderr, "end")
+        flush(new_stderr)
+    finally
+        Libc.flush_cstdio()
+        redirect_stderr(old_stderr)
+        close(new_stderr)
+        let errstr = read(errf, String)
+            @test startswith(errstr, """start
+                Internal error: encountered unexpected error during compilation of f_broken_code:
+                ErrorException(\"unsupported or misplaced expression \\\"invalid\\\" in function f_broken_code\")
+                """) context=errstr
+            @test occursin("""\nmiddle
+                Internal error: encountered unexpected error during compilation of f_broken_code:
+                ErrorException(\"unsupported or misplaced expression \\\"invalid\\\" in function f_broken_code\")
+                """, errstr) context=errstr
+            @test occursin("""\nlater
+                Internal error: encountered unexpected error during compilation of f_broken_code:
+                ErrorException(\"unsupported or misplaced expression \\\"invalid\\\" in function f_broken_code\")
+                """, errstr) context=errstr
+            @test endswith(errstr, "\nend\n") context=errstr
+        end
+        rm(errf)
+    end
+end
+end
+
+# Issue #33163
+A33163(x; y) = x + y
+B33163(x) = x
+let
+    (@code_typed A33163(1, y=2))[1]
+    (@code_typed optimize=false A33163(1, y=2))[1]
+    (@code_typed optimize=false B33163(1))[1]
+end
+
+@test_throws MethodError (@code_lowered wrongkeyword=true 3 + 4)
+
+# Issue #14637
+@test (@which Base.Base.Base.nothing) == Core
+@test_throws ErrorException (@functionloc Base.nothing)
+@test (@code_typed (3//4).num)[2] == Int
+
+struct A14637
+    x
+end
+a14637 = A14637(0)
+@test (@which a14637.x).name === :getproperty
+@test (@functionloc a14637.x)[2] isa Integer
+
+# Issue #28615
+@test_throws ErrorException (@which [1, 2] .+ [3, 4])
+@test (@code_typed optimize=true max.([1,7], UInt.([4])))[2] == Vector{UInt}
+@test (@code_typed Ref.([1,2])[1].x)[2] == Int
+@test (@code_typed max.(Ref(true).x))[2] == Bool
+@test (@code_typed optimize=false round.([1.0, 2.0]; digits = 3))[2] == Vector{Float64}
+@test (@code_typed optimize=false round.([1.0, 2.0], base = 2; digits = 3))[2] == Vector{Float64}
+@test (@code_typed optimize=false round.(base = 2, [1.0, 2.0], digits = 3))[2] == Vector{Float64}
+@test (@code_typed optimize=false [1, 2] .= 2)[2] == Vector{Int}
+@test (@code_typed optimize=false [1, 2] .<<= 2)[2] == Vector{Int}
+@test (@code_typed optimize=false [1, 2.0] .= 1 .+ [2, 3])[2] == Vector{Float64}
+@test (@code_typed optimize=false [1, 2.0] .= 1 .+ round.(base = 1, [1, 3]; digits = 3))[2] == Vector{Float64}
+@test (@code_typed optimize=false [1] .+ [2])[2] == Vector{Int}
+@test !isempty(@code_typed optimize=false max.(Ref.([5, 6])...))
+expansion = string(@macroexpand @code_typed optimize=false max.(Ref.([5, 6])...))
+@test contains(expansion, "(x1) =") # presence of wrapper function
+# Make sure broadcasts in nested arguments are not processed.
+v = Any[1]
+expansion = string(@macroexpand @code_typed v[1] = rand.(Ref(1)))
+@test contains(expansion, "Core.Typeof(rand.(Ref(1)))")
+@test !contains(expansion, "(x1) =")
+
+# Issue # 45889
+@test !isempty(@code_typed 3 .+ 6)
+@test !isempty(@code_typed 3 .+ 6 .+ 7)
+@test !isempty(@code_typed optimize=false (.- [3,4]))
+@test !isempty(@code_typed optimize=false (6 .- [3,4]))
+@test !isempty(@code_typed optimize=false (.- 0.5))
+
+# Issue #36261
+@test (@code_typed max.(1 .+ 3, 5 - 7))[2] == Int
+f36261(x,y) = 3x + 4y
+A36261 = Float64[1.0, 2.0, 3.0]
+let
+    @code_typed f36261.(A36261, pi)[1]
+    @code_typed f36261.(A36261, 1 .+ pi)[1]
+    @code_typed f36261.(A36261, 1 + pi)[1]
 end
 
 module ReflectionTest
@@ -296,39 +714,63 @@ end # module ReflectionTest
 
 @test_throws ArgumentError("argument is not a generic function") code_llvm(===, Tuple{Int, Int})
 @test_throws ArgumentError("argument is not a generic function") code_native(===, Tuple{Int, Int})
+@test_throws ErrorException("argument tuple type must contain only types") code_native(sum, (Int64,1))
+@test_throws ErrorException("expected tuple type") code_native(sum, Vector{Int64})
 
 # Issue #18883, code_llvm/code_native for generated functions
 @generated f18883() = nothing
 @test !isempty(sprint(code_llvm, f18883, Tuple{}))
+@test !isempty(sprint(code_llvm, (typeof(f18883),)))
 @test !isempty(sprint(code_native, f18883, Tuple{}))
+@test !isempty(sprint(code_native, (typeof(f18883),)))
 
 ix86 = r"i[356]86"
 
 if Sys.ARCH === :x86_64 || occursin(ix86, string(Sys.ARCH))
     function linear_foo()
-        x = 4
-        y = 5
+        return 5
     end
 
     rgx = r"%"
     buf = IOBuffer()
-    output=""
     #test that the string output is at&t syntax by checking for occurrences of '%'s
-    code_native(buf,linear_foo,(), syntax = :att)
-    output=String(take!(buf))
-
+    code_native(buf, linear_foo, (), syntax = :att, debuginfo = :none)
+    output = replace(String(take!(buf)), r"#[^\r\n]+" => "")
     @test occursin(rgx, output)
 
     #test that the code output is intel syntax by checking it has no occurrences of '%'
-    code_native(buf,linear_foo,(), syntax = :intel)
-    output=String(take!(buf))
-
+    code_native(buf, linear_foo, (), syntax = :intel, debuginfo = :none)
+    output = replace(String(take!(buf)), r"#[^\r\n]+" => "")
     @test !occursin(rgx, output)
 
-    code_native(buf,linear_foo,())
-    output=String(take!(buf))
+    code_native(buf, linear_foo, (), debuginfo = :none)
+    output = replace(String(take!(buf)), r"#[^\r\n]+" => "")
+    @test !occursin(rgx, output)
 
-    @test occursin(rgx, output)
+    @testset "binary" begin
+        # check the RET instruction (opcode: C3)
+        ret = r"^; [0-9a-f]{4}: c3$"m
+
+        # without binary flag (default)
+        code_native(buf, linear_foo, (), dump_module=false)
+        output = String(take!(buf))
+        @test !occursin(ret, output)
+
+        # with binary flag
+        for binary in false:true
+            code_native(buf, linear_foo, (); binary, dump_module=false)
+            output = String(take!(buf))
+            @test occursin(ret, output) == binary
+        end
+    end
+end
+
+# `Type{T}` is not a dispatch slot, make sure we still disassemble the method rather than
+# the lazy JIT placeholder
+native_type_arg(::Type{T}) where {T} = sizeof(T)
+let output = sprint(io -> code_native(io, native_type_arg, (Type{Int},); dump_module=false))
+    @test occursin("within `native_type_arg`", output)
+    @test !occursin("jl_fptr_wait_for_compiled", output)
 end
 
 @testset "error message" begin
@@ -336,53 +778,654 @@ end
     @test_throws err @code_lowered ""
     @test_throws err @code_lowered 1
     @test_throws err @code_lowered 1.0
+
+    @test_throws "dot expressions are not lowered to a single function call" @which a .= 1 + 2
+    @test_throws "invalid keyword argument syntax" @eval @which round(1; digits(3))
 end
 
-using InteractiveUtils: editor
+using InteractiveUtils: editor, editor_matches, define_editor, find_source, EDITOR_CALLBACKS
 
 # Issue #13032
 withenv("JULIA_EDITOR" => nothing, "VISUAL" => nothing, "EDITOR" => nothing) do
     # Make sure editor doesn't error when no ENV editor is set.
-    @test isa(editor(), Array)
+    @test isa(editor(), Cmd)
+    (Sys.iswindows() || Sys.isapple()) && @test editor() == `open`
 
     # Invalid editor
     ENV["JULIA_EDITOR"] = ""
-    @test_throws ErrorException editor()
+    @test_throws ErrorException("invalid editor \$JULIA_EDITOR: \"\"") editor()
+    ENV["JULIA_EDITOR"] = " "
+    @test_throws ErrorException("invalid editor \$JULIA_EDITOR: \" \"") editor()
+
+    # Precedence
+    ENV["JULIA_EDITOR"], ENV["VISUAL"], ENV["EDITOR"] = "a", "b", "c"
+    @test editor() == `a`
+    delete!(ENV, "JULIA_EDITOR")
+    @test editor() == `b`
+    delete!(ENV, "VISUAL")
+    @test editor() == `c`
+    delete!(ENV, "EDITOR")
 
     # Note: The following testcases should work regardless of whether these editors are
     # installed or not.
 
     # Editor on the path.
     ENV["JULIA_EDITOR"] = "vim"
-    @test editor() == ["vim"]
+    @test editor() == `vim`
 
     # Absolute path to editor.
     ENV["JULIA_EDITOR"] = "/usr/bin/vim"
-    @test editor() == ["/usr/bin/vim"]
+    @test editor() == `/usr/bin/vim`
 
     # Editor on the path using arguments.
     ENV["JULIA_EDITOR"] = "subl -w"
-    @test editor() == ["subl", "-w"]
+    @test editor() == `subl -w`
 
     # Absolute path to editor with spaces.
     ENV["JULIA_EDITOR"] = "/Applications/Sublime\\ Text.app/Contents/SharedSupport/bin/subl"
-    @test editor() == ["/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl"]
+    @test editor() == `'/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl'`
 
     # Paths with spaces and arguments (#13032).
     ENV["JULIA_EDITOR"] = "/Applications/Sublime\\ Text.app/Contents/SharedSupport/bin/subl -w"
-    @test editor() == ["/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl", "-w"]
+    @test editor() == `'/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl' -w`
 
     ENV["JULIA_EDITOR"] = "'/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl' -w"
-    @test editor() == ["/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl", "-w"]
+    @test editor() == `'/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl' -w`
 
     ENV["JULIA_EDITOR"] = "\"/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl\" -w"
-    @test editor() == ["/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl", "-w"]
+    @test editor() == `'/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl' -w`
+end
+
+function with_editor_callbacks(f, callbacks...)
+    saved = copy(EDITOR_CALLBACKS)
+    copy!(EDITOR_CALLBACKS, Function[callbacks...])
+    try
+        f()
+    finally
+        copy!(EDITOR_CALLBACKS, saved)
+    end
+end
+
+@testset "define_editor" begin
+    @test editor_matches("vi", `vi`)
+    @test editor_matches("vi", `/usr/bin/vi -m`)
+    @test editor_matches("vi", `vi.exe`)
+    @test !editor_matches("vi", `vim -g`)
+    @test editor_matches(r"^'/a b/vi' -m$", `'/a b/vi' -m`)
+    @test editor_matches(["vim", r"^vi\b"], `vi -m`)
+    @test !editor_matches(["vim", r"^vim\b"], `vi -m`)
+
+    calls = []
+    fallback = (cmd, path, line, column) -> (push!(calls, (:fallback, line, column)); true)
+    failing = `$(Base.julia_cmd()) -e 'exit(1)'`
+    withenv("JULIA_EDITOR" => "myed --flag") do
+        with_editor_callbacks(fallback) do
+            # The newest match runs first, and declining passes to the next callback.
+            define_editor((cmd, path, line) -> (push!(calls, (:legacy, cmd, path, line)); nothing), "myed")
+            define_editor((cmd, path, line, column) -> (push!(calls, (:new, cmd, path, line, column)); nothing), r"--flag$")
+            define_editor((cmd, path, line, column) -> error("should not match"), "other")
+            @test edit("a.txt", 2, 3) === nothing
+            @test calls == [(:new, `myed --flag`, "a.txt", 2, 3), (:legacy, `myed --flag`, "a.txt", 2), (:fallback, 2, 3)]
+            empty!(calls)
+            define_editor((cmd, path, line, column) -> "not a command", "myed")
+            @test_logs (:warn, "invalid editor value returned") edit("a.txt")
+            @test last(calls) == (:fallback, 1, 1)
+        end
+        # A failing editor can only raise an error if julia waits for it.
+        with_editor_callbacks() do
+            define_editor((cmd, path, line, column) -> failing, "myed"; wait=true)
+            @test_throws ProcessFailedException edit("a.txt")
+        end
+        with_editor_callbacks() do
+            define_editor((cmd, path, line, column) -> failing, "myed"; wait=false)
+            @test edit("a.txt") === nothing
+        end
+        # Callbacks pushed directly may decline, and may omit the column.
+        empty!(calls)
+        with_editor_callbacks((cmd, path, line, column) -> false,
+                              (cmd, path, line) -> (push!(calls, (cmd, path, line)); true)) do
+            edit("a.txt", 5)
+        end
+        @test calls == [(`myed --flag`, "a.txt", 5)]
+        with_editor_callbacks((cmd, path, line, column) -> false) do
+            @test_throws ErrorException("no editor found") edit("a.txt")
+        end
+    end
+end
+
+@testset "find_source" begin
+    # Run from an empty directory, because the test directory has its own files.
+    mktempdir() do dir
+        cd(dir) do
+            @test find_source("missing_file.txt") == "missing_file.txt"
+            @test find_source("missing_file.jl") == "missing_file.jl"
+            @test find_source(SubString("missing_file.txt", 1)) isa String
+            base_file = find_source("int.jl")
+            @test isabspath(base_file) && isfile(base_file) && basename(base_file) == "int.jl"
+            @test find_source(base_file) == base_file
+        end
+    end
+end
+
+edit_test_one_method(x::Int) = x
+"first"
+edit_test_two_methods(x::Int) = x
+"second"
+edit_test_two_methods(x::Float64) = x
+edit_test_doc_line = @__LINE__() + 1
+"documented"
+const edit_test_documented = 1
+const edit_test_undocumented = 1
+function edit_test_no_methods end
+
+@testset "edit locations" begin
+    file, line = functionloc(edit_test_one_method, (Int,))
+    edits(f) = let calls = []
+        with_editor_callbacks(f, (cmd, path, line, column) -> (push!(calls, (path, line, column)); true))
+        calls
+    end
+    for f in (() -> edit(edit_test_one_method),
+              () -> edit(edit_test_one_method, (Int,)),
+              () -> edit(edit_test_one_method, 1),
+              () -> edit(which(edit_test_one_method, (Int,))),
+              () -> edit(Tuple{typeof(edit_test_one_method), Int}),
+              () -> edit((typeof(edit_test_one_method), Int)),
+              () -> @edit edit_test_one_method(1))
+        @test edits(f) == [(file, line, 1)]
+    end
+    @test edits(() -> edit("a.txt")) == [("a.txt", 1, 1)]
+    @test edits(() -> edit("a.txt", 2)) == [("a.txt", 2, 1)]
+    @test edits(() -> edit("a.txt", 2, 3)) == [("a.txt", 2, 3)]
+    @test edits(() -> edit(InteractiveUtils)) == [(pathof(InteractiveUtils), 1, 1)]
+    @test edits(() -> edit(@__MODULE__, :edit_test_documented)) == [(@__FILE__, edit_test_doc_line, 1)]
+    @test edits(() -> @edit edit_test_documented) == [(@__FILE__, edit_test_doc_line, 1)]
+
+    @test isempty(edits() do
+        @test length(edit(edit_test_two_methods)) == 2
+    end)
+    @test_throws "could not determine location" edit(@__MODULE__, :edit_test_undocumented)
+    @test_throws "could not determine location" edit(@__MODULE__, :edit_test_two_methods)
+    @test_throws "could not find source file" edit(nothing, 1)
+    @test_throws "function has no definitions" edit(edit_test_no_methods)
+    @test_throws "object is not callable" edit(1)
+end
+
+# Run the commands for real, but find them in a directory of fake ones.
+Sys.iswindows() || @testset "editor and pager commands" begin
+    mktempdir() do dir
+        script = joinpath(dir, "fake")
+        write(script, "#!/bin/sh\nprintf '%s\\n' \"\${0##*/}\" \"\$@\" >&2\nexit 1\n")
+        chmod(script, 0o755)
+        function spawned(f, command, env...)
+            name = joinpath(dir, first(Base.shell_split(command)))
+            islink(name) || symlink(script, name)
+            pipe = Pipe()
+            Base.link_pipe!(pipe; reader_supports_async=true, writer_supports_async=true)
+            waited = false
+            stderr_txt = @async readlines(pipe)
+            withenv("PATH" => dir, env...) do
+                try
+                    redirect_stderr(f, pipe)
+                catch e
+                    e isa ProcessFailedException || rethrow()
+                    waited = true
+                end
+            end
+            close(pipe.in)
+            return fetch(stderr_txt), waited
+        end
+        function edited(args...; editor)
+            return spawned(() -> edit(args...), editor, "JULIA_EDITOR" => editor)
+        end
+
+        p = "a.txt"
+        for (editors, wait, args) in [
+                (["vim", "vi", "nvim", "mvim"], true, ["+normal 3G4|", p]),
+                (["gvim", "gvim -f"], false, ["+normal 3G4|", p]),
+                (["nano"], true, ["+3,4", p]),
+                (["emacs", "emacs -Q", "emacsclient", "emacsclient -c"], false, ["+3:4", p]),
+                (["emacs -nw", "emacs -Q --no-window-system", "emacsclient -nw", "emacsclient -t",
+                  "emacsclient --tty", "emacsclient -a '' -t", "emacsclient -c -nw"], true, ["+3:4", p]),
+                (["gedit"], false, ["+3:4", p]),
+                (["micro", "kak"], true, ["+3", p]),
+                (["hx", "helix"], true, ["$p:3:4"]),
+                (["textmate", "mate", "kate"], false, [p, "-l", "3"]),
+                (["subl", "subl -w", "atom", "pycharm", "bbedit"], false, ["$p:3"]),
+                (["code", "code-insiders"], false, ["-g", "$p:3:4"]),
+                (["notepad++"], false, [p, "-n3"]),
+                (["notepad", "unknown-editor --flag"], false, [p]),
+            ], editor in editors
+            @test edited(p, 3, 4; editor) == ([Base.shell_split(editor)..., args...], wait)
+        end
+        @test edited(p, 3, 4; editor="open") == (Sys.isapple() ? ["open", "-t", p] : ["open", p], false)
+
+        for (editor, wait) in (("vim", true), ("gvim", false))
+            @test edited(p, 0, 0; editor) == ([editor, p], wait)
+            @test edited(p, 3, 0; editor) == ([editor, "+3", p], wait)
+            @test edited(p; editor) == ([editor, "+normal 1G1|", p], wait)
+        end
+
+        file, line = functionloc(edit_test_one_method, (Int,))
+        for (pager, env) in (("less", "PAGER" => nothing), ("mypager", "PAGER" => "mypager"))
+            paged(f) = spawned(f, pager, env)
+            @test paged(() -> less(p, 3)) == ([pager, "+3g", p], true)
+            @test paged(() -> less(p)) == ([pager, "+1g", p], true)
+            @test paged(() -> less("int.jl", 3)) == ([pager, "+3g", find_source("int.jl")], true)
+            @test paged(() -> less(edit_test_one_method)) == ([pager, "+$(line)g", file], true)
+            @test paged(() -> @less edit_test_one_method(1)) == ([pager, "+$(line)g", file], true)
+        end
+        @test spawned(() -> less(p, 3), "mypager", "PAGER" => "mypager -R") == (["mypager", "-R", "+3g", p], true)
+    end
 end
 
 # clipboard functionality
+if Sys.isapple()
+    let str = "abc\0def"
+        clipboard(str)
+        @test clipboard() == str
+    end
+end
 if Sys.iswindows() || Sys.isapple()
     for str in ("Hello, world.", "∀ x ∃ y", "")
         clipboard(str)
         @test clipboard() == str
     end
+end
+@static if Sys.iswindows()
+    @test_broken false # CI has trouble with this test
+    ## concurrent access error
+    #hDesktop = ccall((:GetDesktopWindow, "user32"), stdcall, Ptr{Cvoid}, ())
+    #ccall((:OpenClipboard, "user32"), stdcall, Cint, (Ptr{Cvoid},), hDesktop) == 0 && Base.windowserror("OpenClipboard")
+    #try
+    #    @test_throws Base.SystemError("OpenClipboard", 0, Base.WindowsErrorInfo(0x00000005, nothing)) clipboard() # ACCESS_DENIED
+    #finally
+    #    ccall((:CloseClipboard, "user32"), stdcall, Cint, ()) == 0 && Base.windowserror("CloseClipboard")
+    #end
+    # empty clipboard failure
+    ccall((:OpenClipboard, "user32"), stdcall, Cint, (Ptr{Cvoid},), C_NULL) == 0 && Base.windowserror("OpenClipboard")
+    try
+        ccall((:EmptyClipboard, "user32"), stdcall, Cint, ()) == 0 && Base.windowserror("EmptyClipboard")
+    finally
+        ccall((:CloseClipboard, "user32"), stdcall, Cint, ()) == 0 && Base.windowserror("CloseClipboard")
+    end
+    @test clipboard() == ""
+    # nul error (unsupported data)
+    @test_throws ArgumentError("Windows clipboard strings cannot contain NUL character") clipboard("abc\0")
+end
+
+# buildbot path updating
+file, ln = functionloc(versioninfo, Tuple{})
+@test isfile(file)
+@test isfile(pathof(InteractiveUtils))
+@test isdir(pkgdir(InteractiveUtils))
+
+module ModuleWithoutPathForEdit
+end
+@test_throws ErrorException("could not find source file for module: $(ModuleWithoutPathForEdit)") edit(ModuleWithoutPathForEdit)
+
+# compiler stdlib path updating
+file, ln = functionloc(Core.Compiler.tmeet, Tuple{Int, Float64})
+@test isfile(file)
+
+@testset "buildbot path updating" begin
+    file, ln = functionloc(versioninfo, Tuple{})
+    @test isfile(file)
+
+    e = try versioninfo("wat")
+    catch e
+        e
+    end
+    @test e isa MethodError
+    m = @which versioninfo()
+    s = sprint(showerror, e)
+    m = match(Regex("@ .+ (.*?):$(m.line)"), s)
+    @test isfile(expanduser(m.captures[1]))
+
+    g() = x
+    e, bt = try code_llvm(g, Tuple{Int})
+    catch e
+        e, catch_backtrace()
+    end
+    @test e isa Exception
+    s = sprint(showerror, e, bt)
+    m = match(r"(\S*InteractiveUtils[\/\\]src\S*):", s)
+    @test isfile(expanduser(m.captures[1]))
+end
+
+@testset "Issue #34434" begin
+    io = IOBuffer()
+    code_native(io, eltype, Tuple{Int})
+    @test occursin("eltype", String(take!(io)))
+end
+
+@testset "Issue #41010" begin
+    struct A41010 end
+
+    struct B41010
+        a::A41010
+    end
+    export B41010
+
+    ms = methodswith(A41010, @__MODULE__) |> collect
+    @test ms[1].name === :B41010
+end
+
+# macro options should accept both literals and variables
+let
+    opt = false
+    @test length(first(@code_typed optimize=opt sum(1:10)).code) ==
+        length((@code_lowered sum(1:10)).code)
+end
+
+@testset "@time_imports, @trace_compile, @trace_dispatch" begin
+    mktempdir() do dir
+        cd(dir) do
+            try
+                pushfirst!(LOAD_PATH, dir)
+                foo_file = joinpath(dir, "Foo3242.jl")
+                write(foo_file,
+                    """
+                    module Foo3242
+                    function foo()
+                        Base.Experimental.@force_compile
+                        foo(1)
+                    end
+                    foo(x) = x
+                    function bar()
+                        Base.Experimental.@force_compile
+                        bar(1)
+                    end
+                    bar(x) = x
+                    __init__() = nothing
+                    end
+                    """)
+
+                Base.compilecache(Base.PkgId("Foo3242"))
+
+                fname = tempname()
+                f = open(fname, "w")
+                redirect_stdout(f) do
+                    @eval @time_imports using Foo3242
+                end
+                close(f)
+                buf = read(fname)
+                rm(fname)
+
+                @test occursin(r"┌ [\d.]+ ms Foo3242\.__init__\(\)[^\n]*\n\s+[\d.]+ ms  Foo3242", String(buf))
+
+                fname = tempname()
+                f = open(fname, "w")
+                redirect_stderr(f) do
+                    @trace_compile @eval Foo3242.foo()
+                end
+                close(f)
+                buf = read(fname)
+                rm(fname)
+
+                @test occursin("ms =# precompile(", String(buf))
+
+                fname = tempname()
+                f = open(fname, "w")
+                redirect_stderr(f) do
+                    @trace_dispatch @eval Foo3242.bar()
+                end
+                close(f)
+                buf = read(fname)
+                rm(fname)
+
+                @test occursin("precompile(", String(buf))
+            finally
+                filter!((≠)(dir), LOAD_PATH)
+            end
+        end
+    end
+end
+
+let # `default_tt` should work with any function with one method
+    @test (code_warntype(devnull, function ()
+        sin(42)
+    end); true)
+    @test (code_warntype(devnull, function (a::Int)
+        sin(a)
+    end); true)
+    @test (code_llvm(devnull, function ()
+        sin(42)
+    end); true)
+    @test (code_llvm(devnull, function (a::Int)
+        sin(a)
+    end); true)
+    @test (code_native(devnull, function ()
+        sin(42)
+    end); true)
+    @test (code_native(devnull, function (a::Int)
+        sin(a)
+    end); true)
+end
+
+let # specifying calls as argtypes (incl. arg0) should be supported
+    @test (code_warntype(devnull, (typeof(function ()
+        sin(42)
+    end),)); true)
+    @test (code_warntype(devnull, (typeof(function (a::Int)
+        sin(42)
+    end), Int)); true)
+    @test (code_llvm(devnull, (typeof(function ()
+        sin(42)
+    end),)); true)
+    @test (code_llvm(devnull, (typeof(function (a::Int)
+        sin(42)
+    end), Int)); true)
+    @test (code_native(devnull, (typeof(function ()
+        sin(42)
+    end),)); true)
+    @test (code_native(devnull, (typeof(function (a::Int)
+        sin(42)
+    end), Int)); true)
+end
+
+@testset "code_llvm on opaque_closure" begin
+    let ci = code_typed(+, (Int, Int))[1][1]
+        ir = Core.Compiler.inflate_ir(ci)
+        ir.argtypes[1] = Tuple{}
+        @test ir.debuginfo.def === nothing
+        ir.debuginfo.def = Symbol(@__FILE__)
+        oc = Core.OpaqueClosure(ir)
+        @test (code_llvm(devnull, oc, Tuple{Int, Int}); true)
+        let io = IOBuffer()
+            code_llvm(io, oc, Tuple{})
+            @test occursin(InteractiveUtils.OC_MISMATCH_WARNING, String(take!(io)))
+        end
+    end
+end
+
+@testset "begin/end in gen_call_with_extracted_types users" begin
+    mktemp() do f, io
+        redirect_stdout(io) do
+            a = [1,2]
+            @test (@code_typed a[1:end]).second == Vector{Int}
+            @test (@code_llvm a[begin:2]) === nothing
+            @test (@code_native a[begin:end]) === nothing
+        end
+    end
+end
+
+@test Base.infer_effects(sin, (Int,)) == InteractiveUtils.@infer_effects sin(42)
+@test Base.infer_return_type(sin, (Int,)) == InteractiveUtils.@infer_return_type sin(42)
+@test Base.infer_exception_type(sin, (Int,)) == InteractiveUtils.@infer_exception_type sin(42)
+@test first(InteractiveUtils.@code_ircode sin(42)) isa Core.Compiler.IRCode
+@test first(InteractiveUtils.@code_ircode optimize_until="CC: INLINING" sin(42)) isa Core.Compiler.IRCode
+# Test.@inferred also uses `gen_call_with_extracted_types`
+@test Test.@inferred round(1.2) isa Float64
+@test Test.@inferred round(1.3; digits = 3) isa Float64
+# ensure proper inference of the macro output of `@inferred`
+@test Base.infer_return_type(x -> Test.@inferred(round(x)), (Float64,)) === Float64
+@test Base.infer_return_type(x -> Test.@inferred(round(x; digits = 3)), (Float64,)) === Float64
+
+@testset "Docstrings" begin
+    @test isempty(Docs.undocumented_names(InteractiveUtils))
+end
+
+# issue https://github.com/JuliaIO/ImageMagick.jl/issues/235
+module OuterModule
+    module InternalModule
+        struct MyType
+            x::Int
+        end
+
+        Base.@deprecate_binding MyOldType MyType
+
+        export MyType
+    end
+    using .InternalModule
+    export MyType, MyOldType
+end # module
+@testset "Subtypes and deprecations" begin
+    using .OuterModule
+    @test_nowarn subtypes(Integer);
+end
+
+# PR #45399
+# Values of the arguments of the call that a reflection macro analyzes for `ex`
+function which_call_args(ex)
+    args = Any[]
+    function walk(x)
+        x isa Expr || return
+        if x.head === :call && (x.args[1] == :(Core.Typeof) || x.args[1] === GlobalRef(Core, :Typeof))
+            push!(args, Core.eval(@__MODULE__, x.args[2]))
+        else
+            foreach(walk, x.args)
+        end
+    end
+    walk(macroexpand(@__MODULE__, :(@which $ex)))
+    return args
+end
+
+const hvncat_x, hvncat_y, hvncat_z, hvncat_w = 1, 2.0, 0x3, 4//1
+const hvncat_v = [1, 2]
+
+@testset "hvncat/typed_hvncat" begin
+    # one-dimensional
+    @test which_call_args(:([1;;;])) == [hvncat, 3, 1]
+    @test which_call_args(:([1 ;;;; 3;;;; 9])) == [hvncat, 4, 1, 3, 9]
+    @test which_call_args(:(Int64[1;;;])) == [Base.typed_hvncat, Int64, 3, 1]
+    @test which_call_args(:(Int64[1 ;;;; 3;;;; 9])) == [Base.typed_hvncat, Int64, 4, 1, 3, 9]
+    @test which_call_args(:([string() ;;; string()])) == [hvncat, 3, "", ""]
+
+    # balanced
+    @test which_call_args(:([1 4 ;;; 3 4 ;;; 1 9])) == [hvncat, (1, 2, 3), true, 1, 4, 3, 4, 1, 9]
+    @test which_call_args(:([1 ;; 4 ;;;; 3;; 9])) == [hvncat, (1, 2, 1, 2), false, 1, 4, 3, 9]
+    @test which_call_args(:(Int64[1 4 ;;; 3 4 ;;; 1 9])) == [Base.typed_hvncat, Int64, (1, 2, 3), true, 1, 4, 3, 4, 1, 9]
+    @test which_call_args(:(Int64[1 ;; 4 ;;;; 3;; 9])) == [Base.typed_hvncat, Int64, (1, 2, 1, 2), false, 1, 4, 3, 9]
+
+    # ragged
+    @test which_call_args(:([1 4 ;;; 3 4 ;;;; 4])) ==
+        [hvncat, ((2, 2, 1), (2, 2, 1), (4, 1), (5,)), true, 1, 4, 3, 4, 4]
+    @test which_call_args(:([1; 4 ;;; 3; 4 ;;;; 4])) ==
+        [hvncat, ((2, 2, 1), (2, 2, 1), (4, 1), (5,)), false, 1, 4, 3, 4, 4]
+    @test which_call_args(:([1 2 3 ;;; 4 5; 6 ;;; 7 8; 9])) ==
+        [hvncat, ((3, 2, 1, 2, 1), (3, 3, 3), (9,)), true, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    # row lengths whose deviations from the first row cancel out
+    @test which_call_args(:([1 2; 3; 4 5 6 ;;; 7 8; 9; 10 11 12])) ==
+        [hvncat, ((2, 1, 3, 2, 1, 3), (6, 6), (12,)), true, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    @test which_call_args(:(Int64[1; 2 ;; 3 ;; 4; 5; 6])) ==
+        [Base.typed_hvncat, Int64, ((2, 1, 3), (6,)), false, 1, 2, 3, 4, 5, 6]
+    @test which_call_args(:(Int64[1 4 ;;; 3 4 ;;;; 4])) ==
+        [Base.typed_hvncat, Int64, ((2, 2, 1), (2, 2, 1), (4, 1), (5,)), true, 1, 4, 3, 4, 4]
+    @test which_call_args(:(Int64[1; 4 ;;; 3; 4 ;;;; 4])) ==
+        [Base.typed_hvncat, Int64, ((2, 2, 1), (2, 2, 1), (4, 1), (5,)), false, 1, 4, 3, 4, 4]
+
+    # elements that are not expressions
+    @test which_call_args(:([hvncat_x hvncat_y ;;; hvncat_z hvncat_w])) ==
+        [hvncat, (1, 2, 2), true, hvncat_x, hvncat_y, hvncat_z, hvncat_w]
+    @test which_call_args(:([hvncat_x ;;; hvncat_y])) == [hvncat, 3, hvncat_x, hvncat_y]
+    @test which_call_args(:(["ab" "cd" ;;; "e" "f"])) == [hvncat, (1, 2, 2), true, "ab", "cd", "e", "f"]
+    @test which_call_args(:(["ab" ;;; "cd"])) == [hvncat, 3, "ab", "cd"]
+    @test which_call_args(:([:a ;; :b ;;; :c ;; :d])) == [hvncat, (1, 2, 2), false, :a, :b, :c, :d]
+    @test which_call_args(:([nothing ;;; nothing])) == [hvncat, 3, nothing, nothing]
+
+    # the analyzed call must build the same array as the literal
+    for ex in (:([1 4 ;;; 3 4 ;;; 1 9]), :([1 ;; 4 ;;;; 3;; 9]), :(Int64[1 ;; 4 ;;;; 3;; 9]),
+               :([[1 2] 3 ;;; 4 5 6]), :([[1 2] 3; 4 5 6 ;;; 7 8 9; [10 11] 12]),
+               :([hvncat_x hvncat_y ;;; hvncat_z hvncat_w]), :(["ab" "cd" ;;; "e" "f"]))
+        f, args... = which_call_args(ex)
+        @test f(args...) == Core.eval(@__MODULE__, ex)
+    end
+
+    @test (@which [1 2 ;;; 3 4]) == which(hvncat, (Tuple{Int,Int,Int}, Bool, Int, Int, Int, Int))
+    @test (@which [hvncat_x ;;; hvncat_y]) == which(hvncat, (Int, Int, Float64))
+
+    # splatting is only supported by lowering in the one-dimensional case
+    @test (@which [hvncat_v... ;;; hvncat_v...]) == which(hvncat, (Int, Int, Int, Int, Int))
+    @test_throws "Splatting ... in an hvncat with multiple dimensions is not supported" @which [hvncat_v... 1 ;;; 2 3]
+    @test_throws "Splatting ... in an hvncat with multiple dimensions is not supported" @which [hvncat_v... ;; 1 ;;; 2 ;; 3]
+end
+
+let code = """
+        using InteractiveUtils
+        @activate Compiler[:codegen, :reflection]
+        println("done compiling")
+    """
+    orig_compiler = realpath(joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "Compiler"))
+    mktempdir() do dir
+        new_compiler = joinpath(dir, "Compiler")
+        cp(orig_compiler, new_compiler)
+        output = read(`$(Base.julia_cmd()) -g0 -O0 --startup-file=no --project=$(new_compiler) -e $code`, String)
+        @test occursin("done compiling", output)
+    end
+end
+
+var_line = @__LINE__()+1
+"""
+    docs for a global variable
+"""
+const _interactiveutils_some_var_ = 0
+
+@test InteractiveUtils.varloc(@__MODULE__, :_interactiveutils_some_var_) == (@__FILE__, var_line)
+
+@testset "code_llvm and code_warntype run the compiler in the typeinf world" begin
+    # Methods with broad signatures invalidate compiler code that normal inference never
+    # notices, because it runs in the frozen typeinf world. `code_llvm`, `code_native` and
+    # `code_warntype` used to run `typeinf_code` in the current world instead, so the first
+    # call after such a definition recompiled the invalidated compiler.
+    script = """
+        using InteractiveUtils
+        struct Displacement <: Integer; val::Int; end
+        Base.convert(::Type{Int64}, x::Displacement) = x.val
+        Base.Int64(x::Displacement) = x.val
+        struct NotReal; val; end
+        Base.isless(x, y::NotReal) = isless(x, y.val)
+        code_llvm(devnull, sin, (Float64,))
+        code_native(devnull, sin, (Float64,))
+        code_warntype(devnull, sin, (Float64,))
+        """
+    trace = mktemp() do path, io
+        run(pipeline(`$(Base.julia_cmd()) --startup-file=no --trace-compile=$path -e $script`, stderr=devnull))
+        read(path, String)
+    end
+    recompiled = filter(l -> occursin("# recompile", l) && occursin("Base.Compiler.", l), split(trace, '\n'))
+    @test isempty(recompiled)
+end
+
+@testset "world argument for varinfo and subtypes" begin
+    # varinfo: a non-const binding added after the recorded world should not
+    # appear when querying that older world (its partition does not yet exist
+    # at world_no_var, so `isdefined` in that world returns false).
+    M_varinfo = @eval module $(gensym()) end
+    world_no_var = Base.get_world_counter()
+    @eval M_varinfo begin
+        export tracked_var
+        tracked_var = 42
+    end
+    @test occursin("tracked_var", repr(varinfo(M_varinfo)))
+    @test !occursin("tracked_var", repr(varinfo(M_varinfo; world=world_no_var)))
+
+    # subtypes: subtype added after the recorded world should not appear when
+    # querying that older world.
+    M_sub = @eval module $(gensym())
+        abstract type MyAbstractParent end
+    end
+    world_no_subtype = Base.get_world_counter()
+    @eval M_sub struct MyConcreteChild <: MyAbstractParent end
+    @test length(subtypes(M_sub, M_sub.MyAbstractParent)) == 1
+    @test isempty(subtypes(M_sub, M_sub.MyAbstractParent; world=world_no_subtype))
 end

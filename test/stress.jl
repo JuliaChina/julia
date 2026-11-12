@@ -2,27 +2,9 @@
 
 # test for proper handling of FD exhaustion
 if Sys.isunix()
-    let ps = Pipe[]
-        ulimit_n = tryparse(Int, readchomp(`sh -c 'ulimit -n'`))
-        try
-            for i = 1:100*something(ulimit_n, 1000)
-                p = Pipe()
-                Base.link_pipe!(p)
-                push!(ps, p)
-            end
-            if ulimit_n === nothing
-                @warn "`ulimit -n` is set to unlimited, fd exhaustion cannot be tested"
-                @test_broken false
-            else
-                @test false
-            end
-        catch ex
-            isa(ex, Base.IOError) || rethrow(ex)
-            @test ex.code in (Base.UV_EMFILE, Base.UV_ENFILE)
-        finally
-            foreach(close, ps)
-        end
-    end
+    # Run this test with a really small ulimit. If the ulimit is too high,
+    # we might saturate kernel resources (See #23143)
+    run(`sh -c "ulimit -n 100; $(Base.shell_escape(Base.julia_cmd())) --startup-file=no $(joinpath(@__DIR__, "stress_fd_exec.jl"))"`)
 end
 
 # issue 13559
@@ -94,13 +76,24 @@ end  # !Sys.iswindows
 
 # sig 2 is SIGINT per the POSIX.1-1990 standard
 if !Sys.iswindows()
-    ccall(:jl_exit_on_sigint, Cvoid, (Cint,), 0)
-    @test_throws InterruptException begin
-        ccall(:kill, Cvoid, (Cint, Cint,), getpid(), 2)
-        for i in 1:10
-            Libc.systemsleep(0.1)
-            ccall(:jl_gc_safepoint, Cvoid, ()) # wait for SIGINT to arrive
+    # With exit_on_sigint disabled, SIGINT cancels the current ^C episode's
+    # cancellation scope and is observed at a cancellation point as a
+    # CancellationRequest (it is no longer force-thrown asynchronously at GC
+    # safepoints). Contain the cancellation in a fresh episode scope so the
+    # enclosing test scope stays live, and close the episode afterwards.
+    Base.exit_on_sigint(false)
+    try
+        @test_throws Base.CancellationRequest begin
+            Base.ScopedValues.@with Base.CANCEL_TOKEN => Base.sigint_new_episode!() begin
+                ccall(:kill, Cvoid, (Cint, Cint,), getpid(), 2)
+                for i in 1:100
+                    Libc.systemsleep(0.1)
+                    Base.@cancel_check # wait for the SIGINT cancellation to arrive
+                end
+            end
         end
+    finally
+        Base.sigint_close_episode!()
+        Base.exit_on_sigint(true)
     end
-    ccall(:jl_exit_on_sigint, Cvoid, (Cint,), 1)
 end

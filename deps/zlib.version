@@ -1,0 +1,8 @@
+# -*- makefile -*-
+## jll artifact
+ZLIB_JLL_NAME := Zlib
+
+## source build
+ZLIB_VER := 1.4.0
+ZLIB_BRANCH=v1.4
+ZLIB_SHA1=99623ef7097352da7993ba614161fd6a311e046e

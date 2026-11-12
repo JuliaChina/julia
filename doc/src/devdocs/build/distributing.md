@@ -1,0 +1,374 @@
+Binary distributions
+=======================================
+
+These notes are for those wishing to compile a binary distribution of Julia
+for distribution on various platforms. We love users spreading Julia as
+far and wide as they can, trying it out on as wide an array of
+operating systems and hardware configurations as possible. As each
+platform has specific gotchas and processes that must be followed in
+order to create a portable, working Julia distribution, we have
+separated most of the notes by OS.
+
+Note that while the code for Julia is
+[MIT-licensed, with a few exceptions](https://github.com/JuliaLang/julia/blob/master/LICENSE.md),
+the distribution created by the techniques described herein will be
+GPL licensed, as various dependent libraries such as `SuiteSparse` are
+GPL licensed. We do hope to have a non-GPL distribution of Julia in the future.
+
+Versioning and Git
+------------------
+The Makefile uses both the `VERSION` file and commit hashes and tags from the
+git repository to generate the `base/version_git.jl` with information we use to
+fill the splash screen and the `versioninfo()` output. If you for some reason
+don't want to have the git repository available when building you should
+pregenerate the `base/version_git.jl` file with:
+
+    make -C base version_git.jl.phony
+
+Julia has lots of build dependencies where we use patched versions that have not
+yet been included by the popular package managers. These dependencies will usually
+be automatically downloaded when you build, but if you want to be able to build
+Julia on a computer without internet access you should create a full-source-dist
+archive with the special make target
+
+    make full-source-dist
+
+that creates a julia-version-commit.tar.gz archive with all required dependencies.
+
+When compiling a tagged release in the git repository, we don't display the
+branch/commit hash info in the splash screen. You can use this line to show
+a release description of up to 45 characters. To set this line you have
+to create a Make.user file containing:
+
+    override TAGGED_RELEASE_BANNER = "my-package-repository build"
+
+Target Architectures
+--------------------
+
+By default, Julia optimizes its system image to the native architecture of
+the build machine. This is usually not what you want when building packages,
+as it will make Julia fail at startup on any machine with incompatible CPUs
+(in particular older ones with more restricted instruction sets).
+
+We therefore recommend that you pass the `MARCH` variable when calling `make`,
+setting it to the baseline target you intend to support. This will determine
+the target CPU for both the Julia executable and libraries, and the system
+image (the latter can also be set using [`JULIA_CPU_TARGET`](@ref JULIA_CPU_TARGET)). Typically useful
+values for x86 CPUs are `x86-64` and `core2` (for 64-bit builds) and
+`pentium4` (for 32-bit builds). Unfortunately, CPUs older than Pentium 4
+are currently not supported (see
+[this issue](https://github.com/JuliaLang/julia/issues/7185)).
+
+The full list of CPU targets supported by LLVM can be obtained by running
+`llc -mattr=help`.
+
+Linux
+-----
+
+On Linux, `make binary-dist` creates a tarball that contains a fully
+functional Julia installation. If you wish to create a distribution
+package such as a `.deb`, or `.rpm`, some extra effort is needed. See the
+[julia-debian](https://github.com/staticfloat/julia-debian) repository
+for an example of what metadata is needed for creating `.deb` packages
+for Debian and Ubuntu-based systems. See the
+[Fedora package](https://src.fedoraproject.org/rpms/julia)
+for RPM-based distributions. Although we have not yet experimented
+with it, [Alien](https://wiki.debian.org/Alien) could be used to
+generate Julia packages for various Linux distributions.
+
+Julia supports overriding standard installation directories via `prefix`
+and other environment variables you can pass when calling `make` and
+`make install`. See Make.inc for their list. `DESTDIR` can also be used
+to force the installation into a temporary directory.
+
+By default, Julia loads `$prefix/etc/julia/startup.jl` as an
+installation-wide initialization file. This file can be used by
+distribution managers to set up custom paths or initialization code.
+For Linux distribution packages, if `$prefix` is
+set to `/usr`, there is no `/usr/etc` to look into. This requires
+the path to Julia's private `etc` directory to be changed. This can
+be done via the `sysconfdir` make variable when building. Simply
+pass `sysconfdir=/etc` to `make` when building and Julia will first
+check `/etc/julia/startup.jl` before trying
+`$prefix/etc/julia/startup.jl`.
+
+OS X
+----
+
+To create a binary distribution on OSX, build Julia first, then cd to
+`contrib/mac/app`, and run `make` with the same makevars that were used
+with `make` when building Julia proper. This will then
+create a `.dmg` file in the `contrib/mac/app` directory holding a
+completely self-contained Julia.app.
+
+Alternatively, Julia may be built as a framework by invoking `make` with the
+`darwinframework` target and `DARWIN_FRAMEWORK=1` set. For example,
+`make DARWIN_FRAMEWORK=1 darwinframework`.
+
+Windows
+-------
+
+Instructions for creating a Julia distribution on Windows are described in the
+[build devdocs for Windows](https://github.com/JuliaLang/julia/blob/master/doc/src/devdocs/build/windows.md).
+
+Notes on BLAS and LAPACK
+------------------------
+
+Julia builds OpenBLAS by default, which includes the BLAS and LAPACK
+libraries. On 32-bit architectures, Julia builds OpenBLAS to use
+32-bit integers, while on 64-bit architectures, Julia builds OpenBLAS
+to use 64-bit integers (ILP64). It is essential that all Julia functions
+that call BLAS and LAPACK API routines use integers of the correct width.
+
+Most BLAS and LAPACK distributions provided on linux distributions,
+and even commercial implementations ship libraries that use 32-bit
+APIs. In many cases, a 64-bit API is provided as a separate library.
+
+When using vendor provided or OS provided libraries, a `make` option
+called `USE_BLAS64` is available as part of the Julia build. When doing
+`make USE_BLAS64=0`, Julia will call BLAS and LAPACK assuming a 32-bit
+API, where all integers are 32-bit wide, even on a 64-bit architecture.
+
+Other libraries that Julia uses, such as SuiteSparse also
+use BLAS and LAPACK internally. The APIs need to be consistent across
+all libraries that depend on BLAS and LAPACK. The Julia build process
+will build all these libraries correctly, but when overriding defaults
+and using system provided libraries, this consistency must be ensured.
+
+Also note that Linux distributions sometimes ship several versions of
+OpenBLAS, some of which enable multithreading, and others only working
+in a serial fashion. For example, in Fedora, `libopenblasp.so` is threaded,
+but `libopenblas.so` is not. We recommend using the former for optimal
+performance. To choose an OpenBLAS library whose name is different from
+the default `libopenblas.so`, pass `LIBBLAS=-l$(YOURBLAS)` and
+`LIBBLASNAME=lib$(YOURBLAS)` to `make`, replacing `$(YOURBLAS)` with the
+name of your library. You can also add `.so.0` to the name of the library
+if you want your package to work without requiring the unversioned `.so`
+symlink.
+
+Finally, OpenBLAS includes its own optimized version of LAPACK. If you
+set `USE_SYSTEM_BLAS=1` and `USE_SYSTEM_LAPACK=1`, you should also set
+`LIBLAPACK=-l$(YOURBLAS)` and `LIBLAPACKNAME=lib$(YOURBLAS)`. Else, the
+reference LAPACK will be used and performance will typically be much lower.
+
+Starting with Julia 1.7, Julia uses [libblastrampoline](https://github.com/JuliaLinearAlgebra/libblastrampoline)
+to pick a different BLAS at runtime.
+
+# Point releasing 101
+
+Creating a point/patch release consists of several distinct steps.
+
+## Backporting commits
+
+Some pull requests are labeled `backport x.y`, e.g. `backport 1.13`.
+This designates that the next release tagged from the release-x.y branch
+should include the commit(s) in that pull request.
+Once the pull request is merged into master, its commits are cherry-picked onto the
+`backports-release-x.y` branch, which will ultimately be merged into release-x.y.
+
+Most of this is done by [Backporter](https://github.com/KristofferC/Backporter), which
+also maintains a checklist of backported and still-pending pull requests in the pull
+request associated with `backports-release-x.y`.
+Commits that do not apply cleanly are backported by hand with
+
+```
+git cherry-pick -x <sha>
+```
+
+resolving conflicts as needed.
+The `-x` flag records the original commit in the message, which is how Backporter
+recognizes the commit as backported.
+See [Contributing to patch releases](@ref) for what to cherry-pick and how to contribute
+a manual backport.
+
+## Checking for performance regressions
+
+Point releases should never introduce performance regressions.
+Luckily the Julia benchmarking bot, Nanosoldier, can run benchmarks against any
+branch, not just master.
+In this case we want to check the benchmark results of js/backport-x.y against
+release-x.y.
+To do this, awaken the Nanosoldier from his robotic slumber using a comment on
+your backporting pull request:
+
+```markdown
+@nanosoldier `runbenchmarks(ALL, vs=":release-x.y")`
+```
+
+This will run all registered benchmarks on release-x.y and js/backport-x.y and
+produce a summary of results, marking all improvements and regressions.
+
+If Nanosoldier finds any regressions, try verifying locally and rerun Nanosoldier
+if necessary.
+If the regressions are deemed to be real rather than just noise, you'll have to
+find a commit on master to backport that fixes it if one exists, otherwise you
+should determine what caused the regression and submit a patch (or get someone who
+knows the code to submit a patch) to master, then backport the commit once that's
+merged.
+(Or submit a patch directly to the backport branch if appropriate.)
+
+## Building test binaries
+
+There is no manual step here anymore: every push to the backports PR (and to the
+`release-x.y` branch) is built and tested by the `julia-ci` Buildkite pipeline for
+all supported platforms, and the binaries are downloadable from the build's
+artifacts.
+
+## Checking for package breakages
+
+Point releases should never break packages, with the possible exception of packages
+that are doing some seriously questionable hacks using Base internals that are
+not intended to be user-facing.
+(In those cases, maybe have a word with the package author.)
+
+Whether the forthcoming release breaks packages is checked with
+[PkgEval](https://github.com/JuliaCI/PkgEval.jl), driven by
+[Nanosoldier](https://github.com/JuliaCI/Nanosoldier.jl): comment on the backports
+PR with something like
+
+```
+@nanosoldier `runtests(ALL, vs = ":release-x.y")`
+```
+
+to test every registered package against the backports branch, compared to the
+current release branch.
+Nanosoldier replies with a report of newly failing packages; investigate those
+(locally or by reading their test logs) and distinguish real regressions caused by
+the backports from pre-existing failures and flaky tests.
+If a backported commit turns out to cause breakage, drop or fix it and rerun.
+
+## Merging backports into the release branch
+
+After you have ensured that
+
+* the backported commits pass all of Julia's unit tests,
+* there are no performance regressions introduced by the backported commits as compared
+  to the release branch, and
+* the backported commits do not break any registered packages,
+
+then the backport branch is ready to be merged into release-x.y.
+Once it's merged, remove the `backport x.y` label from all pull requests whose commits
+have been backported.
+Backporter's audit mode does this; it is available as the manually triggered
+`Backport Label Audit` GitHub Actions workflow.
+Do not remove the label from PRs that have not been backported.
+
+The release-x.y branch should now contain all of the new commits.
+The last thing we want to do to the branch is to adjust the version number.
+To do this, submit a PR against release-x.y that edits the VERSION file to remove `-pre`
+from the version number.
+Once that's merged, we're ready to tag.
+
+## Tagging the release
+
+It's time!
+Check out the release-x.y branch and make sure that your local copy of the branch is
+up to date with the remote branch.
+At the command line, run
+
+```
+git tag v$(cat VERSION)
+git push --tags
+```
+
+This creates the tag locally and pushes it to GitHub.
+
+After tagging the release, submit another PR to release-x.y to bump the patch number
+and add `-pre` back to the end.
+This denotes that the branch state reflects a prerelease version of the next point
+release in the x.y series.
+
+Pushing the tag is what sets the release machinery in motion; see
+[Publishing the release](#publishing-the-release) below.
+
+## Publishing the release
+
+Building, signing, and uploading release artifacts is fully automated in CI; no
+binaries are built or signed on anyone's machine, and no signing key material
+exists outside of a cloud KMS. The authoritative runbook, including recovery
+procedures, lives in `ops/README.md` of
+[JuliaCI/julia-buildkite](https://github.com/JuliaCI/julia-buildkite); in outline:
+
+1. Pushing the `vx.y.z` tag triggers a `julia-ci` Buildkite build, which builds
+   binaries for every platform, runs the tests, and additionally builds the
+   light and full source tarballs (with the bundled HTML documentation).
+2. When the tests pass, `julia-ci` automatically triggers the trusted
+   `julia-publish` pipeline, which signs everything (GPG for the Linux/FreeBSD
+   and source tarballs, notarization for macOS, Authenticode for Windows),
+   publishes version-named artifacts to the `julialangnightlies` bucket, and
+   deploys the documentation.
+3. The release manager then starts a `julia-promote` build (New Build with
+   branch = `vx.y.z`), which copies everything into the release bucket layout
+   served at `julialang-s3.julialang.org` — including the source tarballs under
+   `bin/src/x.y/` — repoints the `julia-x.y-latest-*` files, generates and
+   uploads the `bin/checksums/julia-x.y.z.{sha256,md5}` files, and purges the
+   CDN cache.
+4. Dispatch the CI workflow of
+   [VersionsJSONUtil.jl](https://github.com/JuliaLang/VersionsJSONUtil.jl) to
+   regenerate `versions.json`, then the "Update Version DB" workflow of
+   [juliaup](https://github.com/JuliaLang/juliaup) (its upload jobs need manual
+   approval) so `juliaup` picks up the release.
+5. Create the GitHub release with the CI-signed source tarballs attached by
+   running `contrib/github_source_release.sh x.y.z` — it downloads them from the
+   release bucket, verifies the signatures and layout, and shows what it would
+   do; rerun with `--execute` to create the (pre)release and upload.
+6. Update [the website](https://github.com/JuliaLang/www.julialang.org): bump
+   the version in `config.md` and regenerate the old releases page with
+   `downloads/oldreleases.jl`. Finally, announce the release on Discourse.
+
+
+## Verifying signatures
+
+Signing is performed automatically by the buildbots. The commands below verify
+that the published binaries are correctly signed; run each on the relevant
+platform.
+
+### GPG (Linux, FreeBSD, and source tarballs)
+
+Each tarball ships with a detached `.asc` signature. Import the Julia release
+signing public key (published at <https://julialang.org/assets/juliareleases.asc>)
+and verify:
+
+```
+gpg --verify julia-x.y.z-linux-x86_64.tar.gz.asc julia-x.y.z-linux-x86_64.tar.gz
+```
+
+A "Good signature" line means the tarball is authentic and intact.
+
+### macOS
+
+The `.dmg` is signed and carries a stapled notarization ticket. Verify the disk
+image itself -- run these against the `.dmg` file, not the mounted volume (see
+the note below):
+
+```
+xcrun stapler validate julia-x.y.z-macos-x86_64.dmg
+spctl --assess --type open --context context:primary-signature --verbose \
+    julia-x.y.z-macos-x86_64.dmg
+```
+
+`stapler` should report that the validate action worked, and `spctl` should
+report `accepted` with `source=Notarized Developer ID`.
+
+To check the app bundle, first copy it out of the mounted image to a writable
+location (for example, drag it to `/Applications`), then assess it:
+
+```
+spctl --assess --type install --verbose /Applications/Julia-x.y.app
+```
+
+This should likewise report `accepted` with `source=Notarized Developer ID`.
+
+!!! note
+    Run these checks against the `.dmg` file or a copied-out app bundle, never
+    against the app inside the mounted disk image. The image mounts read-only,
+    and `codesign --verify` errors out on it with "internal error in Code
+    Signing subsystem".
+
+### Windows
+
+Check the Authenticode signature on the installer:
+
+```
+signtool verify /pa julia-x.y.z-win64.exe
+```

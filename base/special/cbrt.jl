@@ -1,6 +1,6 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
-# Float32/Float64 based on C implementations from FDLIBM (http://www.netlib.org/fdlibm/)
+# Float32/Float64 based on C implementations from FDLIBM (https://www.netlib.org/fdlibm/)
 # and FreeBSD:
 #
 ## ====================================================
@@ -22,6 +22,8 @@ Return the cube root of `x`, i.e. ``x^{1/3}``. Negative values are accepted
 
 The prefix operator `∛` is equivalent to `cbrt`.
 
+See also [`sqrt`](@ref), [`fourthroot`](@ref).
+
 # Examples
 ```jldoctest
 julia> cbrt(big(27))
@@ -31,7 +33,6 @@ julia> cbrt(big(-27))
 -3.0
 ```
 """
-cbrt(x::Real) = cbrt(float(x))
 cbrt(x::AbstractFloat) = x < 0 ? -(-x)^(1//3) : x^(1//3)
 
 """
@@ -52,7 +53,7 @@ Adding a bias of -0.03306235651 to the `(e%3+m)÷3` term reduces the error to ab
 32.
 
 With the IEEE floating point representation, for finite positive normal values, ordinary
-integer divison of the value in bits magically gives almost exactly the RHS of the above
+integer division of the value in bits magically gives almost exactly the RHS of the above
 provided we first subtract the exponent bias and later add it back.  We do the
 subtraction virtually to keep e >= 0 so that ordinary integer division rounds towards
 minus infinity; this is also efficient. All operations can be done in 32-bit.
@@ -78,7 +79,7 @@ These implementations assume that NaNs, infinities and zeros have already been f
 end
 
 @inline function _improve_cbrt(x::Float32, t::Float32)
-    # Newton iterations solving
+    # Halley iterations solving
     #   t^2 - x/t == 0
     # with update
     #   t <- t*(t^3 + 2*x)/(2*t^3 + x)
@@ -106,7 +107,7 @@ end
     #
     # where P(r) is a polynomial of degree 4 that approximates 1/cbrt(r)
     # to within 2^-23.5 when |r - 1| < 1/10.  The rough approximation
-    # has produced t such than |t/cbrt(x) - 1| ~< 1/32, and cubing this
+    # has produced t such that |t/cbrt(x) - 1| ~< 1/32, and cubing this
     # gives us bounds for r = t^3/x.
 
     r = (t*t)*(t/x)
@@ -123,7 +124,7 @@ end
     # before the final error is larger than 0.667 ulps.
 
     u = reinterpret(UInt64, t)
-    u = (u + 0x8000_0000) & UInt64(0xffff_ffff_c000_0000)
+    u = (u +% 0x8000_0000) & UInt64(0xffff_ffff_c000_0000)
     t = reinterpret(Float64, u)
 
     # one step Newton iteration solving
@@ -146,4 +147,21 @@ function cbrt(x::Union{Float32,Float64})
     end
     t = _approx_cbrt(x)
     return _improve_cbrt(x, t)
+end
+
+function cbrt(a::Float16)
+    if !isfinite(a) || iszero(a)
+        return a
+    end
+    x = Float32(a)
+
+    # 5 bit approximation. Simpler than _approx_cbrt since subnormals can not appear
+    u = highword(x) & 0x7fff_ffff
+    v = div(u, UInt32(3)) + 0x2a5119f2
+    t = copysign(fromhighword(Float32, v), x)
+
+    # 2 newton iterations
+    t = 0.33333334f0 * (2f0*t + x/(t*t))
+    t = 0.33333334f0 * (2f0*t + x/(t*t))
+    return Float16(t)
 end

@@ -64,6 +64,13 @@
     @test typeof(escape_string("test", "t")) == String
     @test escape_string("test", "t") == "\\tes\\t"
 
+    @test escape_string("\\cdot") == "\\\\cdot"
+    @test escape_string("\\cdot"; keep = '\\') == "\\cdot"
+    @test escape_string("\\cdot", '\\'; keep = '\\') == "\\\\cdot"
+    @test escape_string("\\cdot\n"; keep = "\\\n") == "\\cdot\n"
+    @test escape_string("\\cdot\n", '\n'; keep = "\\\n") == "\\cdot\\\n"
+    @test escape_string("\\cdot\n", "\\\n"; keep = "\\\n") == "\\\\cdot\\\n"
+
     for i = 1:size(cx,1)
         cp, ch, st = cx[i,:]
         @test cp == convert(UInt32, ch)
@@ -143,7 +150,26 @@
         @test "\x01" == unescape_string("\\x01")
         @test "\x0f" == unescape_string("\\x0f")
         @test "\x0F" == unescape_string("\\x0F")
+
+        str= "aaa \\g \\n"
+        @test "aaa \\g \n" == unescape_string(str, ['g'])
+        @test "aaa \\g \\n" == unescape_string(str, ['g', 'n'])
     end
+    @test Base.escape_raw_string(raw"\"\\\"\\-\\") == "\\\"\\\\\\\"\\\\-\\\\"
+    @test Base.escape_raw_string(raw"`\`\\-\\") == "\`\\\`\\\\-\\\\"
+    @test Base.escape_raw_string(raw"\"\\\"\\-\\", '`') == "\"\\\"\\\\-\\\\"
+    @test Base.escape_raw_string(raw"`\`\\-\\", '`') == "\\\`\\\\\\\`\\\\-\\\\"
+    @test Base.escape_raw_string(raw"some`string") == "some`string"
+    @test Base.escape_raw_string(raw"some\"string", '`') == "some\"string"
+    @test Base.escape_raw_string(raw"some`string\\") == "some`string\\\\"
+    @test Base.escape_raw_string(raw"some\"string\\", '`') == "some\"string\\\\"
+    @test Base.escape_raw_string(raw"some\"string") == "some\\\"string"
+    @test Base.escape_raw_string(raw"some`string", '`') == "some\\`string"
+
+    # ascii and fullhex flags:
+    @test escape_string("\u00e4\u00f6\u00fc") == "\u00e4\u00f6\u00fc"
+    @test escape_string("\u00e4\u00f6\u00fc", ascii=true) == "\\ue4\\uf6\\ufc"
+    @test escape_string("\u00e4\u00f6\u00fc", ascii=true, fullhex=true) == "\\u00e4\\u00f6\\u00fc"
 end
 @testset "join()" begin
     @test join([]) == join([],",") == ""
@@ -175,6 +201,42 @@ join(myio, "", "", 1)
     @test_throws ArgumentError unescape_string(IOBuffer(), string('\\',"N"))
     @test_throws ArgumentError unescape_string(IOBuffer(), string('\\',"m"))
 end
+
+@testset "sprint with context" begin
+    function f(io::IO)
+        println(io, "compact => ", get(io, :compact, false)::Bool)
+        println(io, "limit   => ", get(io, :limit,   false)::Bool)
+    end
+
+    str = sprint(f)
+    @test str == """
+        compact => false
+        limit   => false
+        """
+
+    str = sprint(f, context = :compact => true)
+    @test str == """
+        compact => true
+        limit   => false
+        """
+
+    str = sprint(f, context = (:compact => true, :limit => true))
+    @test str == """
+        compact => true
+        limit   => true
+        """
+
+    str = sprint(f, context = IOContext(stdout, :compact => true, :limit => true))
+    @test str == """
+        compact => true
+        limit   => true
+        """
+end
+
+@testset "sprint honoring IOContext" begin
+    @test startswith(sprint(show, Base.Dict[], context=(:compact=>false, :module=>nothing)), "Base.Dict")
+end
+
 @testset "#11659" begin
     # The indentation code was not correctly counting tab stops
     @test Base.indentation("      \t") == (8, true)
@@ -264,4 +326,116 @@ for i = 1:10
     buf = IOBuffer()
     print(buf, join(s22021, "\n"))
     @test isvalid(String, take!(buf))
+end
+
+@testset "string()" begin
+    # test the Float sizehints
+    @test string(2.f0) == "2.0"
+    @test string(2.f0, 2.0) == "2.02.0"
+    # test empty args
+    @test string() == ""
+end
+
+@testset "`string`/`print` of many argument types resolve statically" begin
+    # For an exact signature (what `--trim` compiles), each argument's `print` must
+    # be resolved at compile time even when the arguments span more distinct types
+    # than inference keeps in a merged union.
+    function isdynamic_call(stmt)
+        Meta.isexpr(stmt, :call) || return false
+        f = stmt.args[1]
+        f isa GlobalRef && (f = getglobal(f.mod, f.name))
+        f isa Core.BindingPartition &&
+            (f = Core.getglobal_partition(Base.partition_owner(f).globalref, f, :unordered))
+        return !(f isa Core.Builtin || f isa Core.IntrinsicFunction)
+    end
+    args = ("got ", 1:3, " vs ", 1, " with ", 2.5, " and ", :s, " and ", 'c')
+    expected = "got 1:3 vs 1 with 2.5 and s and c"
+    @test string(args...) == expected
+    @test sprint(print, args...) == expected
+    T = typeof(args)
+    for (f, sig) in ((Base.print_to_string, T), (print, Tuple{IOBuffer, T.parameters...}))
+        src, _ = only(code_typed(f, sig))
+        @test !any(isdynamic_call, src.code)
+    end
+    # arguments of unknown type still take the dynamic path
+    v = Any[args...]
+    @test string(v...) == expected
+    @test sprint(print, v...) == expected
+end
+
+module StringsIOStringReturnTypesTestModule
+    struct S end
+    Base.joinpath(::S) = S()
+end
+
+@testset "`string` return types" begin
+    @test all(T -> T <: AbstractString, Base.return_types(string))
+end
+
+@testset "type stable `join` (#55389)" begin
+    itr = ("foo" for _ in 1:100)
+    @test Base.return_types(join, (typeof(itr),))[] == String
+    @test Base.infer_return_type(join, (Tuple{String,Vararg{String}}, Char)) == String
+    @test Base.infer_return_type(join, (Tuple{Vararg{String}}, String, String)) == String
+end
+
+@testset "String(iterable) (#57072)" begin
+    # Basic generator expressions
+    @test String(c for c in "Hello") == "Hello"
+    @test String(c for c in "Julia" if c != 'i') == "Jula"
+    @test String(uppercase(c) for c in "abc") == "ABC"
+
+    # Iterators.map
+    @test String(Iterators.map(c -> c + 1, "Hello, world")) == "Ifmmp-!xpsme"
+    @test String(Iterators.map(identity, "test")) == "test"
+
+    # Iterators.take and Iterators.drop
+    @test String(Iterators.take("Hello, world", 5)) == "Hello"
+    @test String(Iterators.drop("Hello, world", 7)) == "world"
+    @test String(Iterators.take("abc", 0)) == ""
+    @test String(Iterators.drop("abc", 5)) == ""
+
+    # Iterators.filter
+    @test String(Iterators.filter(c -> c != ' ', "hello world")) == "helloworld"
+    @test String(Iterators.filter(c -> false, "hello")) == ""
+
+    # Iterators.flatten
+    @test String(Iterators.flatten(("hello", " ", "world"))) == "hello world"
+    @test String(Iterators.flatten((['a', 'b'], ['c', 'd']))) == "abcd"
+
+    # Empty iterables
+    @test String(()) == ""
+    @test String(c for c in "") == ""
+    @test String(Iterators.take("", 5)) == ""
+
+    # Tuples and sets of chars
+    @test String(('a', 'b', 'c')) == "abc"
+    @test String(Set(['x'])) == "x"
+
+    # Multi-byte Unicode characters
+    @test String(c for c in "ÄÖÜ⻨😊") == "ÄÖÜ⻨😊"
+    @test String(Iterators.map(c -> c == 'Ö' ? 'O' : c, "ÄÖÜ")) == "ÄOÜ"
+    @test String(Iterators.take("ÄÖÜ⻨", 2)) == "ÄÖ"
+    @test String(Iterators.drop("ÄÖÜ⻨", 1)) == "ÖÜ⻨"
+
+    # Infinite iterators should throw MethodError rather than hang
+    @test_throws MethodError String(Iterators.cycle("abc"))
+    @test_throws MethodError String(Iterators.countfrom(1))
+
+    # Non-iterable inputs should throw MethodError
+    struct NotIterable57072 end
+    @test_throws MethodError String(NotIterable57072())
+
+    # Iterables with elements that cannot convert to Char
+    @test_throws MethodError String(["a", "b"])
+    @test_throws MethodError String([:a, :b])
+    @test_throws MethodError String([[1], [2]])
+    @test_throws InexactError String([3.14])
+
+    # Custom AbstractChar subtype
+    struct CustomChar57072 <: AbstractChar
+        val::Char
+    end
+    Base.Char(c::CustomChar57072) = c.val
+    @test String(CustomChar57072(c) for c in "hello") == "hello"
 end

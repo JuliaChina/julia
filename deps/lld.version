@@ -1,0 +1,4 @@
+# -*- makefile -*-
+
+## jll artifact
+LLD_JLL_NAME := LLD

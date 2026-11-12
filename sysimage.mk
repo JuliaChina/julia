@@ -1,0 +1,217 @@
+SRCDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+BUILDDIR := .
+JULIAHOME := $(SRCDIR)
+include $(JULIAHOME)/Make.inc
+include $(JULIAHOME)/stdlib/stdlib.mk
+
+# Compile coverage instrumentation into the sysimage. Instrument the
+# basecompiler stages too; later stages reuse their inference results.
+ifeq ($(JULIA_COVERAGE_IMAGES),1)
+JULIA_SYSIMG_BUILD_FLAGS += $(JULIA_COVERAGE_IMAGE_FLAGS)
+endif
+
+default: sysimg-$(JULIA_BUILD_MODE) # contains either "debug" or "release"
+all: sysimg-release sysimg-debug
+basecompiler-ji: $(build_private_libdir)/basecompiler.ji
+sysimg-ji: $(build_private_libdir)/sysbase.ji
+sysimg-bc: $(build_private_libdir)/sys-bc.a
+sysimg-release: $(build_private_libdir)/sys.$(SHLIB_EXT)
+sysimg-debug: $(build_private_libdir)/sys-debug.$(SHLIB_EXT)
+sysbase-release: $(build_private_libdir)/sysbase.$(SHLIB_EXT)
+sysbase-debug: $(build_private_libdir)/sysbase-debug.$(SHLIB_EXT)
+
+VERSDIR := v$(shell cut -d. -f1-2 < $(JULIAHOME)/VERSION)
+
+define bootstrap_sysimage_link
+$$(build_private_libdir)/$1$2.$$(SHLIB_EXT): $$(build_private_libdir)/$1$2-o.a
+	@$$(call PRINT_LINK, $$(call link-dll,$$@, \
+		--disable-auto-import --disable-runtime-pseudo-reloc $$(WIN_LD_LIBPATHS), \
+		$$(WIN_LD_DLL_CRT_START) \
+		$$(call whole_archive,$$<) \
+		-ljulia-internal$2 -ljulia$2 \
+		$$(LIBM) $$(WIN_MINGW_LIBS) -lssp $$(WIN_LD_CRT_END), \
+		$$(CXX) $$(LDFLAGS) -shared $$(fPIC) -L$$(build_private_libdir) -L$$(build_libdir) -L$$(build_shlibdir), \
+		$$(call whole_archive,$$<) \
+		-ljulia-internal$2 -ljulia$2))
+	@$$(INSTALL_NAME_CMD)$$(notdir $$@) $$@
+	@$$(call dsymutil,$$@)
+endef
+
+$(eval $(call bootstrap_sysimage_link,basecompiler,))
+$(eval $(call bootstrap_sysimage_link,basecompiler,-debug))
+$(eval $(call bootstrap_sysimage_link,sysbase,))
+$(eval $(call bootstrap_sysimage_link,sysbase,-debug))
+
+ifneq "$(if $(CROSS_BOOTSTRAP_JULIA),1)" "$(if $(CROSS_BOOTSTRAP_SYSBASE),1)"
+$(error CROSS_BOOTSTRAP_JULIA and CROSS_BOOTSTRAP_SYSBASE must be set together)
+endif
+
+bootstrap_julia_flags :=
+
+ifneq ($(CROSS_BOOTSTRAP_JULIA),)
+ifeq ($(SANITIZE),1)
+ifeq ($(SANITIZE_THREAD),1)
+bootstrap_julia_flags += --target-sanitize=thread
+endif
+endif
+JULIA_BOOTSTRAP_EXECUTABLE_debug := $(CROSS_BOOTSTRAP_JULIA)
+JULIA_BOOTSTRAP_EXECUTABLE_release := $(CROSS_BOOTSTRAP_JULIA)
+else
+JULIA_BOOTSTRAP_EXECUTABLE_debug := $(build_bindir)/julia-debug$(EXE)
+JULIA_BOOTSTRAP_EXECUTABLE_release := $(build_bindir)/julia$(EXE)
+endif
+
+ifneq ($(CROSS_BOOTSTRAP_SYSBASE),)
+JULIA_BOOTSTRAP_SYSBASE_release := $(CROSS_BOOTSTRAP_SYSBASE).$(SHLIB_EXT)
+JULIA_BOOTSTRAP_SYSBASE_debug := $(CROSS_BOOTSTRAP_SYSBASE).$(SHLIB_EXT)
+else
+JULIA_BOOTSTRAP_SYSBASE_release := $(build_private_libdir)/sysbase.$(SHLIB_EXT)
+JULIA_BOOTSTRAP_SYSBASE_debug := $(build_private_libdir)/sysbase-debug.$(SHLIB_EXT)
+endif
+
+define sysimage_link
+$$(build_private_libdir)/$1$2.$$(SHLIB_EXT): $$(build_private_libdir)/$1$2-o.a
+	@$$(call PRINT_LINK, JULIA_BINDIR=$$(call cygpath_w,$$(build_bindir)) \
+		$$(call spawn,$3) -J $$(call cygpath_w,$4) --startup-file=no $$(bootstrap_julia_flags) -e \
+		'Base.Linking.link_image(ARGS[1], ARGS[2]; is_sysimage=true, debug_runtime=$(if $2,true,false))' -- $$(call cygpath_w,$$<) $$(call cygpath_w,$$@))
+	@$$(INSTALL_NAME_CMD)$$(notdir $$@) $$@
+ifeq ($$(OS), Darwin)
+	@JULIA_BINDIR=$$(call cygpath_w,$$(build_bindir)) $$(call spawn,$3) -J $$(call cygpath_w,$4) --startup-file=no -e \
+		'run(`$$$$(Base.Linking.dsymutil()) $$$$(ARGS[1])`)' -- $$(call cygpath_w,$$@)
+	@rm -rf $$@.dSYM/Contents/Resources/Relocations
+endif
+endef
+
+$(eval $(call sysimage_link,sys,,$(JULIA_BOOTSTRAP_EXECUTABLE_release),$(JULIA_BOOTSTRAP_SYSBASE_release)))
+$(eval $(call sysimage_link,sys,-debug,$(JULIA_BOOTSTRAP_EXECUTABLE_debug),$(JULIA_BOOTSTRAP_SYSBASE_debug)))
+
+COMPILER_SRCS := $(addprefix $(JULIAHOME)/, \
+		base/Base_compiler.jl \
+		base/boot.jl \
+		base/docs/core.jl \
+		base/abstractarray.jl \
+		base/abstractdict.jl \
+		base/abstractset.jl \
+		base/iddict.jl \
+		base/idset.jl \
+		base/anyall.jl \
+		base/array.jl \
+		base/baseext.jl \
+		base/bitarray.jl \
+		base/bitset.jl \
+		base/bool.jl \
+		base/c.jl \
+		base/checked.jl \
+		base/cmem.jl \
+		base/coreio.jl \
+		base/coreir.jl \
+		base/ctypes.jl \
+		base/error.jl \
+		base/essentials.jl \
+		base/expr.jl \
+		base/exports.jl \
+		base/flfrontend.jl \
+		base/float.jl \
+		base/gcutils.jl \
+		base/generator.jl \
+		base/genericmemory.jl \
+		base/int.jl \
+		base/indices.jl \
+		base/iterators.jl \
+		base/module.jl \
+		base/namedtuple.jl \
+		base/ntuple.jl \
+		base/number.jl \
+		base/operators.jl \
+		base/options.jl \
+		base/ordering.jl \
+		base/pair.jl \
+		base/pointer.jl \
+		base/promotion.jl \
+		base/public.jl \
+		base/range.jl \
+		base/refvalue.jl \
+		base/rounding.jl \
+		base/runtime_internals.jl \
+		base/strings/lazy.jl \
+		base/traits.jl \
+		base/tuple.jl)
+COMPILER_SRCS += $(shell find $(JULIAHOME)/Compiler/src -name \*.jl -and -not -name verifytrim.jl -and -not -name show.jl)
+# Julia-based compiler frontend is bootstrapped into Base for now
+COMPILER_FRONTEND_SRCS = $(shell find $(JULIAHOME)/JuliaSyntax/src $(JULIAHOME)/JuliaLowering/src -name \*.jl)
+# sort these to remove duplicates
+BASE_SRCS := $(sort $(shell find $(JULIAHOME)/base -name \*.jl -and -not -name sysimg.jl) \
+                    $(shell find $(BUILDROOT)/base -name \*.jl  -and -not -name sysimg.jl)) \
+			 $(COMPILER_FRONTEND_SRCS) \
+             $(JULIAHOME)/Compiler/src/ssair/show.jl \
+             $(JULIAHOME)/Compiler/src/verifytrim.jl
+STDLIB_SRCS := $(JULIAHOME)/base/sysimg.jl $(SYSIMG_STDLIBS_SRCS)
+RELBUILDROOT := $(call rel_path,$(JULIAHOME)/base,$(BUILDROOT)/base)/ # <-- make sure this always has a trailing slash
+RELDATADIR := $(call rel_path,$(JULIAHOME)/base,$(build_datarootdir))/ # <-- make sure this always has a trailing slash
+
+# Cached images encode CPU feature bits using these tables.
+CPUFEATURES_TABLES := $(wildcard $(build_includedir)/cpufeatures/target_tables_*.h)
+
+$(build_private_libdir)/basecompiler.ji: $(COMPILER_SRCS) $(CPUFEATURES_TABLES)
+	@$(call PRINT_JULIA, cd $(JULIAHOME)/base && \
+	JULIA_NUM_THREADS=1 $(call spawn,$(JULIA_EXECUTABLE)) $(HEAPLIM) --output-ji $(call cygpath_w,$@).tmp $(JULIA_COVERAGE_IMAGE_FLAGS) \
+		--startup-file=no --warn-overwrite=yes --depwarn=error -g$(BOOTSTRAP_DEBUG_LEVEL) -O1 Base_compiler.jl --buildroot $(RELBUILDROOT) --dataroot $(RELDATADIR))
+	@mv $@.tmp $@
+
+define base_builder
+$$(build_private_libdir)/basecompiler$1-o.a $$(build_private_libdir)/basecompiler$1-bc.a : $$(build_private_libdir)/basecompiler$1-%.a : $(COMPILER_SRCS) $(CPUFEATURES_TABLES)
+	@$$(call PRINT_JULIA, cd $$(JULIAHOME)/base && \
+	WINEPATH="$$(call cygpath_w,$$(build_bindir));$$$$WINEPATH" \
+	JULIA_NUM_THREADS=1 \
+		$$(call spawn, $3) $2 -C "$$(JULIA_CPU_TARGET)" $$(HEAPLIM) --output-$$* $$(call cygpath_w,$$@).tmp $$(JULIA_COVERAGE_IMAGE_FLAGS) \
+		--startup-file=no --warn-overwrite=yes --depwarn=error -g$$(BOOTSTRAP_DEBUG_LEVEL) Base_compiler.jl --buildroot $$(RELBUILDROOT) --dataroot $$(RELDATADIR))
+	@mv $$@.tmp $$@
+$$(build_private_libdir)/sysbase$1.ji: $$(build_private_libdir)/basecompiler$1.$$(SHLIB_EXT) $$(JULIAHOME)/VERSION $$(BASE_SRCS) $$(STDLIB_SRCS)
+	@$$(call PRINT_JULIA, cd $$(JULIAHOME)/base && \
+	if ! JULIA_BINDIR=$$(call cygpath_w,$$(build_bindir)) \
+	     WINEPATH="$$(call cygpath_w,$$(build_bindir));$$$$WINEPATH" \
+		 JULIA_NUM_THREADS=1 \
+			$$(call spawn, $$(JULIA_EXECUTABLE)) -g1 $2 -C "$$(JULIA_CPU_TARGET)" $$(HEAPLIM) --output-ji $$(call cygpath_w,$$@).tmp $$(JULIA_SYSIMG_BUILD_FLAGS) \
+			--startup-file=no --warn-overwrite=yes --depwarn=error --sysimage $$(call cygpath_w,$$<) sysimg.jl --buildroot $$(RELBUILDROOT) --dataroot $$(RELDATADIR); then \
+		echo '*** This error might be fixed by running `make clean`. If the error persists$$(COMMA) try `make cleanall`. ***'; \
+		false; \
+	fi )
+	@mv $$@.tmp $$@
+.SECONDARY: $$(build_private_libdir)/basecompiler$1-o.a $$(build_private_libdir)/basecompiler$1-bc.a $$(build_private_libdir)/sysbase$1.ji # request Make to keep these files around
+endef
+
+define sysimg_builder
+$$(build_private_libdir)/sysbase$1-o.a $$(build_private_libdir)/sysbase$1-bc.a : $$(build_private_libdir)/sysbase$1-%.a : $$(build_private_libdir)/basecompiler$1.$$(SHLIB_EXT) $$(JULIAHOME)/VERSION $$(BASE_SRCS) $$(STDLIB_SRCS)
+	@$$(call PRINT_JULIA, cd $$(JULIAHOME)/base && \
+	if ! JULIA_BINDIR=$$(call cygpath_w,$$(build_bindir)) \
+	     WINEPATH="$$(call cygpath_w,$$(build_bindir));$$$$WINEPATH" \
+		 JULIA_NUM_THREADS=1 \
+			$$(call spawn, $$(JULIA_EXECUTABLE)) -g1 $5 -C "$$(JULIA_CPU_TARGET)" $$(HEAPLIM) --output-$$* $$(call cygpath_w,$$@).tmp $$(JULIA_SYSIMG_BUILD_FLAGS) \
+			--startup-file=no --warn-overwrite=yes --depwarn=error --sysimage $$(call cygpath_w,$$<) sysimg.jl --buildroot $$(RELBUILDROOT) --dataroot $$(RELDATADIR); then \
+		echo '*** This error might be fixed by running `make clean`. If the error persists$$(COMMA) try `make cleanall`. ***'; \
+		false; \
+	fi )
+	@mv $$@.tmp $$@
+$$(build_private_libdir)/sys$1-o.a $$(build_private_libdir)/sys$1-bc.a : $$(build_private_libdir)/sys$1-%.a : $4 $$(JULIAHOME)/contrib/generate_precompile.jl
+	@$$(call PRINT_JULIA, cd $$(JULIAHOME)/base && \
+	if ! JULIA_BINDIR=$$(call cygpath_w,$(build_bindir)) \
+		 WINEPATH="$$(call cygpath_w,$$(build_bindir));$$$$WINEPATH" \
+		 JULIA_LOAD_PATH='@stdlib' \
+		 JULIA_PROJECT= \
+		 JULIA_DEPOT_PATH=':' \
+		 JULIA_NUM_THREADS=1 \
+			$$(call spawn, $3) $2 -C "$$(JULIA_CPU_TARGET)" $$(HEAPLIM) --output-$$* $$(call cygpath_w,$$@).tmp $$(JULIA_SYSIMG_BUILD_FLAGS) \
+			$(bootstrap_julia_flags) \
+			--startup-file=no --warn-overwrite=yes --depwarn=error --sysimage $$(call cygpath_w,$$<) $$(call cygpath_w,$$(JULIAHOME)/contrib/generate_precompile.jl) $(JULIA_PRECOMPILE); then \
+		echo '*** This error is usually fixed by running `make clean`. If the error persists$$(COMMA) try `make cleanall`. ***'; \
+		false; \
+	fi )
+	@mv $$@.tmp $$@
+.SECONDARY: $$(build_private_libdir)/sys$1-o.a $(build_private_libdir)/sys$1-bc.a # request Make to keep these files around
+.SECONDARY: $$(build_private_libdir)/sysbase$1-o.a $(build_private_libdir)/sysbase$1-bc.a # request Make to keep these files around
+endef
+
+$(eval $(call base_builder,,-O1,$(JULIA_EXECUTABLE_release)))
+$(eval $(call base_builder,-debug,-O0,$(JULIA_EXECUTABLE_debug)))
+$(eval $(call sysimg_builder,,-O3,$(JULIA_BOOTSTRAP_EXECUTABLE_release),$(JULIA_BOOTSTRAP_SYSBASE_release),-O1))
+$(eval $(call sysimg_builder,-debug,-O0,$(JULIA_BOOTSTRAP_EXECUTABLE_debug),$(JULIA_BOOTSTRAP_SYSBASE_debug),-O0))

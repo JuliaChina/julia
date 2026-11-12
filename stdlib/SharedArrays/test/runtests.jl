@@ -1,15 +1,20 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
-using Test, Distributed, SharedArrays, Random
-include(joinpath(Sys.BINDIR, "..", "share", "julia", "test", "testenv.jl"))
+using Test, Distributed, Mmap, SharedArrays, Random, Serialization
+include(joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "test", "testenv.jl"))
 
-addprocs_with_testenv(4)
+@test isempty(Test.detect_closure_boxes(SharedArrays))
+
+# These processes explicitly want to share memory, we can't have
+# them in separate rr sessions
+addprocs_with_testenv(4; rr_allowed=false)
 @test nprocs() == 5
 
 @everywhere using Test, SharedArrays
 
 id_me = myid()
-id_other = filter(x -> x != id_me, procs())[rand(1:(nprocs()-1))]
+id_others = filter(x -> x != id_me, procs())
+id_other = id_others[rand(1:(nprocs()-1))]
 
 dims = (20,20,20)
 
@@ -114,7 +119,7 @@ check_pids_all(S)
 filedata = similar(Atrue)
 read!(fn, filedata)
 @test filedata == sdata(S)
-finalize(S)
+close(S)
 
 # Error for write-only files
 @test_throws ArgumentError SharedArray{Int,2}(fn, sz, mode="w")
@@ -129,7 +134,7 @@ S = SharedArray{Int,2}(fn2, sz, init=D->(for i in localindices(D); D[i] = myid()
 filedata2 = similar(Atrue)
 read!(fn2, filedata2)
 @test filedata == filedata2
-finalize(S)
+close(S)
 
 # Appending to a file
 fn3 = tempname()
@@ -141,13 +146,10 @@ filedata = Vector{UInt8}(undef, len)
 read!(fn3, filedata)
 @test all(filedata[1:4] .== 0x01)
 @test all(filedata[5:end] .== 0x02)
-finalize(S)
-
-# call gc 3 times to avoid unlink: operation not permitted (EPERM) on Windows
+close(S)
+@test Base.elsize(S) == Base.elsize(typeof(S)) == Base.elsize(Vector{UInt8})
 S = nothing
-@everywhere GC.gc()
-@everywhere GC.gc()
-@everywhere GC.gc()
+
 rm(fn); rm(fn2); rm(fn3)
 
 ### Utility functions
@@ -165,6 +167,7 @@ S = @inferred(SharedArray{Int}(1,2))
 S = @inferred(SharedArray{Int}(1,2,3))
 @test size(S) == (1,2,3)
 @test typeof(S) <: SharedArray{Int}
+@test Base.elsize(S) == Base.elsize(typeof(S)) == Base.elsize(Vector{Int})
 
 # reshape
 
@@ -172,6 +175,12 @@ d = SharedArrays.shmem_fill(1.0, (10,10,10))
 @test fill(1., 100, 10) == reshape(d,(100,10))
 d = SharedArrays.shmem_fill(1.0, (10,10,10))
 @test_throws DimensionMismatch reshape(d,(50,))
+# issue #40249, reshaping on another process
+let m = SharedArray{ComplexF64}(10, 20, 30)
+    m2 = remotecall_fetch(() -> reshape(m, (100, :)), id_other)
+    @test size(m2) == (100, 60)
+    @test m2 isa SharedArray
+end
 
 # rand, randn
 d = SharedArrays.shmem_rand(dims)
@@ -213,7 +222,7 @@ d[5,1:2:4,8] .= 19
 AA = rand(4,2)
 A = @inferred(convert(SharedArray, AA))
 B = @inferred(convert(SharedArray, copy(AA')))
-@test B*A == AA'*AA
+@test B*A ≈ AA'*AA
 
 d=SharedArray{Int64,2}((10,10); init = D->fill!(D.loc_subarr_1d, myid()), pids=[id_me, id_other])
 d2 = map(x->1, d)
@@ -288,7 +297,7 @@ let
     id = a1.id
     aorig = nothing
     a1 = remotecall_fetch(fill!, id_other, a1, 1.0)
-    GC.gc(); GC.gc()
+    GC.gc(true); GC.gc(true)
     a1 = remotecall_fetch(fill!, id_other, a1, 1.0)
     @test haskey(SharedArrays.sa_refs, id)
     finalize(a1)
@@ -306,5 +315,407 @@ end
 
 let S = SharedArray(Int64[]) # Issue #26582
     @test sprint(show, S) == "Int64[]"
-    @test sprint(show, "text/plain", S) == "0-element SharedArray{Int64,1}:\n"
+    @test sprint(show, "text/plain", S, context = :module=>@__MODULE__) == "0-element SharedVector{Int64}:\n"
 end
+
+#28133
+@test SharedVector([1; 2; 3]) == [1; 2; 3]
+@test SharedMatrix([0.1 0.2; 0.3 0.4]) == [0.1 0.2; 0.3 0.4]
+@test_throws MethodError SharedVector(rand(4,4))
+@test_throws MethodError SharedMatrix(rand(4))
+
+# Resource cleanup
+@static if Sys.islinux()
+
+# If open, an fd will exist with contents matching the name, e.g. "/dev/shm/jltestsegname"
+@everywhere function has_open_fd(name)
+    for fd in readdir("/proc/self/fd")
+        try
+            (basename(name) == basename(Base.Filesystem.readlink("/proc/self/fd/$fd"))) && return true
+        catch
+            # fd may close between listing and reading the link
+        end
+    end
+    return false
+end
+
+# If a named memory segment file descriptor was created, mapped, and closed, the line will look like
+# ["7d3d9c0ed000-7d3d9c0ee000", "rw-s", "00000000", "00:3f", "44", "/dev/shm/jltestsegname", "(deleted)"]
+@everywhere function shmem_mapped(segname)
+    maps = split.(readlines("/proc/self/maps"))
+    i = findfirst(x -> length(x) ≥ 6 && basename(x[6]) == basename(segname), maps)
+    ismapped = i !== nothing
+    isdeleted = ismapped && length(maps[i]) > 6 && maps[i][7] == "(deleted)"
+    return ismapped, isdeleted
+end
+
+elseif Sys.iswindows()
+
+# Attempting to open a named memory object will throw an exception if it has been closed
+@everywhere function named_mapping_open(segname)
+    try
+        io = open(Mmap.SharedMemory, segname, 1; readonly=true, create=false)
+        close(io)
+        return true
+    catch
+        return false
+    end
+end
+
+end
+
+@testset "Resource cleanup" begin
+    @testset "Backing file descriptors/handles closed after construction" begin
+        S = SharedArray{Int64}(100, 100)
+        segname = S.segname
+        pids = procs(S)
+
+        @static if Sys.islinux()
+
+            @test !has_open_fd(segname)
+            ismapped, isdeleted = shmem_mapped(segname)
+            @test ismapped
+            @test isdeleted
+
+            @test all(pids) do p
+                hasfd = remotecall_fetch(has_open_fd, p, segname)
+                ismapped, isdeleted = remotecall_fetch(shmem_mapped, p, segname)
+                return !hasfd && ismapped && isdeleted
+            end
+
+        elseif Sys.iswindows()
+
+            @test !named_mapping_open(segname)
+            @test !any(pids) do p
+                remotecall_fetch(named_mapping_open, p, segname)
+            end
+
+        else # other Unix, tests TODO
+
+        end
+    end
+
+    @testset "`unshare!` immediately releases worker mmaps" begin
+        S = SharedArray{Int64}(100, 100)
+        segname = S.segname
+        pids = procs(S)
+        fill!(S, 42)
+        unshare!(S)
+
+        # bookkeeping is cleared, and the parent-side data survives unshare
+        @test isempty(procs(S))
+        @test all(S .== 42)
+
+        @static if Sys.islinux()
+
+            # parent array still mapped (unshare! does not unmap the parent)
+            ismapped, _ = shmem_mapped(segname)
+            @test ismapped
+
+            # worker arrays unmapped immediately by munmap! — no GC round needed
+            @test all(pids) do p
+                ismapped, _ = remotecall_fetch(shmem_mapped, p, segname)
+                return !ismapped
+            end
+
+        else # Other platforms TODO, if possible
+
+        end
+
+        # calling again on an already-unshared array is a no-op, not an error
+        unshare!(S)
+        @test isempty(procs(S))
+        @test all(S .== 42)
+    end
+
+    @testset "unshare! on a single-process SharedArray leaves it intact" begin
+        S = SharedArray{Int64}(10, 10; pids=[id_me])
+        segname = S.segname
+        fill!(S, 7)
+        @test procs(S) == [id_me]
+
+        unshare!(S)
+        @test isempty(procs(S))
+        @test all(S .== 7)
+
+        @static if Sys.islinux()
+            # the sole process is also the host, so its mapping must survive
+            ismapped, _ = shmem_mapped(segname)
+            @test ismapped
+        end
+    end
+
+    @testset "unshare! on a 2-process SharedArray created by the host leaves the host's copy intact" begin
+        S = SharedArray{Int64}(10, 10; pids=[id_me, id_other])
+        segname = S.segname
+        fill!(S, 7)
+
+        unshare!(S)
+        @test isempty(procs(S))
+        @test all(S .== 7)
+
+        @static if Sys.islinux()
+            ismapped, _ = shmem_mapped(segname)
+            @test ismapped
+            @test !remotecall_fetch(shmem_mapped, id_other, segname)[1]
+        end
+    end
+
+    @testset "unshare! throws when called from a process other than the host" begin
+        host = id_other
+        @everywhere global _unshare_host_S = nothing
+        remotecall_wait(host) do
+            global _unshare_host_S = SharedArray{Int64}((10, 10); pids=[id_me, host])
+            fill!(Main._unshare_host_S, 7)
+            nothing
+        end
+        S = remotecall_fetch(() -> Main._unshare_host_S, host)
+        segname = S.segname
+        @test all(S .== 7) # main's own local mapping works before unshare!
+
+        # main did not create S, so unshare! must refuse and leave everything untouched
+        @test_throws ArgumentError unshare!(S)
+        @test_throws ArgumentError close(S)
+        @test procs(S) == [id_me, host]
+        @test all(S .== 7)
+
+        @static if Sys.islinux()
+            ismapped, _ = shmem_mapped(segname)
+            @test ismapped
+        end
+
+        # unshare! succeeds when called from the actual host process
+        @test remotecall_fetch(host) do
+            unshare!(Main._unshare_host_S)
+            isempty(procs(Main._unshare_host_S)) && all(Main._unshare_host_S .== 7)
+        end
+
+        remotecall_wait(host) do
+            global _unshare_host_S = nothing
+            nothing
+        end
+    end
+
+    @testset "Remote creation's close-via-future path releases resources" begin
+        p = id_other
+        segname = "/jltestremoteclose" * randstring(8)
+        mode = SharedArrays.JL_O_CREAT | SharedArrays.JL_O_RDWR
+        io = remotecall(p) do
+            last(SharedArrays.shm_mmap_array(Int64, (10, 10), segname, mode, false))
+        end
+        wait(io)
+
+        @static if Sys.islinux()
+            @test remotecall_fetch(has_open_fd, p, segname)
+        end
+
+        remotecall_fetch(p, io) do fut
+            close(fetch(fut))
+        end
+
+        @static if Sys.islinux()
+            @test !remotecall_fetch(has_open_fd, p, segname)
+        end
+    end
+
+    @testset "finalize drops the parent's own reference without force-invalidating it" begin
+        S = SharedArray{Int64}(100, 100)
+        segname = S.segname
+        fill!(S, 3)
+
+        @static if Sys.islinux()
+            @test first(shmem_mapped(segname))
+        end
+
+        function finalize_and_check_alias()
+            backing = sdata(S)
+            GC.@preserve backing begin
+                finalize(S)
+                @test all(backing .== 3)
+                @static if Sys.islinux()
+                    @test first(shmem_mapped(segname))
+                end
+            end
+        end
+        finalize_and_check_alias()
+
+        @static if Sys.islinux()
+            GC.gc(); GC.gc()
+            @test !first(shmem_mapped(segname))
+        end
+    end
+
+    @testset "close eagerly releases all mappings" begin
+        S = SharedArray{Int64}(100, 100)
+        segname = S.segname
+        mapped_pids = procs(S)
+        fill!(S, 11)
+
+        close(S)
+
+        @test isempty(procs(S))
+        @test isempty(sdata(S))
+        @test size(S) == (0, 0)
+        @test repr(S) == "0×0 SharedMatrix{Int64}"
+        @test repr("text/plain", S) == "0×0 SharedMatrix{Int64}"
+        @static if Sys.islinux()
+            for p in mapped_pids
+                @test !remotecall_fetch(s -> first(shmem_mapped(s)), p, segname)
+            end
+        end
+
+        close(S)
+    end
+
+    @testset "closed SharedArrays travel and copy as empty arrays" begin
+        S = SharedArray{Int64}(4)
+        fill!(S, 2)
+        close(S)
+
+        io = IOBuffer()
+        serialize(io, S)
+        seekstart(io)
+        D = deserialize(io)
+        @test D isa SharedVector{Int64}
+        @test size(D) == (0,)
+        @test isempty(procs(D))
+
+        W = remotecall_fetch(identity, id_other, S)
+        @test W isa SharedVector{Int64}
+        @test size(W) == (0,)
+        @test isempty(procs(W))
+
+        C = deepcopy(S)
+        @test size(C) == (0,)
+        @test isempty(procs(C))
+        @test isempty(sdata(C))
+
+        S2 = SharedArray{Int64}(4)
+        close(S2)
+        @test copyto!(S, S2) === S
+
+        E1 = SharedArray{Int64}(0)
+        E2 = SharedArray{Int64}(0)
+        @test copyto!(E1, E2) === E1
+
+        A = SharedArray{Int64}(3)
+        fill!(A, 7)
+        unshare!(A)
+        B = deepcopy(A)
+        @test isempty(procs(B))
+        @test sdata(B) !== sdata(A)
+        @test B == A
+    end
+
+    @testset "backing array remains valid after the SharedArray wrapper is GC'd" begin
+        S = SharedArray{Int64}(10, 10)
+        fill!(S, 7)
+        a = sdata(S) # alias to the real backing array, kept alive independently of S
+        S = nothing
+        GC.gc(); GC.gc()
+
+        # `a` is still reachable, so ordinary Julia semantics must keep its backing
+        # memory valid even though the SharedArray wrapper itself was collected.
+        @test all(a .== 7)
+        a[1] = 99
+        @test a[1] == 99
+    end
+
+    @testset "Zero-element SharedArray creates no shared memory segment" begin
+        S = SharedArray{Int64}(0)
+        segname = S.segname
+        pids = procs(S)
+
+        @static if Sys.islinux()
+
+            @test !ispath("/dev/shm" * segname)
+            ismapped, _ = shmem_mapped(segname)
+            @test !ismapped
+
+            @test all(pids) do p
+                ismapped, _ = shmem_mapped(segname)
+                return !ismapped
+            end
+
+        else
+            # Cannot be tested?
+        end
+    end
+end
+
+@testset "Array and convenience constructors" begin
+    A = [1 2; 3 4]
+    for S in (SharedArray{Float64}(A), SharedArray{Float64,2}(A), convert(SharedMatrix{Float64}, A))
+        @test S isa SharedMatrix{Float64}
+        @test S == A
+        @test similar(S) isa Matrix{Float64}
+        @test size(similar(S)) == size(A)
+    end
+    @test_throws InexactError SharedArray{Int}([1.5])
+    @test size(SharedArray{Int}(1, 2, 3, 4)) == (1, 2, 3, 4)
+    @test size(SharedArray{Int}(Int8(2))) == (2,)
+    @test size(SharedArray{Int}(Int8(2), Int8(3))) == (2, 3)
+    @test size(SharedArray{Int}((Int8(2), Int8(3)))) == (2, 3)
+    @test size(SharedArray{Int,2}(Int8(2), Int8(3))) == (2, 3)
+
+    for (S, T, sz) in ((SharedArrays.shmem_rand(1:3, 4), Int, (4,)),
+                       (SharedArrays.shmem_rand(1:3, 4, 2), Int, (4, 2)),
+                       (SharedArrays.shmem_rand(Int8, 4), Int8, (4,)),
+                       (SharedArrays.shmem_rand(Int8, 4, 2), Int8, (4, 2)),
+                       (SharedArrays.shmem_rand(4), Float64, (4,)),
+                       (SharedArrays.shmem_rand(4, 2), Float64, (4, 2)),
+                       (SharedArrays.shmem_randn(4), Float64, (4,)),
+                       (SharedArrays.shmem_randn(4, 2), Float64, (4, 2)),
+                       (SharedArrays.shmem_randn((4, 2)), Float64, (4, 2)))
+        @test eltype(S) === T
+        @test size(S) == sz
+    end
+    @test all(in(1:3), SharedArrays.shmem_rand(1:3, 100))
+    @test all(<(1), SharedArrays.shmem_rand(100))
+    @test any(<(0), SharedArrays.shmem_randn(100))
+end
+
+@testset "indexpids" begin
+    S = SharedArray{Int}(3)
+    @test indexpids(S) == 0
+    @test [remotecall_fetch(indexpids, p, S) for p in procs(S)] == eachindex(procs(S))
+    S = SharedArray{Int}(3; pids=id_others[1:1])
+    @test remotecall_fetch(indexpids, id_others[2], S) == 0
+    @test SharedArray{Int}(3; pids=[myid()]) |> indexpids == 1
+end
+
+@testset "reduce with concatenation" begin
+    v = collect(1:10)
+    S = SharedArray{Int}(v)
+    @test reduce(vcat, S) == reduce(vcat, v)
+    @test reduce(hcat, S) == reduce(hcat, v)
+
+    # Workers holding no elements have nothing to add to the result.
+    v = collect(1:(length(workers()) - 1))
+    S = SharedArray{Int}(v)
+    @test reduce(vcat, S) == reduce(vcat, v)
+    @test reduce(hcat, S) == reduce(hcat, v)
+    @test reduce(max, S) == maximum(v)
+    @test reduce(+, SharedArray{Int}(0)) == 0
+end
+
+@testset "argument errors" begin
+    file = abspath(tempname())
+    @test_throws ArgumentError SharedArray{Int,1}("relative_path", (2,))
+    @test_throws ArgumentError SharedArray{Vector{Int},1}(file, (2,))
+    write(file, zeros(Int, 2))
+    S = SharedArray{Int,1}(file, (2,); mode="r")
+    @test S == [0, 0]
+    @test_throws ArgumentError SharedArray{Int,1}(file, (2,); mode="r", init=_ -> nothing)
+    close(S)
+    rm(file)
+
+    S1, S2 = SharedArray{Int}(3; pids=id_others[1:1]), SharedArray{Int}(3; pids=id_others[2:2])
+    @test_throws ArgumentError map!(identity, S1, S2)
+end
+
+@testset "Docstrings" begin
+    @test isempty(Docs.undocumented_names(SharedArrays))
+end
+
+rmprocs(id_others)

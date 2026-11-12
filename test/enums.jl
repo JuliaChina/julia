@@ -10,9 +10,11 @@ using Main.MacroCalls
 
 @test_throws MethodError convert(Enum, 1.0)
 
+@test_throws ArgumentError("invalid type expression for enum 1 + 1") @macrocall(@enum 1 + 1 2)
 @test_throws ArgumentError("no arguments given for Enum Foo") @macrocall(@enum Foo)
 @test_throws ArgumentError("invalid base type for Enum Foo2, Foo2::Float64=::Float64; base type must be an integer primitive type") @macrocall(@enum Foo2::Float64 apple=1.)
 
+const fruit_enum_line = @__LINE__() + 1
 @enum Fruit apple orange kiwi
 @test typeof(Fruit) == DataType
 @test isbitstype(Fruit)
@@ -36,6 +38,10 @@ using Main.MacroCalls
 @test Fruit(2) == kiwi
 @test_throws ArgumentError Fruit(3)
 @test_throws ArgumentError Fruit(-1)
+let m = only(methods(Fruit))
+    @test m.file == Symbol(@__FILE__)
+    @test m.line == fruit_enum_line
+end
 @test UInt8(apple) === 0x00
 @test UInt16(orange) === 0x0001
 @test UInt128(kiwi) === 0x00000000000000000000000000000002
@@ -77,8 +83,8 @@ end
 @test Int(_neg4) === -4
 @test Int(_neg3) === -3
 
-@test_throws ArgumentError("invalid value for Enum Test1, _zerofp = 0.0=0.0; values must be integers") @macrocall(@enum Test1 _zerofp=0.0)
-@test_throws ArgumentError("invalid value for Enum Test11, _zerofp2 = 0.5=0.5; values must be integers") @macrocall(@enum Test11 _zerofp2=0.5)
+@test_throws ArgumentError("invalid value for Enum Test1, _zerofp = 0.0; values must be integers") @macrocall(@enum Test1 _zerofp=0.0)
+@test_throws ArgumentError("invalid value for Enum Test11, _zerofp2 = 0.5; values must be integers") @macrocall(@enum Test11 _zerofp2=0.5)
 @enum Test111 _zerobi=BigInt(1)
 @test Integer(_zerobi) == 1
 
@@ -89,27 +95,28 @@ end
                                   2
                               end""") @macrocall(@enum Test2  x ? 1 : 2)
 @test_throws ArgumentError("invalid argument for Enum Test22: 1 = 2") @macrocall(@enum Test22 1=2)
+@test_throws ArgumentError("invalid name for Enum TestEnum; \"1 + 1\" is not a valid identifier") var"@enum"(LineNumberNode(@__LINE__), @__MODULE__, :TestEnum, Symbol("1 + 1"))
 
 # other Integer types of enum members
 @enum Test3::UInt8 _one_Test3=0x01 _two_Test3=0x02 _three_Test3=0x03
-@test Test3.size == 1
+@test Core.sizeof(Test3) == 1
 @test UInt8(_one_Test3) === 0x01
 @test length(instances(Test3)) == 3
 
 @enum Test4::UInt16 _one_Test4=0x01 _two_Test4=0x0002 _three_Test4=0x03
-@test Test4.size == 2
+@test Core.sizeof(Test4) == 2
 
 @enum Test5::UInt32 _one_Test5=0x01 _two_Test5=0x00000002 _three_Test5=0x00000003
-@test Test5.size == 4
+@test Core.sizeof(Test5) == 4
 
 @enum Test6::UInt128 _one_Test6=0x00000000000000000000000000000001 _two_Test6=0x00000000000000000000000000000002
-@test Test6.size == 16
+@test Core.sizeof(Test6) == 16
 @test typeof(Integer(_one_Test6)) == UInt128
 
 # enum values must be integers
-@test_throws ArgumentError("invalid value for Enum Test7, _zero = \"zero\"=zero; values must be integers") @macrocall(@enum Test7 _zero="zero")
-@test_throws ArgumentError("invalid value for Enum Test8, _zero = '0'=0; values must be integers") @macrocall(@enum Test8 _zero='0')
-@test_throws ArgumentError("invalid value for Enum Test9, _zero = 0.5=0.5; values must be integers") @macrocall(@enum Test9 _zero=0.5)
+@test_throws ArgumentError("invalid value for Enum Test7, _zero = \"zero\"; values must be integers") @macrocall(@enum Test7 _zero="zero")
+@test_throws ArgumentError("invalid value for Enum Test8, _zero = '0'; values must be integers") @macrocall(@enum Test8 _zero='0')
+@test_throws ArgumentError("invalid value for Enum Test9, _zero = 0.5; values must be integers") @macrocall(@enum Test9 _zero=0.5)
 
 # test macro handles keyword arguments
 @enum(Test11, _zero_Test11=2,
@@ -126,9 +133,11 @@ end
 @test_throws ArgumentError("overflow in value \"y\" of Enum EnumOvf") @macrocall(@enum EnumOvf x=typemax(Int32) y)
 
 # test for unique Enum values
-@test_throws ArgumentError("values for Enum Test14 are not unique") @macrocall(@enum(Test14, _zero_Test14, _one_Test14, _two_Test14=0))
+@test_throws ArgumentError("both _two_Test14 and _zero_Test14 have value 0 in Enum Test14; values must be unique") @macrocall(@enum(Test14, _zero_Test14, _one_Test14, _two_Test14=0))
+# and names
+@test_throws ArgumentError("name \"_zero_Test15\" in Enum Test15 is not unique") @macrocall(@enum(Test15, _zero_Test15, _one_Test15, _zero_Test15))
 
-@test repr(apple) == "apple::Fruit = 0"
+@test repr(apple) == "$(@__MODULE__).apple"
 @test string(apple) == "apple"
 
 @test repr("text/plain", Fruit) == "Enum $(string(Fruit)):\napple = 0\norange = 1\nkiwi = 2"
@@ -138,6 +147,10 @@ let io = IOBuffer()
     show(io, Fruit)
     @test String(take!(io)) == sprint(print, Fruit)
 end
+
+# Test printing of invalid enums
+@test repr("text/plain", reinterpret(Fruit, Int32(11))) == "<invalid #11>::Fruit = 11"
+@test repr("text/plain", reinterpret(Fruit, Int32(-5))) == "<invalid #-5>::Fruit = -5"
 
 @enum LogLevel DEBUG INFO WARN ERROR CRITICAL
 @test DEBUG < CRITICAL
@@ -149,8 +162,15 @@ let b = IOBuffer()
     @test deserialize(b) === apple
 end
 
-@enum UI8::UInt8 ten=0x0A thr=0x03 sevn=0x07
-@test repr("text/plain", UI8) == "Enum $(string(UI8)):\nten = 0x0a\nthr = 0x03\nsevn = 0x07"
+@enum UI8::UInt8 ten=0x0A thr=0x03 sevn=0x07 fiftn=0xF0
+@test repr("text/plain", UI8)   == "Enum $(string(UI8)):\nten = 0x0a\nthr = 0x03\nsevn = 0x07\nfiftn = 0xf0"
+@test repr("text/plain", ten)   == "$(string(ten))::UI8 = 0x0a"
+@test repr("text/plain", thr)   == "$(string(thr))::UI8 = 0x03"
+@test repr("text/plain", sevn)  == "$(string(sevn))::UI8 = 0x07"
+@test repr("text/plain", fiftn) == "$(string(fiftn))::UI8 = 0xf0"
+
+@test repr("text/plain", reinterpret(UI8, 0x01)) == "<invalid #1>::UI8 = 0x01"
+@test repr("text/plain", reinterpret(UI8, 0xff)) == "<invalid #255>::UI8 = 0xff"
 
 # test block form
 @enum BritishFood begin
@@ -159,3 +179,84 @@ end
     haggis       = 4
 end
 @test Int(haggis) == 4
+
+@enum HashEnum1 Enum1_a=1
+@enum HashEnum2 Enum2_a=1
+@test hash(Enum1_a) != hash(Enum2_a)
+
+# PR #49777: Check that `Base.hash` can be specialized by the user without
+# overwriting a method definition.
+@enum HashEnum3 Enum3_a=1
+@test which(hash, (HashEnum3, UInt)).sig != Tuple{typeof(hash), HashEnum3, UInt64}
+
+# Check that generic `hash` on custom enum subtypes works.
+struct HashEnum4 <: Enum{Int} end
+@test hash(HashEnum4(), zero(UInt)) == invoke(hash, Tuple{Any, UInt}, HashEnum4(), zero(UInt))
+
+@test (Vector{Fruit}(undef, 3) .= apple) == [apple, apple, apple]
+
+# long, discontiguous
+@enum Alphabet begin
+    alphabet_a
+    alphabet_b
+    alphabet_c
+    alphabet_d
+    alphabet_e
+    alphabet_f
+    alphabet_g
+    alphabet_h
+    alphabet_i
+    alphabet_j
+    alphabet_k
+    alphabet_l
+    alphabet_m
+    alphabet_n
+    alphabet_o
+    alphabet_p
+    alphabet_q
+    alphabet_r
+    alphabet_s
+    alphabet_t
+    alphabet_u
+    alphabet_v
+    alphabet_w
+    alphabet_x
+    alphabet_y
+    alphabet_z = 26
+end
+@test alphabet_z == Alphabet(26)
+
+let b = IOBuffer()
+    show(b, MIME"text/plain"(), Enum)
+    @test String(take!(b)) == "Enum"
+    b = IOBuffer()
+    show(b, MIME"text/plain"(), Union{Alphabet, BritishFood})
+    str = String(take!(b))
+    p = string(@__MODULE__)
+    @test str == "Union{$p.Alphabet, $p.BritishFood}" || str == "Union{$p.BritishFood, $p.Alphabet}"
+end
+
+module TestDocumentedEnums
+using REPL, Test  # REPL is needed for retrieving docstrings
+"""
+Ancestral species of citrus
+"""
+@enum Citrus begin
+    "C. reticulata"
+    mandarin
+    "C. maxima"
+    pomelo = 8
+    "C. medica"
+    citron
+    "C. japonica"
+    kumquat
+end
+
+_gimmedoc(x::Enum) = _gimmedoc(Symbol(x))
+_gimmedoc(T::Type) = _gimmedoc(nameof(T))
+_gimmedoc(x) = strip(sprint(show, MIME"text/plain"(), Docs.doc(Docs.Binding(@__MODULE__, x))))
+
+@test Int.(instances(Citrus)) == (0, 8, 9, 10)
+@test _gimmedoc.(instances(Citrus)) == "C. " .* ("reticulata", "maxima", "medica", "japonica")
+@test _gimmedoc(Citrus) == "Ancestral species of citrus"
+end

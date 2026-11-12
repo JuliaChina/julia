@@ -1,6 +1,6 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
-# The epochs used for date rounding are based ISO 8601's "year zero" notation
+# The epochs used for date rounding are based on ISO 8601's "year zero" notation
 const DATEEPOCH = value(Date(0))
 const DATETIMEEPOCH = value(DateTime(0))
 
@@ -11,7 +11,7 @@ const ConvertiblePeriod = Union{TimePeriod, Week, Day}
 const TimeTypeOrPeriod = Union{TimeType, ConvertiblePeriod}
 
 """
-    epochdays2date(days) -> Date
+    epochdays2date(days)::Date
 
 Take the number of days since the rounding epoch (`0000-01-01T00:00:00`) and return the
 corresponding `Date`.
@@ -19,7 +19,7 @@ corresponding `Date`.
 epochdays2date(i) = Date(UTD(DATEEPOCH + Int64(i)))
 
 """
-    epochms2datetime(milliseconds) -> DateTime
+    epochms2datetime(milliseconds)::DateTime
 
 Take the number of milliseconds since the rounding epoch (`0000-01-01T00:00:00`) and
 return the corresponding `DateTime`.
@@ -27,7 +27,7 @@ return the corresponding `DateTime`.
 epochms2datetime(i) = DateTime(UTM(DATETIMEEPOCH + Int64(i)))
 
 """
-    date2epochdays(dt::Date) -> Int64
+    date2epochdays(dt::Date)::Int64
 
 Take the given `Date` and return the number of days since the rounding epoch
 (`0000-01-01T00:00:00`) as an [`Int64`](@ref).
@@ -35,7 +35,7 @@ Take the given `Date` and return the number of days since the rounding epoch
 date2epochdays(dt::Date) = value(dt) - DATEEPOCH
 
 """
-    datetime2epochms(dt::DateTime) -> Int64
+    datetime2epochms(dt::DateTime)::Int64
 
 Take the given `DateTime` and return the number of milliseconds since the rounding epoch
 (`0000-01-01T00:00:00`) as an [`Int64`](@ref).
@@ -58,6 +58,11 @@ function Base.floor(dt::Date, p::Month)
     return Date(target_year, target_month)
 end
 
+function Base.floor(dt::Date, p::Quarter)
+    return floor(dt, Month(p))
+end
+
+
 function Base.floor(dt::Date, p::Week)
     value(p) < 1 && throw(DomainError(p))
     days = value(dt) - WEEKEPOCH
@@ -79,6 +84,81 @@ function Base.floor(dt::DateTime, p::TimePeriod)
     return epochms2datetime(milliseconds - mod(milliseconds, value(Millisecond(p))))
 end
 
+function Base.floor(t::Time, p::TimePeriod)
+    value(p) < 1 && throw(DomainError(p))
+    nanoseconds = value(t)
+    return Time(Nanosecond(nanoseconds - mod(nanoseconds, value(Nanosecond(p)))))
+end
+
+# Timestamp rounding computes the floor and the ceiling of `dt` in exact nanoseconds since
+# the Unix epoch (Int128, or a Rational below a nanosecond), so a bound past the range
+# does not wrap. The chosen bound must fit in Timestamp{P}, or an InexactError is thrown.
+# `upper = false` skips the ceiling. As for Date and DateTime, months count from 0000-01,
+# weeks from Monday 0000-01-03, and other periods from 0000-01-01.
+function timestamp_rounding_value(dt::Timestamp{P}, ns, op::Symbol) where {P}
+    ticks, remainder = divrem(ns, timestamp_scale(P))
+    iszero(remainder) && value(typemin(P)) <= ticks <= value(typemax(P)) ||
+        throw(InexactError(op, Timestamp{P}, dt))
+    return Timestamp{P}(UTInstant(P(ticks)))
+end
+
+# Rata Die day of the first day of month `m` of year `y`. A very large year or
+# rounding period can require more than Int128 nanoseconds.
+@inline function timestamp_rounding_days(y, m)
+    if typemin(Int64) ÷ 366 + 1 <= y <= typemax(Int64) ÷ 366 - 1
+        return Int128(totaldays(Int64(y), Int64(m), 1))
+    end
+    return totaldays(big(y), m, 1)
+end
+
+# `months` is the month of `dt`, counted from 0000-01, and `step` is the period in months
+@inline function timestamp_month_bounds(dt::Timestamp, months, step, upper::Bool)
+    lower = months - mod(months, step)
+    fy, fm = fldmod(lower, 12)
+    f = (timestamp_rounding_days(fy, fm + 1) - UNIXEPOCHDAYS) * NS_PER_DAY
+    upper || return f, f
+    x = widen(value(dt)) * timestamp_scale(typeof(dt))
+    x == f && return f, f
+    cy, cm = fldmod(lower + step, 12)
+    c = (timestamp_rounding_days(cy, cm + 1) - UNIXEPOCHDAYS) * NS_PER_DAY
+    return f, c
+end
+
+@inline function timestamp_rounding_bounds(dt::Timestamp, p::Union{Year,Quarter,Month}, upper::Bool)
+    value(p) < 1 && throw(DomainError(p))
+    y, m = yearmonth(dt)
+    months = 12y + m - 1
+    step = Int128(value(p)) * (p isa Year ? 12 : p isa Quarter ? 3 : 1)
+    if step <= typemax(Int64)
+        return timestamp_month_bounds(dt, months, Int64(step), upper)
+    end
+    return timestamp_month_bounds(dt, Int128(months), step, upper)
+end
+
+@inline function timestamp_rounding_bounds(dt::Timestamp, p::Union{FixedPeriod,TimePeriod}, upper::Bool)
+    value(p) < 1 && throw(DomainError(p))
+    epoch = p isa Week ? WEEKEPOCH : DATEEPOCH
+    epochns = Int128(UNIXEPOCHDAYS - epoch) * NS_PER_DAY
+    x = widen(value(dt)) * timestamp_scale(typeof(dt))
+    step = widen(value(p)) * timestamp_period_scale(typeof(p))
+    f = x - mod(x + epochns, step)
+    return f, !upper || x == f ? f : f + step
+end
+
+Base.floor(dt::Timestamp, p::Period) =
+    timestamp_rounding_value(dt, first(timestamp_rounding_bounds(dt, p, false)), :floor)
+Base.ceil(dt::Timestamp, p::Period) =
+    timestamp_rounding_value(dt, last(timestamp_rounding_bounds(dt, p, true)), :ceil)
+function floorceil(dt::Timestamp, p::Period)
+    f, c = timestamp_rounding_bounds(dt, p, true)
+    return timestamp_rounding_value(dt, f, :floor), timestamp_rounding_value(dt, c, :ceil)
+end
+function Base.round(dt::Timestamp, p::Period, ::RoundingMode{:NearestTiesUp})
+    f, c = timestamp_rounding_bounds(dt, p, true)
+    x = widen(value(dt)) * timestamp_scale(typeof(dt))
+    return timestamp_rounding_value(dt, x - f < c - x ? f : c, :round)
+end
+
 """
     floor(x::Period, precision::T) where T <: Union{TimePeriod, Week, Day} -> T
 
@@ -89,13 +169,13 @@ For convenience, `precision` may be a type instead of a value: `floor(x, Dates.H
 shortcut for `floor(x, Dates.Hour(1))`.
 
 ```jldoctest
-julia> floor(Dates.Day(16), Dates.Week)
+julia> floor(Day(16), Week)
 2 weeks
 
-julia> floor(Dates.Minute(44), Dates.Minute(15))
+julia> floor(Minute(44), Minute(15))
 30 minutes
 
-julia> floor(Dates.Hour(36), Dates.Day)
+julia> floor(Hour(36), Day)
 1 day
 ```
 
@@ -109,42 +189,44 @@ function Base.floor(x::ConvertiblePeriod, precision::T) where T <: ConvertiblePe
 end
 
 """
-    floor(dt::TimeType, p::Period) -> TimeType
+    floor(dt::TimeType, p::Period)::TimeType
 
-Return the nearest `Date` or `DateTime` less than or equal to `dt` at resolution `p`.
+Return the nearest `Date`, `DateTime`, or `Timestamp` less than or equal to `dt`
+at resolution `p`.
 
 For convenience, `p` may be a type instead of a value: `floor(dt, Dates.Hour)` is a shortcut
 for `floor(dt, Dates.Hour(1))`.
 
 ```jldoctest
-julia> floor(Date(1985, 8, 16), Dates.Month)
+julia> floor(Date(1985, 8, 16), Month)
 1985-08-01
 
-julia> floor(DateTime(2013, 2, 13, 0, 31, 20), Dates.Minute(15))
+julia> floor(DateTime(2013, 2, 13, 0, 31, 20), Minute(15))
 2013-02-13T00:30:00
 
-julia> floor(DateTime(2016, 8, 6, 12, 0, 0), Dates.Day)
+julia> floor(DateTime(2016, 8, 6, 12, 0, 0), Day)
 2016-08-06T00:00:00
 ```
 """
 Base.floor(::Dates.TimeType, ::Dates.Period)
 
 """
-    ceil(dt::TimeType, p::Period) -> TimeType
+    ceil(dt::TimeType, p::Period)::TimeType
 
-Return the nearest `Date` or `DateTime` greater than or equal to `dt` at resolution `p`.
+Return the nearest `Date`, `DateTime`, or `Timestamp` greater than or equal to
+`dt` at resolution `p`.
 
 For convenience, `p` may be a type instead of a value: `ceil(dt, Dates.Hour)` is a shortcut
 for `ceil(dt, Dates.Hour(1))`.
 
 ```jldoctest
-julia> ceil(Date(1985, 8, 16), Dates.Month)
+julia> ceil(Date(1985, 8, 16), Month)
 1985-09-01
 
-julia> ceil(DateTime(2013, 2, 13, 0, 31, 20), Dates.Minute(15))
+julia> ceil(DateTime(2013, 2, 13, 0, 31, 20), Minute(15))
 2013-02-13T00:45:00
 
-julia> ceil(DateTime(2016, 8, 6, 12, 0, 0), Dates.Day)
+julia> ceil(DateTime(2016, 8, 6, 12, 0, 0), Day)
 2016-08-07T00:00:00
 ```
 """
@@ -163,13 +245,13 @@ For convenience, `precision` may be a type instead of a value: `ceil(x, Dates.Ho
 shortcut for `ceil(x, Dates.Hour(1))`.
 
 ```jldoctest
-julia> ceil(Dates.Day(16), Dates.Week)
+julia> ceil(Day(16), Week)
 3 weeks
 
-julia> ceil(Dates.Minute(44), Dates.Minute(15))
+julia> ceil(Minute(44), Minute(15))
 45 minutes
 
-julia> ceil(Dates.Hour(36), Dates.Day)
+julia> ceil(Hour(36), Day)
 2 days
 ```
 
@@ -184,8 +266,9 @@ end
 """
     floorceil(dt::TimeType, p::Period) -> (TimeType, TimeType)
 
-Simultaneously return the `floor` and `ceil` of a `Date` or `DateTime` at resolution `p`.
-More efficient than calling both `floor` and `ceil` individually.
+Simultaneously return the `floor` and `ceil` of a `Date`, `DateTime`, or
+`Timestamp` at resolution `p`. More efficient than calling both `floor` and
+`ceil` individually.
 """
 function floorceil(dt::TimeType, p::Period)
     f = floor(dt, p)
@@ -195,7 +278,7 @@ end
 """
     floorceil(x::Period, precision::T) where T <: Union{TimePeriod, Week, Day} -> (T, T)
 
-Simultaneously return the `floor` and `ceil` of `Period` at resolution `p`.  More efficient
+Simultaneously return the `floor` and `ceil` of a `Period` at resolution `precision`.  More efficient
 than calling both `floor` and `ceil` individually.
 """
 function floorceil(x::ConvertiblePeriod, precision::ConvertiblePeriod)
@@ -206,20 +289,20 @@ end
 """
     round(dt::TimeType, p::Period, [r::RoundingMode]) -> TimeType
 
-Return the `Date` or `DateTime` nearest to `dt` at resolution `p`. By default
+Return the `Date`, `DateTime`, or `Timestamp` nearest to `dt` at resolution `p`. By default
 (`RoundNearestTiesUp`), ties (e.g., rounding 9:30 to the nearest hour) will be rounded up.
 
 For convenience, `p` may be a type instead of a value: `round(dt, Dates.Hour)` is a shortcut
 for `round(dt, Dates.Hour(1))`.
 
 ```jldoctest
-julia> round(Date(1985, 8, 16), Dates.Month)
+julia> round(Date(1985, 8, 16), Month)
 1985-08-01
 
-julia> round(DateTime(2013, 2, 13, 0, 31, 20), Dates.Minute(15))
+julia> round(DateTime(2013, 2, 13, 0, 31, 20), Minute(15))
 2013-02-13T00:30:00
 
-julia> round(DateTime(2016, 8, 6, 12, 0, 0), Dates.Day)
+julia> round(DateTime(2016, 8, 6, 12, 0, 0), Day)
 2016-08-07T00:00:00
 ```
 
@@ -243,13 +326,13 @@ For convenience, `precision` may be a type instead of a value: `round(x, Dates.H
 shortcut for `round(x, Dates.Hour(1))`.
 
 ```jldoctest
-julia> round(Dates.Day(16), Dates.Week)
+julia> round(Day(16), Week)
 2 weeks
 
-julia> round(Dates.Minute(44), Dates.Minute(15))
+julia> round(Minute(44), Minute(15))
 45 minutes
 
-julia> round(Dates.Hour(36), Dates.Day)
+julia> round(Hour(36), Day)
 2 days
 ```
 
@@ -279,7 +362,13 @@ Base.round(x::TimeTypeOrPeriod, p::Period) = Base.round(x, p, RoundNearestTiesUp
 # Make rounding functions callable using Period types in addition to values.
 Base.floor(x::TimeTypeOrPeriod, ::Type{P}) where P <: Period = Base.floor(x, oneunit(P))
 Base.ceil(x::TimeTypeOrPeriod, ::Type{P}) where P <: Period = Base.ceil(x, oneunit(P))
+Base.floor(::Type{Date}, x::TimeTypeOrPeriod, ::Type{P}) where P <: Period = Base.floor(Date(x), oneunit(P))
+Base.ceil(::Type{Date}, x::TimeTypeOrPeriod, ::Type{P}) where P <: Period = Base.ceil(Date(x), oneunit(P))
 
 function Base.round(x::TimeTypeOrPeriod, ::Type{P}, r::RoundingMode=RoundNearestTiesUp) where P <: Period
     return Base.round(x, oneunit(P), r)
+end
+
+function Base.round(::Type{Date}, x::TimeTypeOrPeriod, ::Type{P}, r::RoundingMode=RoundNearestTiesUp) where P <: Period
+    return Base.round(Date(x), oneunit(P), r)
 end

@@ -4,12 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __GLIBC__
+#include <link.h>
+#endif
 
 #include "platform.h"
 #include "julia.h"
 #include "julia_internal.h"
 #ifdef _OS_WINDOWS_
-#include <windows.h>
 #include <direct.h>
 #else
 #include <unistd.h>
@@ -25,27 +27,30 @@ extern "C" {
 static char const *const extensions[] = { "", ".dylib" };
 #elif defined(_OS_WINDOWS_)
 static char const *const extensions[] = { "", ".dll" };
-extern int needsSymRefreshModuleList;
+extern volatile int needsSymRefreshModuleList;
 #else
 static char const *const extensions[] = { "", ".so" };
 #endif
 #define N_EXTENSIONS (sizeof(extensions) / sizeof(char*))
 
-static int endswith_extension(const char *path)
+static int endswith_extension(const char *path) JL_NOTSAFEPOINT
 {
     if (!path)
         return 0;
     size_t len = strlen(path);
     // Skip the first one since it is empty
-    for (size_t i = 1;i < N_EXTENSIONS;i++) {
+    for (size_t i = 1; i < N_EXTENSIONS; i++) {
         const char *ext = extensions[i];
         size_t extlen = strlen(ext);
-        if (len < extlen) return 0;
+        if (len < extlen)
+            return 0;
         // Skip version extensions if present
-        size_t j = len-1;
+        size_t j = len - 1;
         while (j > 0) {
-            if (path[j] == '.' || (path[j] >= '0' && path[j] <= '9')) j--;
-            else break;
+            if (path[j] == '.' || (path[j] >= '0' && path[j] <= '9'))
+                j--;
+            else
+                break;
         }
         if ((j == len-1 || path[j+1] == '.') && memcmp(ext, path + j - extlen + 1, extlen) == 0) {
             return 1;
@@ -54,39 +59,199 @@ static int endswith_extension(const char *path)
     return 0;
 }
 
-#define PATHBUF 512
+#ifdef _OS_WINDOWS_
+#define CRTDLL_BASENAME "msvcrt"
 
-extern char *julia_bindir;
+JL_DLLEXPORT const char *jl_crtdll_basename = CRTDLL_BASENAME;
+const char *jl_crtdll_name = CRTDLL_BASENAME ".dll";
+
+#undef CRTDLL_BASENAME
+#endif
+
+#ifdef _OS_WINDOWS_
+void win32_formatmessage(DWORD code, char *reason, int len) JL_NOTSAFEPOINT
+{
+    DWORD res;
+    LPWSTR errmsg;
+    res = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                         FORMAT_MESSAGE_FROM_SYSTEM |
+                         FORMAT_MESSAGE_IGNORE_INSERTS |
+                         FORMAT_MESSAGE_MAX_WIDTH_MASK,
+                         NULL, code,
+                         MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
+                         (LPWSTR)&errmsg, 0, NULL);
+    if (!res && (GetLastError() == ERROR_MUI_FILE_NOT_FOUND ||
+                 GetLastError() == ERROR_RESOURCE_TYPE_NOT_FOUND)) {
+      res = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                           FORMAT_MESSAGE_FROM_SYSTEM |
+                           FORMAT_MESSAGE_IGNORE_INSERTS |
+                           FORMAT_MESSAGE_MAX_WIDTH_MASK,
+                           NULL, code,
+                           0, (LPWSTR)&errmsg, 0, NULL);
+    }
+    char *buf = reason;
+    size_t buflen = len - 1;
+    int err = uv_utf16_to_wtf8((uint16_t*)errmsg, -1, &buf, &buflen);
+    assert(err == 0 || err == UV_ENOBUFS); (void)err;
+    LocalFree(errmsg);
+}
+#endif
+
+typedef void* (*dlopen_prototype)(const char* filename, int flags) JL_CANCALLBACK;
+
+#if defined(_COMPILER_MSAN_ENABLED_) || defined(_COMPILER_ASAN_ENABLED_) || defined(_COMPILER_TSAN_ENABLED_)
+struct link_map;
+
+/* This function is copied from the memory sanitizer runtime.
+   Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+   See https://llvm.org/LICENSE.txt for license information.
+   SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+*/
+static inline uintptr_t RoundUpTo(uintptr_t size, uintptr_t boundary) {
+  return (size + boundary - 1) & ~(boundary - 1);
+}
+static inline uintptr_t RoundDownTo(uintptr_t x, uintptr_t boundary) {
+  return x & ~(boundary - 1);
+}
+void ForEachMappedRegion(struct link_map *map, void (*cb)(const volatile void *, uintptr_t)) {
+#if !defined(_OS_FREEBSD_)
+  typedef ElfW(Phdr) Elf_Phdr;
+  typedef ElfW(Ehdr) Elf_Ehdr;
+#endif
+  char *base = (char *)map->l_addr;
+  Elf_Ehdr *ehdr = (Elf_Ehdr *)base;
+  char *phdrs = base + ehdr->e_phoff;
+  char *phdrs_end = phdrs + ehdr->e_phnum * ehdr->e_phentsize;
+
+  // Find the segment with the minimum base so we can "relocate" the p_vaddr
+  // fields.  Typically ET_DYN objects (DSOs) have base of zero and ET_EXEC
+  // objects have a non-zero base.
+  uintptr_t preferred_base = (uintptr_t)-1;
+  for (char *iter = phdrs; iter != phdrs_end; iter += ehdr->e_phentsize) {
+    Elf_Phdr *phdr = (Elf_Phdr *)iter;
+    if (phdr->p_type == PT_LOAD && preferred_base > (uintptr_t)phdr->p_vaddr)
+      preferred_base = (uintptr_t)phdr->p_vaddr;
+  }
+
+  // Compute the delta from the real base to get a relocation delta.
+  intptr_t delta = (uintptr_t)base - preferred_base;
+  // Now we can figure out what the loader really mapped.
+  for (char *iter = phdrs; iter != phdrs_end; iter += ehdr->e_phentsize) {
+    Elf_Phdr *phdr = (Elf_Phdr *)iter;
+    if (phdr->p_type == PT_LOAD) {
+      uintptr_t seg_start = phdr->p_vaddr + delta;
+      uintptr_t seg_end = seg_start + phdr->p_memsz;
+      // None of these values are aligned.  We consider the ragged edges of the
+      // load command as defined, since they are mapped from the file.
+      seg_start = RoundDownTo(seg_start, jl_page_size);
+      seg_end = RoundUpTo(seg_end, jl_page_size);
+      cb((void *)seg_start, seg_end - seg_start);
+    }
+  }
+}
+#endif
+
+#if defined(_OS_WINDOWS_)
+void *jl_dlopen(const char *filename, unsigned flags)
+{
+    ssize_t len = uv_wtf8_length_as_utf16(filename);
+    if (len < 0) return NULL;
+    WCHAR *wfilename = (WCHAR*)alloca(len * sizeof(WCHAR));
+    uv_wtf8_to_utf16(filename, (uint16_t*)wfilename, len);
+    HANDLE lib;
+    if (flags & JL_RTLD_NOLOAD) {
+        lib = GetModuleHandleW(wfilename);
+    }
+    else {
+        lib = LoadLibraryExW(wfilename, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
+    return lib;
+}
+#else
 
 #define JL_RTLD(flags, FLAG) (flags & JL_RTLD_ ## FLAG ? RTLD_ ## FLAG : 0)
 
-static void JL_NORETURN jl_dlerror(const char *fmt, const char *sym)
+int jl_running_under_sanitizer(int recheck) JL_NOTSAFEPOINT
 {
-#ifdef _OS_WINDOWS_
-    CHAR reason[256];
-    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, GetLastError(),
-            MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
-            reason, sizeof(reason) / sizeof(reason[0]), NULL);
+#if defined(_COMPILER_ASAN_ENABLED_) || defined(_COMPILER_TSAN_ENABLED_) || defined(_COMPILER_MSAN_ENABLED_)
+    return 1;
 #else
-    const char *reason = dlerror();
+    static _Atomic(int) detected_ = -1;
+    int detected = jl_atomic_load_relaxed(&detected_);
+    if (detected < 0 || recheck) {
+        const char *env = getenv("JULIA_ASAN_COMPAT");
+        if (env != NULL && env[0] != '\0')
+            detected = strcmp(env, "0") != 0 ? 1 : 0;
+        else if (dlsym(RTLD_DEFAULT, "__asan_init") != NULL)
+            detected = 1;
+        else
+            detected = 0;
+        jl_atomic_store_relaxed(&detected_, detected);
+    }
+    return detected == 1;
 #endif
-    jl_errorf(fmt, sym, reason);
 }
 
-JL_DLLEXPORT void *jl_dlopen(const char *filename, unsigned flags)
+#ifdef RTLD_DEEPBIND
+// RTLD_DEEPBIND is incompatible with the sanitizers' libc interposition
+// (c.f. https://github.com/google/sanitizers/issues/611)
+static int jl_use_rtld_deepbind(int recheck) JL_NOTSAFEPOINT
 {
-#if defined(_OS_WINDOWS_)
-    needsSymRefreshModuleList = 1;
-    size_t len = MultiByteToWideChar(CP_UTF8, 0, filename, -1, NULL, 0);
-    if (!len) return NULL;
-    WCHAR *wfilename = (WCHAR*)alloca(len * sizeof(WCHAR));
-    if (!MultiByteToWideChar(CP_UTF8, 0, filename, -1, wfilename, len)) return NULL;
-    return LoadLibraryExW(wfilename, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-#else
-    dlerror(); /* Reset error status. */
-    return dlopen(filename,
-                  (flags & JL_RTLD_NOW ? RTLD_NOW : RTLD_LAZY)
+    static _Atomic(int) enabled_ = -1;
+    int enabled = jl_atomic_load_relaxed(&enabled_);
+    if (enabled < 0 || recheck) {
+        const char *env = getenv("JULIA_USE_RTLD_DEEPBIND");
+        if (env != NULL && env[0] != '\0')
+            enabled = strcmp(env, "0") != 0;
+        else
+            enabled = !jl_running_under_sanitizer(recheck);
+        jl_atomic_store_relaxed(&enabled_, enabled);
+    }
+    return enabled == 1;
+}
+#endif
+
+/* The sanitizers break RUNPATH use in dlopen for annoying reasons that are
+   are hard to fix. Specifically, libc will use the return address of the
+   caller to determine certain paths and flags that affect .so location lookup.
+   To work around this, we need to avoid using the sanitizer's dlopen interposition,
+   instead using the real dlopen directly from the current shared library.
+   Of course, this does mean that we need to manually perform the work that
+   the sanitizers would otherwise do. */
+static JL_NO_SANITIZE dlopen_prototype resolve_dlopen(void) JL_CANCALLBACK
+{
+#if defined(__GLIBC__)
+    // When a sanitizer is active, bypass its dlopen interposition by resolving and
+    // caching the real libdl dlopen; otherwise use dlopen directly.
+    if (jl_running_under_sanitizer(/*recheck*/0)) {
+        static dlopen_prototype real_dlopen = NULL;
+        if (!real_dlopen) {
+            dlopen_prototype fptr = (dlopen_prototype)dlsym(RTLD_NEXT, "dlopen");
+            if (!fptr)
+                return NULL;
+            // Since glibc 2.34, dlopen lives in libc and libdl.so.2 may not be loaded
+            void *libdl_handle = fptr("libdl.so.2", RTLD_NOW | RTLD_NOLOAD);
+            if (libdl_handle) {
+                fptr = (dlopen_prototype)dlsym(libdl_handle, "dlopen");
+                dlclose(libdl_handle);
+                assert(fptr);
+            }
+            real_dlopen = fptr;
+        }
+        // The real interceptors check the validity of the string here, but let's
+        // just skip that for the time being.
+        return real_dlopen;
+    }
+#endif
+    return &dlopen;
+}
+
+JL_NO_SANITIZE void *jl_dlopen(const char *filename, unsigned flags)
+{
+    dlopen_prototype dlopen_fptr = resolve_dlopen();
+    if (dlopen_fptr == NULL)
+        return NULL;
+    int real_flags = (flags & JL_RTLD_NOW ? RTLD_NOW : RTLD_LAZY)
                   | JL_RTLD(flags, LOCAL)
                   | JL_RTLD(flags, GLOBAL)
 #ifdef RTLD_NODELETE
@@ -95,164 +260,323 @@ JL_DLLEXPORT void *jl_dlopen(const char *filename, unsigned flags)
 #ifdef RTLD_NOLOAD
                   | JL_RTLD(flags, NOLOAD)
 #endif
-#if defined(RTLD_DEEPBIND) && !defined(JL_ASAN_ENABLED)
-                  | JL_RTLD(flags, DEEPBIND)
-#endif
 #ifdef RTLD_FIRST
                   | JL_RTLD(flags, FIRST)
 #endif
-                  );
+                  ;
+#ifdef RTLD_DEEPBIND
+    if (jl_use_rtld_deepbind(/*recheck*/0))
+        real_flags = real_flags | JL_RTLD(flags, DEEPBIND);
 #endif
+    void *hnd = dlopen_fptr(filename, real_flags);
+#if defined(_COMPILER_MSAN_ENABLED_) && defined(__GLIBC__)
+    struct link_map *map = (struct link_map*)hnd;
+    if (filename && map)
+      ForEachMappedRegion(map, __msan_unpoison);
+#endif
+    return hnd;
+}
+#endif
+
+static void jl_dlopen_throw(int err, const char *filename) {
+#ifdef _OS_WINDOWS_
+    char reason[256];
+    win32_formatmessage(err, reason, sizeof(reason));
+#else
+    const char *reason = dlerror();
+#endif
+    jl_errorf("could not load library \"%s\"\n%s", filename, reason);
 }
 
-JL_DLLEXPORT int jl_dlclose(void *handle)
+extern jl_libhandle jl_dlopen_e(const char *filename, unsigned flags) JL_NO_SAFEPOINT_ANALYSIS
+#ifdef __clang_gcanalyzer__
+; // function used when we know that jl_dlopen will not safepoint
+#else
+{
+    void *handle = jl_dlopen(filename, flags);
+    if (!handle)
+        jl_dlopen_throw(errno, filename);
+    return handle;
+}
+#endif
+
+int jl_dlclose(void *handle)
 {
 #ifdef _OS_WINDOWS_
-    if (!handle) return -1;
+    if (!handle) {
+        return -1;
+    }
     return !FreeLibrary((HMODULE) handle);
 #else
-    dlerror(); /* Reset error status. */
-    if (!handle) return -1;
+    if (!handle) {
+        dlerror(); /* Reset error status. */
+        return -1;
+    }
     return dlclose(handle);
 #endif
 }
 
-static void *jl_load_dynamic_library_(const char *modname, unsigned flags, int throw_err)
+void *jl_find_dynamic_library_by_addr(void *symbol, int throw_err, int close) JL_NOTSAFEPOINT
 {
-    char path[PATHBUF];
+    void *handle;
+#ifdef _OS_WINDOWS_
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)symbol,
+                            (HMODULE*)&handle)) {
+        if (throw_err)
+            jl_error("could not load base module");
+        return NULL;
+    }
+#else
+    const char *path = jl_pathname_for_symbol(symbol);
+    if (path == NULL) {
+        if (throw_err)
+            jl_error("could not load base module");
+        return NULL;
+    }
+    if (path[0] == '\0') { // symbol is in the main executable
+        handle = dlopen(NULL, RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
+    } else {
+        handle = dlopen(path, RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
+    }
+    if (handle != NULL && close)
+        dlclose(handle); // Undo ref count increment from `dlopen`
+#endif
+    return handle;
+}
+
+JL_DLLEXPORT void *jl_load_dynamic_library(const char *modname, unsigned flags, int throw_err) JL_CANSAFEPOINT
+{
+    ios_t path, relocated;
     int i;
+    int err = 0;
     uv_stat_t stbuf;
     void *handle;
     int abspath;
-    // number of extensions to try — if modname already ends with the
+    int is_atpath;
+    // number of extensions to try — if modname already ends with the
     // standard extension, then we don't try adding additional extensions
     int n_extensions = endswith_extension(modname) ? 1 : N_EXTENSIONS;
 
-    /*
-      this branch returns handle of libjulia
-    */
-    if (modname == NULL) {
-#ifdef _OS_WINDOWS_
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                (LPCWSTR)(uintptr_t)(&jl_load_dynamic_library),
-                                (HMODULE*)&handle)) {
-            jl_error("could not load base module");
-        }
-#else
-        Dl_info info;
-        if (!dladdr((void*)(uintptr_t)&jl_load_dynamic_library, &info) || !info.dli_fname)
-            jl_error("could not load base module");
-        handle = dlopen(info.dli_fname, RTLD_NOW);
-#endif
-        goto done;
-    }
+    // modname == NULL is a sentinel value requesting the handle of libjulia-internal
+    if (modname == NULL)
+        return jl_libjulia_internal_handle;
 
-    abspath = isabspath(modname);
+    abspath = jl_isabspath(modname);
+    is_atpath = 0;
+
+    JL_TIMING(DL_OPEN, DL_OPEN);
+    if (!(flags & JL_RTLD_NOLOAD))
+        jl_timing_puts(JL_TIMING_DEFAULT_BLOCK, modname);
+
+    // Detect if our `modname` is something like `@rpath/libfoo.dylib`
+#ifdef _OS_DARWIN_
+    size_t nameLen = strlen(modname);
+    const char *const atPaths[] = {"@executable_path/", "@loader_path/", "@rpath/"};
+    for (i = 0; i < sizeof(atPaths)/sizeof(char*); ++i) {
+        size_t atLen = strlen(atPaths[i]);
+        if (nameLen >= atLen && 0 == strncmp(modname, atPaths[i], atLen)) {
+            is_atpath = 1;
+        }
+    }
+#endif
+
+    ios_mem(&path, IOS_INLSIZE);
+    ios_mem(&relocated, IOS_INLSIZE);
 
     /*
       this branch permutes all base paths in DL_LOAD_PATH with all extensions
       note: skip when !jl_base_module to avoid UndefVarError(:DL_LOAD_PATH),
             and also skip for absolute paths
+            and also skip for `@`-paths on macOS
+      We also do simple string replacement here for elements starting with `@executable_path/`.
+      While these exist as OS concepts on Darwin, we want to use them on other platforms
+      such as Windows, so we emulate them here.
     */
-    if (!abspath && jl_base_module != NULL) {
-        jl_array_t *DL_LOAD_PATH = (jl_array_t*)jl_get_global(jl_base_module, jl_symbol("DL_LOAD_PATH"));
+    if (!abspath && !is_atpath && jl_base_module != NULL && jl_typeinf_world != 1) {
+        jl_binding_t *b = jl_get_module_binding(jl_base_module, jl_symbol("DL_LOAD_PATH"), 0);
+        jl_array_t *DL_LOAD_PATH = (jl_array_t*)(b ? jl_get_binding_value_in_world(b, jl_typeinf_world) : NULL);
         if (DL_LOAD_PATH != NULL) {
             size_t j;
-            for (j = 0; j < jl_array_len(DL_LOAD_PATH); j++) {
+            for (j = 0; j < jl_array_nrows(DL_LOAD_PATH); j++) {
                 char *dl_path = jl_string_data(jl_array_ptr_data(DL_LOAD_PATH)[j]);
-                size_t len = strlen(dl_path);
-                if (len == 0)
+                if (*dl_path == 0)
                     continue;
-                for (i=0; i < n_extensions; i++) {
+
+                ios_trunc(&relocated, 0);
+
+                // Is this entry supposed to be relative to the bindir?
+                if (strncmp(dl_path, "@executable_path", 16) == 0) {
+                    ios_printf(&relocated, "%s%s", jl_options.julia_bindir, dl_path + 16);
+                } else {
+                    ios_puts(dl_path, &relocated);
+                }
+                ios_putc(0, &relocated);
+                for (i = 0; i < n_extensions; i++) {
+                    ios_trunc(&path, 0);
                     const char *ext = extensions[i];
-                    path[0] = '\0';
-                    if (dl_path[len-1] == PATHSEPSTRING[0])
-                        snprintf(path, PATHBUF, "%s%s%s", dl_path, modname, ext);
+                    if (relocated.buf[relocated.bpos - 2] == PATHSEPSTRING[0])
+                        ios_printf(&path, "%s%s%s", relocated.buf, modname, ext);
                     else
-                        snprintf(path, PATHBUF, "%s" PATHSEPSTRING "%s%s", dl_path, modname, ext);
-                    handle = jl_dlopen(path, flags);
-                    if (handle)
-                        goto done;
+                        ios_printf(&path, "%s" PATHSEPSTRING "%s%s", relocated.buf, modname, ext);
+                    ios_putc(0, &path);
+
+#ifdef _OS_WINDOWS_
+                    if (i == 0) { // LoadLibrary already tested the extensions, we just need to check the `stat` result
+#endif
+                        handle = jl_dlopen(path.buf, flags);
+                        if (handle && !(flags & JL_RTLD_NOLOAD))
+                            jl_timing_puts(JL_TIMING_DEFAULT_BLOCK, jl_pathname_for_handle(handle));
+                        if (handle)
+                            goto success;
+#ifdef _OS_WINDOWS_
+                        err = GetLastError();
+                    }
+#endif
                     // bail out and show the error if file actually exists
-                    if (jl_stat(path, (char*)&stbuf) == 0)
-                        goto notfound;
+                    if (jl_stat(path.buf, (char *)&stbuf) == 0) {
+                        if (!S_ISDIR(stbuf.st_mode)) {
+                            goto notfound;
+                        }
+                    }
                 }
             }
         }
     }
 
     // now fall back and look in default library paths, for all extensions
-    for(i=0; i < n_extensions; i++) {
+    for (i = 0; i < n_extensions; i++) {
+        ios_trunc(&path, 0);
         const char *ext = extensions[i];
-        path[0] = '\0';
-        snprintf(path, PATHBUF, "%s%s", modname, ext);
-        handle = jl_dlopen(path, flags);
+        ios_printf(&path, "%s%s", modname, ext);
+        ios_putc(0, &path);
+        handle = jl_dlopen(path.buf, flags);
+        if (handle && !(flags & JL_RTLD_NOLOAD))
+            jl_timing_puts(JL_TIMING_DEFAULT_BLOCK, jl_pathname_for_handle(handle));
         if (handle)
-            goto done;
+            goto success;
+#ifdef _OS_WINDOWS_
+        err = GetLastError();
+        break; // LoadLibrary already tested the rest
+#else
+        // bail out and show the error if file actually exists
+        if (jl_stat(path.buf, (char *)&stbuf) == 0) {
+            if (!S_ISDIR(stbuf.st_mode)) {
+                break;
+            }
+        }
+#endif
     }
 
 notfound:
-    if (throw_err)
-        jl_dlerror("could not load library \"%s\"\n%s", modname);
-    return NULL;
+    if (throw_err) {
+        ios_close(&relocated);
+        ios_close(&path);
+        jl_dlopen_throw(err, modname);
+    }
+    handle = NULL;
 
-done:
+success:
+    ios_close(&relocated);
+    ios_close(&path);
     return handle;
 }
 
-JL_DLLEXPORT void *jl_load_dynamic_library_e(const char *modname, unsigned flags)
+/*
+ * When search_deps is 1, act like dlsym and search both the library for the
+ * handle and all its dependencies.  Use this option only when compatibility
+ * with dlsym(3) is required, though this behaviour is not possible on Windows.
+ *
+ * At time of writing, only Base.dlsym() uses search_deps = 1.
+ */
+JL_DLLEXPORT int jl_dlsym(void *handle, const char *symbol, void ** value, int throw_err, int search_deps) JL_NOTSAFEPOINT
 {
-    return jl_load_dynamic_library_(modname, flags, 0);
-}
+    int symbol_found = 0;
 
-JL_DLLEXPORT void *jl_load_dynamic_library(const char *modname, unsigned flags)
-{
-    return jl_load_dynamic_library_(modname, flags, 1);
-}
-
-JL_DLLEXPORT void *jl_dlsym_e(void *handle, const char *symbol)
-{
-#ifdef _OS_WINDOWS_
-    void *ptr = GetProcAddress((HMODULE) handle, symbol);
+    /* First, get the symbol value */
+#if defined(_OS_WINDOWS_)
+    *value = GetProcAddress((HMODULE) handle, symbol);
+#elif defined(_OS_DARWIN_)
+    /* When !search_deps and the handle isn't special, force RTLD_FIRST. */
+    if (!search_deps && handle != RTLD_NEXT && handle != RTLD_DEFAULT &&
+        handle != RTLD_SELF && handle != RTLD_MAIN_ONLY)
+        handle = (void *)((uintptr_t)handle | 1);
+    *value = dlsym(handle, symbol);
 #else
-    dlerror(); /* Reset error status. */
-    void *ptr = dlsym(handle, symbol);
+    *value = dlsym(handle, symbol);
 #endif
-    return ptr;
-}
 
-JL_DLLEXPORT void *jl_dlsym(void *handle, const char *symbol)
-{
-    void *ptr = jl_dlsym_e(handle, symbol);
-    if (!ptr)
-        jl_dlerror("could not load symbol \"%s\":\n%s", symbol);
-    return ptr;
-}
+    /* Next, check for errors. On Windows, a NULL pointer means the symbol was
+     * not found. On everything else, we can have NULL symbols, so we check for
+     * non-NULL returns from dlerror(). Since POSIX doesn't require `dlerror`
+     * to be implemented safely, FreeBSD doesn't (unlike everyone else, who
+     * realized decades ago that threads are here to stay), so we avoid calling
+     * `dlerror` unless we need to get the error message.
+     * https://github.com/freebsd/freebsd-src/blob/12db51d20823a5e3b9e5f8a2ea73156fe1cbfc28/libexec/rtld-elf/rtld.c#L198
+     */
+    symbol_found = *value != NULL;
+#ifndef _OS_WINDOWS_
+    const char *err = "";
+    if (!symbol_found) {
+        dlerror(); /* Reset error status. */
+        *value = dlsym(handle, symbol);
+        err = dlerror();
+        symbol_found = *value != NULL || err == NULL;
+    }
+#endif
 
+#if !defined(_OS_DARWIN_) && !defined(_OS_WINDOWS_)
+    /*
+     * Unlike GetProcAddress, dlsym will search the dependencies of the given
+     * library, so we must check where the symbol came from.
+     */
+    if (symbol_found && !search_deps && handle != jl_RTLD_DEFAULT_handle) {
+        void *symbol_handle = jl_find_dynamic_library_by_addr(*value, 0, 1);
+        symbol_found = handle == symbol_handle;
+    }
+#endif
+
+    if (!symbol_found) {
+        if (throw_err) {
 #ifdef _OS_WINDOWS_
-//Look for symbols in win32 libraries
-const char *jl_dlfind_win32(const char *f_name)
+            char err[256];
+            win32_formatmessage(GetLastError(), err, sizeof(err));
+#endif
+            jl_errorf("could not load symbol \"%s\":\n%s", symbol, err);
+        }
+        return 0;
+    }
+
+    return 1;
+}
+
+// Look for symbols in internal libraries
+JL_DLLEXPORT const char *jl_dlfind(const char *f_name)
 {
-    if (jl_dlsym_e(jl_exe_handle, f_name))
+#ifdef _OS_FREEBSD_
+    // This is a workaround for FreeBSD <= 13.2 which do not have
+    // https://cgit.freebsd.org/src/commit/?id=21a52f99440c9bec7679f3b0c5c9d888901c3694
+    // (See https://github.com/JuliaLang/julia/issues/50846)
+    if (strcmp(f_name, "dl_iterate_phdr") == 0)
+        return NULL;
+#endif
+    void * dummy;
+    if (jl_dlsym(jl_libjulia_internal_handle, f_name, &dummy, 0, 0))
+        return JL_LIBJULIA_INTERNAL_DL_LIBNAME;
+    if (jl_dlsym(jl_libjulia_handle, f_name, &dummy, 0, 0))
+        return JL_LIBJULIA_DL_LIBNAME;
+    if (jl_dlsym(jl_exe_handle, f_name, &dummy, 0, 0))
         return JL_EXE_LIBNAME;
-    if (jl_dlsym_e(jl_dl_handle, f_name))
-        return JL_DL_LIBNAME;
-    if (jl_dlsym_e(jl_kernel32_handle, f_name))
+#ifdef _OS_WINDOWS_
+    if (jl_dlsym(jl_kernel32_handle, f_name, &dummy, 0, 0))
         return "kernel32";
-    if (jl_dlsym_e(jl_ntdll_handle, f_name))
+    if (jl_dlsym(jl_crtdll_handle, f_name, &dummy, 0, 0)) // Prefer crtdll over ntdll
+        return jl_crtdll_basename;
+    if (jl_dlsym(jl_ntdll_handle, f_name, &dummy, 0, 0))
         return "ntdll";
-    if (jl_dlsym_e(jl_crtdll_handle, f_name))
-#if defined(_MSC_VER)
-#if _MSC_VER == 1800
-        return "msvcr120";
-#else
-#error This version of MSVC has not been tested.
-#endif
-#else
-        return "msvcrt";
-#endif
-    if (jl_dlsym_e(jl_winsock_handle, f_name))
+    if (jl_dlsym(jl_winsock_handle, f_name, &dummy, 0, 0))
         return "ws2_32";
+#endif
     // additional common libraries (libc?) could be added here, but in general,
     // it is better to specify the library explicitly in the code. This exists
     // mainly to ease compatibility with linux, and for libraries that don't
@@ -261,10 +585,9 @@ const char *jl_dlfind_win32(const char *f_name)
     // explicit is preferred over implicit
     return NULL;
     // oops, we didn't find it. NULL defaults to searching jl_RTLD_DEFAULT_handle,
-    // which defaults to jl_dl_handle, where we won't find it, and will throw the
-    // appropriate error.
+    // which defaults to jl_libjulia_internal_handle, where we won't find it, and
+    // will throw the appropriate error.
 }
-#endif
 
 #ifdef __cplusplus
 }

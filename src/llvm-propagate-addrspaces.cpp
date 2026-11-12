@@ -1,5 +1,10 @@
 // This file is a part of Julia. License is MIT: https://julialang.org/license
 
+#include "llvm-version.h"
+
+#include <llvm-c/Core.h>
+#include <llvm-c/Types.h>
+
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Analysis/CFG.h>
 #include <llvm/IR/Value.h>
@@ -10,16 +15,16 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/InstVisitor.h>
-#include <llvm/IR/CallSite.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Pass.h>
 #include <llvm/Support/Debug.h>
 
-#include "llvm-version.h"
-#include "codegen_shared.h"
-#include "julia.h"
+#include <set>
+
+#include "passes.h"
+#include "llvm-codegen-shared.h"
 
 #define DEBUG_TYPE "propagate_julia_addrspaces"
 
@@ -36,64 +41,82 @@ using namespace llvm;
     optimizations.
 */
 
-struct PropagateJuliaAddrspaces : public FunctionPass, public InstVisitor<PropagateJuliaAddrspaces> {
-    static char ID;
+namespace {
+struct PropagateJuliaAddrspacesVisitor : public InstVisitor<PropagateJuliaAddrspacesVisitor> {
     DenseMap<Value *, Value *> LiftingMap;
     SmallPtrSet<Value *, 4> Visited;
-    std::vector<Instruction *> ToDelete;
-    std::vector<std::pair<Instruction *, Instruction *>> ToInsert;
-    PropagateJuliaAddrspaces() : FunctionPass(ID) {};
+    SmallVector<Instruction *, 0> ToDelete;
+    SmallVector<std::pair<Instruction *, Instruction *>, 0> ToInsert;
 
 public:
-    bool runOnFunction(Function &F) override;
-    Value *LiftPointer(Value *V, Type *LocTy = nullptr, Instruction *InsertPt=nullptr);
-    void visitStoreInst(StoreInst &SI);
+    Value *LiftPointer(Module *M, Value *V, Instruction *InsertPt=nullptr);
+    void visitMemop(Instruction &I, Type *T, unsigned OpIndex);
     void visitLoadInst(LoadInst &LI);
+    void visitStoreInst(StoreInst &SI);
+    void visitAtomicCmpXchgInst(AtomicCmpXchgInst &SI);
+    void visitAtomicRMWInst(AtomicRMWInst &SI);
     void visitMemSetInst(MemSetInst &MI);
     void visitMemTransferInst(MemTransferInst &MTI);
 
 private:
-    void PoisonValues(std::vector<Value *> &Worklist);
+    void PoisonValues(SmallVectorImpl<Value *> &Worklist);
 };
-
-bool PropagateJuliaAddrspaces::runOnFunction(Function &F) {
-    visit(F);
-    for (auto it : ToInsert)
-        it.first->insertBefore(it.second);
-    for (Instruction *I : ToDelete)
-        I->eraseFromParent();
-    ToInsert.clear();
-    ToDelete.clear();
-    LiftingMap.clear();
-    Visited.clear();
-    return true;
-}
+}  // anonymous namespace
 
 static unsigned getValueAddrSpace(Value *V) {
-    return cast<PointerType>(V->getType())->getAddressSpace();
+    return V->getType()->getPointerAddressSpace();
 }
 
 static bool isSpecialAS(unsigned AS) {
     return AddressSpace::FirstSpecial <= AS && AS <= AddressSpace::LastSpecial;
 }
 
-void PropagateJuliaAddrspaces::PoisonValues(std::vector<Value *> &Worklist) {
+void PropagateJuliaAddrspacesVisitor::PoisonValues(SmallVectorImpl<Value *> &Worklist) {
     while (!Worklist.empty()) {
         Value *CurrentV = Worklist.back();
         Worklist.pop_back();
+        // Constant data (undef, poison, null, ...) is uniqued per context and
+        // its users span unrelated functions.
+        if (isa<ConstantData>(CurrentV))
+            continue;
         for (Value *User : CurrentV->users()) {
             if (Visited.count(User))
                 continue;
-            Visited.insert(CurrentV);
+            Visited.insert(User);
             Worklist.push_back(User);
         }
     }
 }
 
-Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction *InsertPt) {
+Value *PropagateJuliaAddrspacesVisitor::LiftPointer(Module *M, Value *V, Instruction *InsertPt) {
     SmallVector<Value *, 4> Stack;
-    std::vector<Value *> Worklist;
+    SmallVector<Value *, 0> Worklist;
     std::set<Value *> LocalVisited;
+    // We need to ensure all non-null leaves agree on an address space in
+    // order to lift them. This affects GPU backends where allocas might live
+    // in a different AS than global consts for example
+    unsigned LiftAS = UINT_MAX;
+    auto mergeLeafAS = [&](Value *Leaf) -> bool {
+        while (!LiftingMap.count(Leaf)) {
+            if (auto *BCI = dyn_cast<BitCastInst>(Leaf))
+                Leaf = BCI->getOperand(0);
+            else if (auto *ACI = dyn_cast<AddrSpaceCastInst>(Leaf))
+                Leaf = ACI->getOperand(0);
+            else
+                break;
+        }
+        if (isa<ConstantPointerNull>(Leaf))
+            return true; // null can be lifted into any address space
+        auto It = LiftingMap.find(Leaf);
+        if (It != LiftingMap.end())
+            Leaf = It->second;
+        unsigned AS = getValueAddrSpace(Leaf);
+        if (isSpecialAS(AS))
+            return false;
+        if (LiftAS == UINT_MAX)
+            LiftAS = AS;
+        return LiftAS == AS;
+    };
     Worklist.push_back(V);
     // Follow pointer casts back, see if we're based on a pointer in
     // an untracked address space, in which case we're allowed to drop
@@ -109,12 +132,16 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
                 CurrentV = BCI->getOperand(0);
             else if (auto *ACI = dyn_cast<AddrSpaceCastInst>(CurrentV)) {
                 CurrentV = ACI->getOperand(0);
-                if (!isSpecialAS(getValueAddrSpace(ACI)))
+                if (!isSpecialAS(getValueAddrSpace(ACI))) {
+                    if (!mergeLeafAS(CurrentV))
+                        return nullptr;
                     break;
+                }
             }
             else if (auto *GEP = dyn_cast<GetElementPtrInst>(CurrentV)) {
                 if (LiftingMap.count(GEP)) {
-                    CurrentV = LiftingMap[GEP];
+                    if (!mergeLeafAS(GEP))
+                        return nullptr;
                     break;
                 } else if (Visited.count(GEP)) {
                     return nullptr;
@@ -124,6 +151,8 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
                 CurrentV = GEP->getOperand(0);
             } else if (auto *Phi = dyn_cast<PHINode>(CurrentV)) {
                 if (LiftingMap.count(Phi)) {
+                    if (!mergeLeafAS(Phi))
+                        return nullptr;
                     break;
                 }
                 for (Value *Incoming : Phi->incoming_values()) {
@@ -134,6 +163,8 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
                 break;
             } else if (auto *Select = dyn_cast<SelectInst>(CurrentV)) {
                 if (LiftingMap.count(Select)) {
+                    if (!mergeLeafAS(Select))
+                        return nullptr;
                     break;
                 } else if (Visited.count(Select)) {
                     return nullptr;
@@ -149,8 +180,10 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
                 break;
             } else {
                 // Ok, we've reached a leaf - check if it is eligible for lifting
-                if (!CurrentV->getType()->isPointerTy() ||
+                if (!CurrentV->getType()->isPtrOrPtrVectorTy() ||
                     isSpecialAS(getValueAddrSpace(CurrentV))) {
+                    if (Visited.count(CurrentV))
+                        return nullptr;
                     // If not, poison all (recursive) users of this value, to prevent
                     // looking at them again in future iterations.
                     Worklist.clear();
@@ -159,13 +192,20 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
                     PoisonValues(Worklist);
                     return nullptr;
                 }
+                if (!mergeLeafAS(CurrentV))
+                    return nullptr;
                 break;
             }
         }
     }
 
+    if (LiftAS == UINT_MAX) {
+        // Use alloca AS if there are no non-null leaves
+        LiftAS = M->getDataLayout().getAllocaAddrSpace();
+    }
+
     // Go through and insert lifted versions of all instructions on the list.
-    std::vector<Value *> ToRevisit;
+    SmallVector<Value *, 0> ToRevisit;
     for (Value *V : Stack) {
         if (LiftingMap.count(V))
             continue;
@@ -173,15 +213,14 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
             Instruction *InstV = cast<Instruction>(V);
             Instruction *NewV = InstV->clone();
             ToInsert.push_back(std::make_pair(NewV, InstV));
-            Type *NewRetTy = cast<PointerType>(InstV->getType())->getElementType()->getPointerTo(0);
+            Type *NewRetTy = PointerType::get(InstV->getContext(), LiftAS);
             NewV->mutateType(NewRetTy);
             LiftingMap[InstV] = NewV;
             ToRevisit.push_back(NewV);
         }
     }
-
     auto CollapseCastsAndLift = [&](Value *CurrentV, Instruction *InsertPt) -> Value * {
-        PointerType *TargetType = cast<PointerType>(CurrentV->getType())->getElementType()->getPointerTo(0);
+        PointerType *TargetType = PointerType::get(CurrentV->getContext(), LiftAS);
         while (!LiftingMap.count(CurrentV)) {
             if (isa<BitCastInst>(CurrentV))
                 CurrentV = cast<BitCastInst>(CurrentV)->getOperand(0);
@@ -195,11 +234,7 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
         }
         if (LiftingMap.count(CurrentV))
             CurrentV = LiftingMap[CurrentV];
-        if (CurrentV->getType() != TargetType) {
-            auto *BCI = new BitCastInst(CurrentV, TargetType);
-            ToInsert.push_back(std::make_pair(BCI, InsertPt));
-            CurrentV = BCI;
-        }
+        assert(CurrentV->getType() == TargetType);
         return CurrentV;
     };
 
@@ -225,59 +260,66 @@ Value *PropagateJuliaAddrspaces::LiftPointer(Value *V, Type *LocTy, Instruction 
     return CollapseCastsAndLift(V, InsertPt);
 }
 
-void PropagateJuliaAddrspaces::visitLoadInst(LoadInst &LI) {
-    unsigned AS = LI.getPointerAddressSpace();
+void PropagateJuliaAddrspacesVisitor::visitMemop(Instruction &I, Type *T, unsigned OpIndex) {
+    Value *Original = I.getOperand(OpIndex);
+    unsigned AS = Original->getType()->getPointerAddressSpace();
     if (!isSpecialAS(AS))
         return;
-    Value *Replacement = LiftPointer(LI.getPointerOperand(), LI.getType(), &LI);
+    Value *Replacement = LiftPointer(I.getModule(), Original, &I);
     if (!Replacement)
         return;
-    LI.setOperand(LoadInst::getPointerOperandIndex(), Replacement);
+    I.setOperand(OpIndex, Replacement);
 }
 
-void PropagateJuliaAddrspaces::visitStoreInst(StoreInst &SI) {
-    unsigned AS = SI.getPointerAddressSpace();
-    if (!isSpecialAS(AS))
-        return;
-    Value *Replacement = LiftPointer(SI.getPointerOperand(), SI.getValueOperand()->getType(), &SI);
-    if (!Replacement)
-        return;
-    SI.setOperand(StoreInst::getPointerOperandIndex(), Replacement);
+void PropagateJuliaAddrspacesVisitor::visitLoadInst(LoadInst &LI) {
+    visitMemop(LI, LI.getType(), LoadInst::getPointerOperandIndex());
 }
 
-void PropagateJuliaAddrspaces::visitMemSetInst(MemSetInst &MI) {
+void PropagateJuliaAddrspacesVisitor::visitStoreInst(StoreInst &SI) {
+    visitMemop(SI, SI.getValueOperand()->getType(), StoreInst::getPointerOperandIndex());
+}
+
+void PropagateJuliaAddrspacesVisitor::visitAtomicCmpXchgInst(AtomicCmpXchgInst &SI) {
+    visitMemop(SI, SI.getNewValOperand()->getType(), AtomicCmpXchgInst::getPointerOperandIndex());
+}
+
+void PropagateJuliaAddrspacesVisitor::visitAtomicRMWInst(AtomicRMWInst &SI) {
+    visitMemop(SI, SI.getType(), AtomicRMWInst::getPointerOperandIndex());
+}
+
+void PropagateJuliaAddrspacesVisitor::visitMemSetInst(MemSetInst &MI) {
     unsigned AS = MI.getDestAddressSpace();
     if (!isSpecialAS(AS))
         return;
-    Value *Replacement = LiftPointer(MI.getRawDest());
+    Value *Replacement = LiftPointer(MI.getModule(), MI.getRawDest());
     if (!Replacement)
         return;
-    Value *TheFn = Intrinsic::getDeclaration(MI.getModule(), Intrinsic::memset,
+    Function *TheFn = Intrinsic::getOrInsertDeclaration(MI.getModule(), Intrinsic::memset,
         {Replacement->getType(), MI.getOperand(1)->getType()});
     MI.setCalledFunction(TheFn);
     MI.setArgOperand(0, Replacement);
 }
 
-void PropagateJuliaAddrspaces::visitMemTransferInst(MemTransferInst &MTI) {
+void PropagateJuliaAddrspacesVisitor::visitMemTransferInst(MemTransferInst &MTI) {
     unsigned DestAS = MTI.getDestAddressSpace();
     unsigned SrcAS = MTI.getSourceAddressSpace();
     if (!isSpecialAS(DestAS) && !isSpecialAS(SrcAS))
         return;
     Value *Dest = MTI.getRawDest();
     if (isSpecialAS(DestAS)) {
-        Value *Replacement = LiftPointer(Dest, cast<PointerType>(Dest->getType())->getElementType(), &MTI);
+        Value *Replacement = LiftPointer(MTI.getModule(), Dest, &MTI);
         if (Replacement)
             Dest = Replacement;
     }
     Value *Src = MTI.getRawSource();
     if (isSpecialAS(SrcAS)) {
-        Value *Replacement = LiftPointer(Src, cast<PointerType>(Src->getType())->getElementType(), &MTI);
+        Value *Replacement = LiftPointer(MTI.getModule(), Src, &MTI);
         if (Replacement)
             Src = Replacement;
     }
     if (Dest == MTI.getRawDest() && Src == MTI.getRawSource())
         return;
-    Value *TheFn = Intrinsic::getDeclaration(MTI.getModule(), MTI.getIntrinsicID(),
+    Function *TheFn = Intrinsic::getOrInsertDeclaration(MTI.getModule(), MTI.getIntrinsicID(),
         {Dest->getType(), Src->getType(),
          MTI.getOperand(2)->getType()});
     MTI.setCalledFunction(TheFn);
@@ -285,9 +327,28 @@ void PropagateJuliaAddrspaces::visitMemTransferInst(MemTransferInst &MTI) {
     MTI.setArgOperand(1, Src);
 }
 
-char PropagateJuliaAddrspaces::ID = 0;
-static RegisterPass<PropagateJuliaAddrspaces> X("PropagateJuliaAddrspaces", "Propagate (non-)rootedness information", false, false);
+static bool propagateJuliaAddrspaces(Function &F) {
+    PropagateJuliaAddrspacesVisitor visitor;
+    visitor.visit(F);
+    for (auto it : visitor.ToInsert)
+        it.first->insertBefore(it.second->getIterator());
+    for (Instruction *I : visitor.ToDelete)
+        I->eraseFromParent();
+    visitor.ToInsert.clear();
+    visitor.ToDelete.clear();
+    visitor.LiftingMap.clear();
+    visitor.Visited.clear();
+    return true;
+}
+PreservedAnalyses PropagateJuliaAddrspacesPass::run(Function &F, FunctionAnalysisManager &AM) {
+    bool modified = propagateJuliaAddrspaces(F);
 
-Pass *createPropagateJuliaAddrspaces() {
-    return new PropagateJuliaAddrspaces();
+#ifdef JL_VERIFY_PASSES
+    assert(!verifyLLVMIR(F));
+#endif
+    if (modified) {
+        return PreservedAnalyses::allInSet<CFGAnalyses>();
+    } else {
+        return PreservedAnalyses::all();
+    }
 }

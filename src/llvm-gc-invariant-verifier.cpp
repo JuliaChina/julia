@@ -3,6 +3,12 @@
 // This LLVM pass verifies invariants required for correct GC root placement.
 // See the devdocs for a description of these invariants.
 
+#include "llvm-version.h"
+#include "passes.h"
+
+#include <llvm-c/Core.h>
+#include <llvm-c/Types.h>
+
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/CFG.h>
@@ -13,15 +19,13 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/InstVisitor.h>
-#include <llvm/IR/CallSite.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Pass.h>
 #include <llvm/Support/Debug.h>
 
-#include "llvm-version.h"
-#include "codegen_shared.h"
+#include "llvm-codegen-shared.h"
 #include "julia.h"
 
 #define DEBUG_TYPE "verify_gc_invariants"
@@ -29,11 +33,11 @@
 
 using namespace llvm;
 
-struct GCInvariantVerifier : public FunctionPass, public InstVisitor<GCInvariantVerifier> {
-    static char ID;
+namespace {
+struct GCInvariantVerifier : public InstVisitor<GCInvariantVerifier> {
     bool Broken = false;
     bool Strong;
-    GCInvariantVerifier(bool Strong = false) : FunctionPass(ID), Strong(Strong) {}
+    GCInvariantVerifier(bool Strong = false) : Strong(Strong) {}
 
 private:
     void Check(bool Cond, const char *message, Value *Val) {
@@ -44,25 +48,24 @@ private:
     }
 
 public:
-    void getAnalysisUsage(AnalysisUsage &AU) const override {
-        FunctionPass::getAnalysisUsage(AU);
-        AU.setPreservesAll();
-    }
-
-    bool runOnFunction(Function &F) override;
     void visitAddrSpaceCastInst(AddrSpaceCastInst &I);
-    void visitStoreInst(StoreInst &SI);
     void visitLoadInst(LoadInst &LI);
+    void visitStoreInst(StoreInst &SI);
+    void visitAtomicCmpXchgInst(AtomicCmpXchgInst &SI);
+    void visitAtomicRMWInst(AtomicRMWInst &SI);
     void visitReturnInst(ReturnInst &RI);
     void visitGetElementPtrInst(GetElementPtrInst &GEP);
     void visitIntToPtrInst(IntToPtrInst &IPI);
     void visitPtrToIntInst(PtrToIntInst &PII);
     void visitCallInst(CallInst &CI);
+
+    void checkStoreInst(Type *VTy, unsigned AS, Value &SI);
 };
+}  // anonymous namespace
 
 void GCInvariantVerifier::visitAddrSpaceCastInst(AddrSpaceCastInst &I) {
-    unsigned FromAS = cast<PointerType>(I.getSrcTy())->getAddressSpace();
-    unsigned ToAS = cast<PointerType>(I.getDestTy())->getAddressSpace();
+    unsigned FromAS = I.getSrcTy()->getPointerAddressSpace();
+    unsigned ToAS = I.getDestTy()->getPointerAddressSpace();
     if (FromAS == 0)
         return;
     Check(ToAS != AddressSpace::Loaded && FromAS != AddressSpace::Loaded,
@@ -76,39 +79,47 @@ void GCInvariantVerifier::visitAddrSpaceCastInst(AddrSpaceCastInst &I) {
           "Illegal address space cast from decayed ptr", &I);
 }
 
-void GCInvariantVerifier::visitStoreInst(StoreInst &SI) {
-    Type *VTy = SI.getValueOperand()->getType();
-    if (VTy->isPointerTy()) {
+void GCInvariantVerifier::checkStoreInst(Type *VTy, unsigned AS, Value &SI) {
+    if (VTy->isPtrOrPtrVectorTy()) {
         /* We currently don't obey this for arguments. That's ok - they're
            externally rooted. */
-        if (!isa<Argument>(SI.getValueOperand())) {
-            unsigned AS = cast<PointerType>(VTy)->getAddressSpace();
-            Check(AS != AddressSpace::CalleeRooted &&
-                  AS != AddressSpace::Derived,
-                  "Illegal store of decayed value", &SI);
-        }
+        unsigned AS = VTy->getPointerAddressSpace();
+        Check(AS != AddressSpace::CalleeRooted &&
+              AS != AddressSpace::Derived,
+              "Illegal store of decayed value", &SI);
     }
-    VTy = SI.getPointerOperand()->getType();
-    if (VTy->isPointerTy()) {
-        unsigned AS = cast<PointerType>(VTy)->getAddressSpace();
-        Check(AS != AddressSpace::CalleeRooted,
-              "Illegal store to callee rooted value", &SI);
-    }
+    Check(AS != AddressSpace::CalleeRooted,
+          "Illegal store to callee rooted value", &SI);
+}
+
+void GCInvariantVerifier::visitStoreInst(StoreInst &SI) {
+    Type *VTy = SI.getValueOperand()->getType();
+    checkStoreInst(VTy, SI.getPointerAddressSpace(), SI);
+}
+
+void GCInvariantVerifier::visitAtomicRMWInst(AtomicRMWInst &SI) {
+    Type *VTy = SI.getValOperand()->getType();
+    checkStoreInst(VTy, SI.getPointerAddressSpace(), SI);
+}
+
+void GCInvariantVerifier::visitAtomicCmpXchgInst(AtomicCmpXchgInst &SI) {
+    Type *VTy = SI.getNewValOperand()->getType();
+    checkStoreInst(VTy, SI.getPointerAddressSpace(), SI);
 }
 
 void GCInvariantVerifier::visitLoadInst(LoadInst &LI) {
     Type *Ty = LI.getType();
-    if (Ty->isPointerTy()) {
-        unsigned AS = cast<PointerType>(Ty)->getAddressSpace();
+    if (Ty->isPtrOrPtrVectorTy()) {
+        unsigned AS = Ty->getPointerAddressSpace();
         Check(AS != AddressSpace::CalleeRooted &&
               AS != AddressSpace::Derived,
               "Illegal load of gc relevant value", &LI);
     }
     Ty = LI.getPointerOperand()->getType();
-    if (Ty->isPointerTy()) {
-        unsigned AS = cast<PointerType>(Ty)->getAddressSpace();
+    if (Ty->isPtrOrPtrVectorTy()) {
+        unsigned AS = Ty->getPointerAddressSpace();
         Check(AS != AddressSpace::CalleeRooted,
-              "Illegal store of callee rooted value", &LI);
+              "Illegal load of callee rooted value", &LI);
     }
 }
 
@@ -120,18 +131,18 @@ void GCInvariantVerifier::visitReturnInst(ReturnInst &RI) {
     if (!RI.getReturnValue())
         return;
     Type *RTy = RI.getReturnValue()->getType();
-    if (!RTy->isPointerTy())
+    if (!RTy->isPtrOrPtrVectorTy())
         return;
-    unsigned AS = cast<PointerType>(RTy)->getAddressSpace();
+    unsigned AS = RTy->getPointerAddressSpace();
     Check(!isSpecialAS(AS) || AS == AddressSpace::Tracked,
           "Only gc tracked values may be directly returned", &RI);
 }
 
 void GCInvariantVerifier::visitGetElementPtrInst(GetElementPtrInst &GEP) {
     Type *Ty = GEP.getType();
-    if (!Ty->isPointerTy())
+    if (!Ty->isPtrOrPtrVectorTy())
         return;
-    unsigned AS = cast<PointerType>(Ty)->getAddressSpace();
+    unsigned AS = Ty->getPointerAddressSpace();
     if (!isSpecialAS(AS))
         return;
     /* We're actually ok with GEPs here, as long as they don't feed into any
@@ -150,12 +161,48 @@ void GCInvariantVerifier::visitGetElementPtrInst(GetElementPtrInst &GEP) {
 }
 
 void GCInvariantVerifier::visitCallInst(CallInst &CI) {
-    CallingConv::ID CC = CI.getCallingConv();
-    if (CC == JLCALL_CC || CC == JLCALL_F_CC) {
-        for (Value *Arg : CI.arg_operands()) {
+    Function *Callee = CI.getCalledFunction();
+#ifdef GC_BARRIER_FIELD_PRECISE
+    // There are currently no codegen exceptions permitting whole-object barriers.
+    Check(!Callee || Callee->getName() != "julia.object_write_barrier",
+          "Object write barrier is not permitted with field-precise barriers", &CI);
+#endif
+    // Varargs are not type-checked by LLVM, so validate every (slot, child) pair.
+    if (Callee && Callee->getName().starts_with("julia.field_write_barrier.")) {
+        bool derived = Callee->getName() == "julia.field_write_barrier.p11";
+        Check(derived || Callee->getName() == "julia.field_write_barrier.p13",
+              "Unknown field write barrier address space", &CI);
+        auto isPointerInAS = [](Value *V, unsigned AS) {
+            auto *Ty = dyn_cast<PointerType>(V->getType());
+            return Ty && Ty->getAddressSpace() == AS;
+        };
+        Check(CI.arg_size() >= 3 && CI.arg_size() % 2 == 1,
+              "Field write barrier must be (parent, slot, child) plus (slot, child) pairs", &CI);
+        if (!CI.arg_empty())
+            Check(isPointerInAS(CI.getArgOperand(0), AddressSpace::Tracked),
+                  "Field write barrier requires a tracked parent", &CI);
+        for (unsigned i = 1; i + 1 < CI.arg_size(); i += 2) {
+            Check(isPointerInAS(CI.getArgOperand(i), derived ? AddressSpace::Derived : AddressSpace::Loaded),
+                  "Field write barrier slot address space must match its declaration", &CI);
+            Check(isPointerInAS(CI.getArgOperand(i + 1), AddressSpace::Tracked),
+                  "Field write barrier requires tracked children", &CI);
+            Check(!isa<ConstantPointerNull>(CI.getArgOperand(i)->stripPointerCasts()),
+                  "Field write barrier requires non-null slots", &CI);
+        }
+    }
+    if (Callee && (Callee->getName() == "julia.call" ||
+                   Callee->getName() == "julia.call2" ||
+                   Callee->getName() == "julia.call3")) {
+        unsigned Fixed = CI.getFunctionType()->getNumParams();
+        for (Value *Arg : CI.args()) {
+            if (Fixed) {
+                Fixed--;
+                continue;
+            }
             Type *Ty = Arg->getType();
-            Check(Ty->isPointerTy() && cast<PointerType>(Ty)->getAddressSpace() == AddressSpace::Tracked,
-                "Invalid derived pointer in jlcall", &CI);
+            Check(Ty->isPtrOrPtrVectorTy() &&
+                      Ty->getPointerAddressSpace() == AddressSpace::Tracked,
+                  "Invalid derived pointer in jlcall", &CI);
         }
     }
 }
@@ -169,20 +216,14 @@ void GCInvariantVerifier::visitIntToPtrInst(IntToPtrInst &IPI) {
 
 void GCInvariantVerifier::visitPtrToIntInst(PtrToIntInst &PII) {
     Check(!isSpecialAS(PII.getPointerAddressSpace()),
-          "Illegal inttoptr", &PII);
+          "Illegal ptrtoint", &PII);
 }
 
-bool GCInvariantVerifier::runOnFunction(Function &F) {
-    visit(F);
-    if (Broken) {
+PreservedAnalyses GCInvariantVerifierPass::run(Function &F, FunctionAnalysisManager &AM) {
+    GCInvariantVerifier GIV(Strong);
+    GIV.visit(F);
+    if (GIV.Broken) {
         abort();
     }
-    return false;
-}
-
-char GCInvariantVerifier::ID = 0;
-static RegisterPass<GCInvariantVerifier> X("GCInvariantVerifier", "GC Invariant Verification Pass", false, false);
-
-Pass *createGCInvariantVerifierPass(bool Strong) {
-    return new GCInvariantVerifier(Strong);
+    return PreservedAnalyses::all();
 }

@@ -1,10 +1,148 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 using Sockets, Random, Test
+using Base: Experimental
+
+@test isempty(Test.detect_closure_boxes(Sockets))
+
+# These diagnostics are only printed by the watchdog. Missing system tools are ignored.
+function command_output(label, cmd)
+    output = try
+        read(ignorestatus(cmd), String)
+    catch ex
+        "unavailable ($(typeof(ex))): $ex\n"
+    end
+    return "$label:\n$output"
+end
+
+function network_diagnostics(ports=Int[]; include_sockets=true)
+    commands = Pair{String, Cmd}["network interfaces" => `netstat -ndi`]
+    if Sys.isapple()
+        push!(commands, "UDP statistics" => `netstat -s -p udp`)
+        include_sockets && push!(commands, "UDP sockets" => `netstat -anv -p udp`)
+    elseif Sys.islinux()
+        push!(commands, "UDP statistics" => `netstat -su`)
+        include_sockets && push!(commands, "UDP sockets" => `ss -uanp`)
+    elseif Sys.isbsd()
+        push!(commands, "UDP statistics" => `netstat -s -p udp`)
+        include_sockets && push!(commands, "UDP sockets" => `netstat -an -p udp`)
+    elseif Sys.iswindows()
+        push!(commands, "UDP statistics" => `netstat -s -p UDP`)
+        include_sockets && push!(commands, "UDP sockets" => `netstat -an -p UDP`)
+    end
+    if include_sockets && !Sys.iswindows()
+        push!(commands, "Julia UDP sockets" => `lsof -nP -a -p $(getpid()) -iUDP`)
+        for port in ports
+            udp_filter = "-iUDP:$port"
+            push!(commands, "processes using UDP port $port" => `lsof -nP $udp_filter`)
+        end
+    end
+    return join((command_output(label, cmd) for (label, cmd) in commands), '\n')
+end
+
+const network_before = network_diagnostics(; include_sockets=false)
+const sockets_watchdog_state_lock = ReentrantLock()
+const sockets_watchdog_state = Ref{Any}((
+    phase = "before UDP tests",
+    details = (;),
+    counters = (;),
+    sockets = (;),
+    tasks = (;),
+))
+
+function set_sockets_watchdog_state(phase; details=(;), counters=(;), sockets=(;), tasks=(;))
+    @lock sockets_watchdog_state_lock begin
+        sockets_watchdog_state[] = (; phase, details, counters, sockets, tasks)
+    end
+    nothing
+end
+
+function print_sockets_watchdog_state()
+    state = @lock sockets_watchdog_state_lock sockets_watchdog_state[]
+    Core.print(Core.stderr, "Sockets watchdog state:\n  phase: ", state.phase,
+               "\n  details: ", repr(state.details), "\n")
+    for (name, counter) in pairs(state.counters)
+        Core.print(Core.stderr, "  ", name, ": ", counter[], "\n")
+    end
+    for (name, socket) in pairs(state.sockets)
+        socket_repr = try
+            repr(socket)
+        catch ex
+            repr(ex)
+        end
+        socket_fd = try
+            Base.fd(socket)
+        catch ex
+            ex
+        end
+        Core.print(Core.stderr, "  ", name, ": ", socket_repr,
+                   ", fd: ", repr(socket_fd), "\n")
+    end
+    for (name, task_or_tasks) in pairs(state.tasks)
+        tasks = task_or_tasks isa AbstractVector ? task_or_tasks : (task_or_tasks,)
+        Core.print(Core.stderr, "  ", name, ": ", length(tasks), " task(s)\n")
+        for (i, task) in enumerate(tasks)
+            task_repr = try
+                repr(task)
+            catch ex
+                repr(ex)
+            end
+            Core.print(Core.stderr, "    ", i, ": ", task_repr, "\n")
+        end
+    end
+    nothing
+end
+
+# `randport` is only known to be available for TCP, so find a port that can
+# actually be bound for UDP (#38711).
+function bind_udp_any(host)
+    local port = UInt16(rand(2000:4000))
+    for _ in 1:100
+        port = UInt16(rand(2000:4000))
+        sock = UDPSocket()
+        bind(sock, host, port) && return sock, port
+        close(sock)
+    end
+    message = "UDP test failed to bind $(repr(host)) after 100 attempts"
+    Core.print(Core.stderr, message, '\n')
+    diagnostics = network_diagnostics([Int(port)])
+    error("$message\n$diagnostics")
+end
+
+# set up a watchdog alarm for 10 minutes
+# so that we can attempt to get a "friendly" backtrace if something gets stuck
+# (although this'll also terminate any attempted debugging session)
+# expected test duration is about 5-10 seconds
+function killjob(d)
+    Core.print(Core.stderr, d)
+    print_sockets_watchdog_state()
+    Core.print(Core.stderr, "Network state before:\n")
+    Core.print(Core.stderr, network_before)
+    Core.print(Core.stderr, "\nNetwork state after:\n")
+    # This might fail if we're in a bad libuv state
+    ports = isdefinedglobal(@__MODULE__, :randport) ? [Int(randport), Int(randport) + 1] : Int[]
+    Core.print(Core.stderr, network_diagnostics(ports), '\n')
+    if Sys.islinux()
+        SIGINFO = 10
+    elseif Sys.isbsd()
+        SIGINFO = 29
+    end
+    if @isdefined(SIGINFO)
+        ccall(:uv_kill, Cint, (Cint, Cint), getpid(), SIGINFO)
+        sleep(5) # Allow time for profile to collect and print before killing
+    end
+    if Sys.isunix()
+        # SIGQUIT prints all live task backtraces, unlike the single-task SIGINFO profile.
+        ccall(:uv_kill, Cint, (Cint, Cint), getpid(), Base.SIGQUIT)
+    else
+        ccall(:uv_kill, Cint, (Cint, Cint), getpid(), Base.SIGTERM)
+    end
+    nothing
+end
+sockets_watchdog_timer = Timer(_ -> killjob("KILLING BY SOCKETS TEST WATCHDOG\n"), 600)
 
 @testset "parsing" begin
     @test ip"127.0.0.1" == IPv4(127,0,0,1)
-    @test ip"192.0" == IPv4(192,0,0,0)
 
     # These used to work, but are now disallowed. Check that they error
     @test_throws ArgumentError parse(IPv4, "192.0xFFF") # IPv4(192,0,15,255)
@@ -12,6 +150,7 @@ using Sockets, Random, Test
     @test_throws ArgumentError parse(IPv4, "192.0xFFFFF") # IPv4(192,15,255,255)
     @test_throws ArgumentError parse(IPv4, "192.0xFFFFFF") # IPv4(192,255,255,255)
     @test_throws ArgumentError parse(IPv4, "022.0.0.1") # IPv4(18,0,0,1)
+    @test_throws ArgumentError parse(IPv4, "192.0") # IPv4(192,0,0,0)
 
     @test UInt(IPv4(0x01020304)) == 0x01020304
     @test Int(IPv4("1.2.3.4")) == Int(0x01020304) == Int32(0x01020304)
@@ -64,6 +203,11 @@ end
     inet = Sockets.InetAddr(IPv4(127,0,0,1), 1024)
     @test inet.host == ip"127.0.0.1"
     @test inet.port == 1024
+    str = "Sockets.InetAddr{$(isdefined(Main, :IPv4) ? "" : "Sockets.")IPv4}(ip\"127.0.0.1\", 1024)"
+    @test sprint(show, inet) == str
+    inet = Sockets.InetAddr("127.0.0.1", 1024)
+    @test inet.host == ip"127.0.0.1"
+    @test inet.port == 1024
 end
 @testset "InetAddr invalid port" begin
     @test_throws InexactError Sockets.InetAddr(IPv4(127,0,0,1), -1)
@@ -75,6 +219,11 @@ end
     @test ip"1.2.3.4" >= ip"1.2.3.4" >= ip"1.2.3.1"
     @test isless(ip"1.2.3.4", ip"1.2.3.5")
     @test_throws MethodError sort([ip"2.3.4.5", ip"1.2.3.4", ip"2001:1:2::1"])
+end
+
+@testset "broadcastable" begin
+    @test size(ip"127.0.0.1" .== ip"127.0.0.1") == ()
+    @test size(ip"::1" .== ip"::1") == ()
 end
 
 @testset "RFC 5952 Compliance" begin
@@ -105,7 +254,7 @@ defaultport = rand(2000:4000)
                 write(sock, "Hello World\n")
 
                 # test "locked" println to a socket
-                @sync begin
+                Experimental.@sync begin
                     for i in 1:100
                         @async println(sock, "a", 1)
                     end
@@ -120,7 +269,7 @@ defaultport = rand(2000:4000)
             if otherip != Sockets.localhost
                 @test_throws Base._UVError("connect", Base.UV_ECONNREFUSED) connect(otherip, p)
             end
-            for i in 1:3
+            for _ in 1:3
                 client = connect(p)
                 let name = getsockname(client)::Tuple{IPAddr, UInt16}
                     @test name[1] == Sockets.localhost
@@ -130,30 +279,108 @@ defaultport = rand(2000:4000)
                 @test read(client, String) == "Hello World\n" * ("a1\n"^100)
             end
         end
-        Base.wait(tsk)
+        wait(tsk)
     end
 
     mktempdir() do tmpdir
         socketname = Sys.iswindows() ? ("\\\\.\\pipe\\uv-test-" * randstring(6)) : joinpath(tmpdir, "socket")
-        c = Condition()
-        tsk = @async begin
-            s = listen(socketname)
-            notify(c)
-            sock = accept(s)
-            write(sock,"Hello World\n")
-            close(s)
-            close(sock)
+        local nconn = Ref(0)
+        srv = listen(socketname)
+        t = accept(srv) do client
+            write(client, "Hello World $(nconn[] += 1)\n")
+            close(client)
+            nconn[] == 3 && Base.wait_close(srv)
         end
-        wait(c)
-        @test read(connect(socketname), String) == "Hello World\n"
-        Base.wait(tsk)
+        @test read(connect(socketname), String) == "Hello World 1\n"
+        @test read(connect(socketname), String) == "Hello World 2\n"
+        @test read(connect(socketname), String) == "Hello World 3\n"
+        conn = connect(socketname)
+        close(srv)
+        wait(t)
+        @test read(conn, String) == ""
     end
 end
 
+# flush() must not throw after the peer has received everything and closed.
+@testset "flush after peer close" begin
+    mktempdir() do tmpdir
+        for reply in (false, true)
+            socketname = Sys.iswindows() ? ("\\\\.\\pipe\\uv-test-" * randstring(6)) :
+                         joinpath(tmpdir, "socket-$(Int(reply))")
+            server = listen(socketname)
+            peer_closed = Channel{Nothing}(1)
+            server_task = @async begin
+                peer = accept(server)
+                try
+                    @test readline(peer) == "ping"
+                    reply && write(peer, "pong\n")
+                finally
+                    close(peer)
+                    close(server)
+                    put!(peer_closed, nothing)
+                end
+            end
+
+            client = connect(socketname)
+            try
+                @test write(client, "ping\n") == 5
+                take!(peer_closed)
+                reply && @test readline(client) == "pong"
+                @test flush(client) === nothing
+            finally
+                close(client)
+            end
+            wait(server_task)
+        end
+    end
+end
+
+@testset "getsockname errors" begin
+    sock = TCPSocket()
+    serv = Sockets.TCPServer()
+    udp = UDPSocket()
+    @test_throws MethodError getpeername(serv)
+    @test_throws MethodError getpeername(udp)
+    @test_throws Base._UVError("cannot obtain socket name", Base.UV_EBADF) getpeername(sock)
+    @test_throws Base._UVError("cannot obtain socket name", Base.UV_EBADF) getsockname(serv)
+    @test_throws Base._UVError("cannot obtain socket name", Base.UV_EBADF) getsockname(sock)
+    @test_throws Base._UVError("cannot obtain socket name", Base.UV_EBADF) getsockname(udp)
+    close(sock)
+    close(serv)
+    close(udp)
+end
+
+
 @testset "getnameinfo on some unroutable IP addresses (RFC 5737)" begin
+    try
+        getnameinfo(ip"192.0.2.1")
+        getnameinfo(ip"198.51.100.1")
+        getnameinfo(ip"203.0.113.1")
+        getnameinfo(ip"0.1.1.1")
+        getnameinfo(ip"::ffff:0.1.1.1")
+        getnameinfo(ip"::ffff:192.0.2.1")
+        getnameinfo(ip"2001:db8::1")
+    catch
+        # NOTE: Default Ubuntu installations contain a faulty DNS configuration
+        # that returns `EAI_AGAIN` instead of `EAI_NONAME`.  To fix this, try
+        # installing `libnss-resolve`, which installs the `systemd-resolve`
+        # backend for NSS, which should fix it.
+        #
+        # If you are running tests inside Docker, you'll need to install
+        # `libnss-resolve` both outside Docker (i.e. on the host machine) and
+        # inside the Docker container.
+        if Sys.islinux()
+            error_msg = string(
+                "`getnameinfo` failed on an unroutable IP address. ",
+                "If your DNS setup seems to be working, try installing libnss-resolve",
+            )
+            @error(error_msg)
+        end
+    end
     @test getnameinfo(ip"192.0.2.1") == "192.0.2.1"
     @test getnameinfo(ip"198.51.100.1") == "198.51.100.1"
-    @test getnameinfo(ip"203.0.113.1") == "203.0.113.1"
+    # Temporarily broken due to a DNS issue. See https://github.com/JuliaLang/julia/issues/55008
+    @test_skip getnameinfo(ip"203.0.113.1") == "203.0.113.1"
     @test getnameinfo(ip"0.1.1.1") == "0.1.1.1"
     @test getnameinfo(ip"::ffff:0.1.1.1") == "::ffff:0.1.1.1"
     @test getnameinfo(ip"::ffff:192.0.2.1") == "::ffff:192.0.2.1"
@@ -173,6 +400,8 @@ end
 end
 
 @testset "getaddrinfo" begin
+    @test getaddrinfo("127.0.0.1") == ip"127.0.0.1"
+    @test getaddrinfo("::1") == ip"::1"
     let localhost = getnameinfo(ip"127.0.0.1")::String
         @test !isempty(localhost) && localhost != "127.0.0.1"
         @test !isempty(getalladdrinfo(localhost)::Vector{IPAddr})
@@ -198,7 +427,7 @@ end
 end
 
 @testset "put! in listenany(defaultport)" begin
-    (p, server) = listenany(defaultport)
+    (_, server) = listenany(defaultport)
     r = Channel(1)
     tsk = @async begin
         put!(r, :start)
@@ -206,14 +435,14 @@ end
     end
     @test fetch(r) === :start
     close(server)
-    Base.wait(tsk)
+    wait(tsk)
 end
 
 # test connecting to a named port
-let localhost = getaddrinfo("localhost")
+let localhost = ip"127.0.0.1"
     global randport
     randport, server = listenany(localhost, defaultport)
-    @async connect("localhost", randport)
+    @async connect(localhost, randport)
     s1 = accept(server)
     @test_throws ErrorException("client TCPSocket is not in initialization state") accept(server, s1)
     @test_throws Base._UVError("listen", Base.UV_EADDRINUSE) listen(randport)
@@ -226,59 +455,152 @@ end
 @test_throws Sockets.DNSError connect(".invalid", 80)
 
 @testset "UDPSocket" begin
+    set_sockets_watchdog_state("UDP socket display")
     # test show() function for UDPSocket()
-    @test endswith(repr(UDPSocket()), "UDPSocket(init)")
-    a = UDPSocket()
-    b = UDPSocket()
-    bind(a, ip"127.0.0.1", randport)
-    bind(b, ip"127.0.0.1", randport + 1)
+    @test repr(UDPSocket()) ∈ ("Sockets.UDPSocket(init)", "UDPSocket(init)")
 
-    c = Condition()
-    tsk = @async begin
-        @test String(recv(a)) == "Hello World"
-        # Issue 6505
-        tsk2 = @async begin
-            @test String(recv(a)) == "Hello World"
-            notify(c)
-        end
-        send(b, ip"127.0.0.1", randport, "Hello World")
-        Base.wait(tsk2)
-    end
-    send(b, ip"127.0.0.1", randport, "Hello World")
-    wait(c)
-    Base.wait(tsk)
+    let
+        set_sockets_watchdog_state("UDP IPv4 bind";
+            details=(host=ip"127.0.0.1",))
+        a, aport = bind_udp_any(ip"127.0.0.1")
+        @test getsockname(a) == (ip"127.0.0.1", aport)
+        b = UDPSocket()
+        set_sockets_watchdog_state("UDP IPv4 bind";
+            details=(host=ip"127.0.0.1", receiver_port=aport),
+            sockets=(receiver=a, sender=b))
 
-    tsk = @async begin
-        @test begin
-            (addr,data) = recvfrom(a)
-            addr == ip"127.0.0.1" && String(data) == "Hello World"
+        burst_sent = Threads.Atomic{Int}(0)
+        burst_received = Threads.Atomic{Int}(0)
+        burst_tasks = Task[]
+        Experimental.@sync begin
+            let i = 0
+                for _ = 1:30
+                    task = @async let msg = String(recv(a))
+                        Threads.atomic_add!(burst_received, 1)
+                        @test msg == "Hello World $(i += 1)"
+                    end
+                    push!(burst_tasks, task)
+                end
+            end
+            set_sockets_watchdog_state("UDP IPv4 30-packet burst";
+                details=(host=ip"127.0.0.1", port=aport),
+                counters=(sent=burst_sent, received=burst_received),
+                sockets=(receiver=a, sender=b), tasks=(receivers=copy(burst_tasks),))
+            yield()
+            for i = 1:30
+                send(b, ip"127.0.0.1", aport, "Hello World $i")
+                @atomic burst_sent[] = i
+            end
         end
+        let msg = Vector{UInt8}("fedcba9876543210"^36) # The minimum reassembly buffer size for IPv4 is 576 bytes
+            sent = Threads.Atomic{Int}(0)
+            received = Threads.Atomic{Int}(0)
+            tsk = @async begin
+                data = recv(a)
+                @atomic received[] = 1
+                @test data == msg
+            end
+            set_sockets_watchdog_state("UDP IPv4 576-byte datagram";
+                details=(host=ip"127.0.0.1", port=aport, bytes=length(msg)),
+                counters=(sent=sent, received=received), sockets=(receiver=a, sender=b),
+                tasks=(receiver=tsk,))
+            @test send(b, ip"127.0.0.1", aport, msg) === nothing
+            @atomic sent[] = 1
+            wait(tsk)
+        end
+        let msg = Vector{UInt8}("1234"^16377) # The maximum size of an IPv4 datagram is 65535 bytes, including the header
+            set_sockets_watchdog_state("UDP IPv4 oversized datagram";
+                details=(host=ip"127.0.0.1", port=aport, bytes=length(msg)),
+                sockets=(receiver=a, sender=b))
+            @test_throws(Base._UVError("send", Base.UV_EMSGSIZE),
+                         send(b, ip"127.0.0.1", aport, msg))
+            pop!(msg)
+            sent = Threads.Atomic{Int}(0)
+            received = Threads.Atomic{Int}(0)
+            tsk = @async begin
+                data = recv(a)
+                @atomic received[] = 1
+                data
+            end
+            set_sockets_watchdog_state("UDP IPv4 maximum datagram";
+                details=(host=ip"127.0.0.1", port=aport, bytes=length(msg)),
+                counters=(sent=sent, received=received),
+                sockets=(receiver=a, sender=b), tasks=(receiver=tsk,))
+            try
+                send(b, ip"127.0.0.1", aport, msg)
+                @atomic sent[] = 1
+            catch ex
+                if !(ex isa Base.IOError && ex.code == Base.UV_EMSGSIZE) || Sys.islinux() || Sys.iswindows()
+                    # this is allowed failure on some platforms which might further restrict
+                    # the maximum packet size being sent (even locally), such as BSD's `sysctl net.inet.udp.maxdgram`
+                    rethrow()
+                end
+                empty!(msg)
+                set_sockets_watchdog_state("UDP IPv4 empty datagram fallback";
+                    details=(host=ip"127.0.0.1", port=aport, bytes=length(msg)),
+                    counters=(sent=sent, received=received),
+                    sockets=(receiver=a, sender=b), tasks=(receiver=tsk,))
+                send(b, ip"127.0.0.1", aport, msg) # check that the socket is still alive
+                @atomic sent[] = 1
+            end
+            @test fetch(tsk) == msg
+        end
+        let sent = Threads.Atomic{Int}(0), received = Threads.Atomic{Int}(0)
+            tsk = @async begin
+                send(b, ip"127.0.0.1", aport, "WORLD HELLO")
+                @atomic sent[] = 1
+            end
+            set_sockets_watchdog_state("UDP IPv4 recvfrom";
+                details=(host=ip"127.0.0.1", port=aport),
+                counters=(sent=sent, received=received), sockets=(receiver=a, sender=b),
+                tasks=(sender=tsk,))
+            (inetaddr, data) = recvfrom(a)
+            @atomic received[] = 1
+            @test inetaddr.host == ip"127.0.0.1" && String(data) == "WORLD HELLO"
+            wait(tsk)
+        end
+        close(a)
+        close(b)
     end
-    send(b, ip"127.0.0.1", randport, "Hello World")
-    Base.wait(tsk)
 
     @test_throws MethodError bind(UDPSocket(), randport)
 
-    close(a)
-    close(b)
-
-    if !Sys.iswindows() || Sys.windows_version() >= Sys.WINDOWS_VISTA_VER
-        a = UDPSocket()
+    let
+        set_sockets_watchdog_state("UDP IPv6 bind";
+            details=(host=ip"::1",))
+        a, aport = bind_udp_any(ip"::1")
+        @test getsockname(a) == (ip"::1", aport)
         b = UDPSocket()
-        bind(a, ip"::1", UInt16(randport))
-        bind(b, ip"::1", UInt16(randport + 1))
+        set_sockets_watchdog_state("UDP IPv6 bind";
+            details=(host=ip"::1", receiver_port=aport),
+            sockets=(receiver=a, sender=b))
 
-        tsk = @async begin
-            @test begin
-                (addr, data) = recvfrom(a)
-                addr == ip"::1" && String(data) == "Hello World"
+        sent = Threads.Atomic{Int}(0)
+        received = Threads.Atomic{Int}(0)
+        iteration = Threads.Atomic{Int}(0)
+        recv_tasks = Task[]
+        for i = 1:3
+            @atomic iteration[] = i
+            tsk = @async begin
+                let (inetaddr, data) = recvfrom(a)
+                    Threads.atomic_add!(received, 1)
+                    @test inetaddr.host == ip"::1"
+                    @test String(data) == "Hello World"
+                end
             end
+            push!(recv_tasks, tsk)
+            set_sockets_watchdog_state("UDP IPv6 datagram";
+                details=(host=ip"::1", port=aport),
+                counters=(iteration=iteration, sent=sent, received=received),
+                sockets=(receiver=a, sender=b), tasks=(receivers=copy(recv_tasks),))
+            send(b, ip"::1", aport, "Hello World")
+            Threads.atomic_add!(sent, 1)
+            wait(tsk)
         end
-        send(b, ip"::1", randport, "Hello World")
-        Base.wait(tsk)
-        send(b, ip"::1", randport, "Hello World")
-        Base.wait(tsk)
+        close(a)
+        close(b)
     end
+    set_sockets_watchdog_state("UDP tests complete")
 end
 
 @testset "local ports" begin
@@ -292,69 +614,124 @@ end
         @test addr == gsn_addr
         @test port == gsn_port
 
-        @test_throws MethodError getpeername(listen_sock)
-
         # connect to it
         client_sock = connect(addr, port)
-        server_sock = accept(listen_sock)
+        test_done = Ref(false)
+        Experimental.@sync begin
+            @async begin
+                Base.wait_readnb(client_sock, 1)
+                test_done[] || error("Client disconnected prematurely.")
+            end
+            @async begin
+                server_sock = accept(listen_sock)
 
-        self_client_addr, self_client_port = getsockname(client_sock)
-        peer_client_addr, peer_client_port = getpeername(client_sock)
-        self_srvr_addr, self_srvr_port = getsockname(server_sock)
-        peer_srvr_addr, peer_srvr_port = getpeername(server_sock)
+                self_client_addr, self_client_port = getsockname(client_sock)
+                peer_client_addr, peer_client_port = getpeername(client_sock)
+                self_srvr_addr, self_srvr_port = getsockname(server_sock)
+                peer_srvr_addr, peer_srvr_port = getpeername(server_sock)
 
-        @test self_client_addr == peer_client_addr == self_srvr_addr == peer_srvr_addr
+                @test self_client_addr == peer_client_addr == self_srvr_addr == peer_srvr_addr
 
-        @test peer_client_port == self_srvr_port
-        @test peer_srvr_port == self_client_port
-        @test self_srvr_port != self_client_port
+                @test peer_client_port == self_srvr_port
+                @test peer_srvr_port == self_client_port
+                @test self_srvr_port != self_client_port
 
-        close(listen_sock)
-        close(client_sock)
-        close(server_sock)
+                test_done[] = true
+
+                close(listen_sock)
+                close(client_sock)
+                close(server_sock)
+            end
+        end
     end
 end
 
 @testset "Local-machine broadcast" begin
     let a, b, c
-        # (Mac OS X's loopback interface doesn't support broadcasts)
+        # Apple does not support broadcasting on 127.255.255.255
         bcastdst = Sys.isapple() ? ip"255.255.255.255" : ip"127.255.255.255"
 
-        function create_socket()
+        function create_socket(addr::IPAddr, port)
             s = UDPSocket()
-            bind(s, ip"0.0.0.0", 2000, reuseaddr = true, enable_broadcast = true)
-            s
+            bind(s, addr, port, reuseaddr = true, enable_broadcast = true)
+            return s
         end
 
-        function wait_with_timeout(recvs)
-            TIMEOUT_VAL = 3  # seconds
-            t0 = time()
+        # Wait for futures to finish with a given timeout
+        function wait_with_timeout(recvs, TIMEOUT_VAL = 3*1e9)
+            t0 = time_ns()
             recvs_check = copy(recvs)
             while ((length(filter!(t->!istaskdone(t), recvs_check)) > 0)
-                  && (time() - t0 < TIMEOUT_VAL))
+                  && (time_ns() - t0 < TIMEOUT_VAL))
                 sleep(0.05)
             end
             length(recvs_check) > 0 && error("timeout")
-            map(Base.wait, recvs)
+            map(wait, recvs)
         end
 
-        a, b, c = [create_socket() for i = 1:3]
+        # Concurrent test runs on one host share its network namespace, so use an
+        # OS-assigned port, as fixed ports would receive each other's datagrams.
+        function create_sockets(addr::IPAddr)
+            local a = create_socket(addr, 0)
+            local port = getsockname(a)[2]
+            return a, create_socket(addr, port), create_socket(addr, port), port
+        end
+
+        # First, test IPv4 broadcast
+        a, b, c, port = create_sockets(ip"0.0.0.0")
         try
-            # bsd family do not allow broadcasting to ip"255.255.255.255"
-            # or ip"127.255.255.255"
+            # bsd family do not allow broadcasting on loopbacks
             @static if !Sys.isbsd() || Sys.isapple()
-                send(c, bcastdst, 2000, "hello")
+                send(c, bcastdst, port, "hello")
                 recvs = [@async @test String(recv(s)) == "hello" for s in (a, b)]
                 wait_with_timeout(recvs)
             end
         catch e
             if isa(e, Base.IOError) && Base.uverrorname(e.code) == "EPERM"
-                @warn "UDP broadcast test skipped (permission denied upon send, restrictive firewall?)"
+                @warn "UDP IPv4 broadcast test skipped (permission denied upon send, restrictive firewall?)"
+            elseif Sys.isapple() && isa(e, Base.IOError) && Base.uverrorname(e.code) == "EHOSTUNREACH"
+                @warn "UDP IPv4 broadcast test skipped (local network access not granted?)"
             else
                 rethrow()
             end
         end
         [close(s) for s in [a, b, c]]
+
+        # Test ipv6 broadcast groups
+        a, b, c, port = create_sockets(ip"::")
+        try
+            # Exemplary Interface-local ipv6 multicast group, if we wanted this to actually be routed
+            # to other computers, we should use a link-local or larger address scope group
+            # bsd family and darwin do not allow broadcasting on loopbacks
+            @static if !Sys.isbsd() && !Sys.isapple()
+                # Group membership is per interface, and Linux delivers a group's
+                # datagrams to every socket bound to the port while any socket on
+                # the host is a member, so a group shared with a concurrent run
+                # would still be received after leaving it. Use a random group ID, in
+                # the range RFC 3307 reserves for host-selected IDs.
+                group = IPv6(UInt128(0xff11) << 112 | rand(UInt128) >> 16 | 0x80000000)
+                join_multicast_group(a, group)
+                join_multicast_group(b, group)
+
+                send(c, group, port, "hello")
+                recvs = [@async @test String(recv(s)) == "hello" for s in (a, b)]
+                wait_with_timeout(recvs)
+
+                leave_multicast_group(a, group)
+                leave_multicast_group(b, group)
+
+                send(c, group, port, "hello")
+                recvs = [@async @test String(recv(s)) == "hello" for s in (a, b)]
+                # We only wait 200ms since we're pretty sure this is going to time out
+                @test_throws ErrorException wait_with_timeout(recvs, 2e8)
+            end
+        catch e
+            if isa(e, Base.IOError) && Base.uverrorname(e.code) == "EPERM"
+                @warn "UDP IPv6 broadcast test skipped (permission denied upon send, restrictive firewall?)"
+            else
+                rethrow()
+            end
+        end
     end
 end
 
@@ -381,12 +758,12 @@ end
     # on windows, the kernel fails to do even that
     # causing the `write` call to freeze
     # so we end up forced to do a slightly weaker test here
-    Sys.iswindows() || Base.wait(t)
+    Sys.iswindows() || wait(t)
     @test isopen(P) # without an active uv_reader, P shouldn't be closed yet
     @test !eof(P) # should already know this,
     @test isopen(P) #  so it still shouldn't have an active uv_reader
     @test readuntil(P, 'w') == "llo"
-    Sys.iswindows() && Base.wait(t)
+    Sys.iswindows() && wait(t)
     @test eof(P)
     @test !isopen(P) # eof test should have closed this by now
     close(P) # should be a no-op, just make sure
@@ -396,28 +773,21 @@ end
 
 @testset "connect!" begin
     # test the method matching connect!(::TCPSocket, ::Sockets.InetAddr{T<:Base.IPAddr})
-    let addr = Sockets.InetAddr(ip"127.0.0.1", 4444)
-        srv = listen(addr)
-        c = Condition()
-        r = @async try; close(accept(srv)); finally; notify(c); end
-        try
-            close(connect(addr))
-            fetch(c)
-        finally
-            close(srv)
-        end
+    let srv = listen(Sockets.InetAddr(ip"127.0.0.1", 0))
+        addr = Sockets.InetAddr(getsockname(srv)...)
+        r = @async close(accept(srv))
+        close(connect(addr))
         fetch(r)
+        close(srv)
     end
 
-    let addr = Sockets.InetAddr(ip"127.0.0.1", 4444)
-        srv = listen(addr)
+    let srv = listen(Sockets.InetAddr(ip"127.0.0.1", 0))
         r = @async close(srv)
         @test_throws Base._UVError("accept", Base.UV_ECONNABORTED) accept(srv)
         fetch(r)
     end
 
-    let addr = Sockets.InetAddr(ip"127.0.0.1", 4444)
-        srv = listen(addr)
+    let addr = Sockets.InetAddr(ip"192.0.2.5", 4444)
         s = Sockets.TCPSocket()
         Sockets.connect!(s, addr)
         r = @async close(s)
@@ -426,10 +796,146 @@ end
     end
 end
 
+@testset "iswritable" begin
+    let srv = listen(Sockets.InetAddr(ip"127.0.0.1", 0))
+        addr = Sockets.InetAddr(getsockname(srv)...)
+        let s = Sockets.TCPSocket()
+            Sockets.connect!(s, addr)
+            @test iswritable(s) broken=Sys.iswindows()
+            close(s)
+            @test !iswritable(s)
+        end
+        let s = Sockets.connect(addr)
+            @test iswritable(s)
+            closewrite(s)
+            @test !iswritable(s)
+            close(s)
+        end
+        close(srv)
+        srv = listen(Sockets.InetAddr(ip"127.0.0.1", 0))
+        addr = Sockets.InetAddr(getsockname(srv)...)
+        let s = Sockets.connect(addr)
+            let c = accept(srv)
+                Base.errormonitor(@async try; write(c, c); finally; close(c); end)
+            end
+            @test iswritable(s)
+            write(s, "hello world\n")
+            closewrite(s)
+            @test !iswritable(s)
+            @test isreadable(s)
+            @test read(s, String) == "hello world\n"
+            @test !isreadable(s)
+            @test !isopen(s)
+            close(s)
+        end
+        close(srv)
+    end
+end
+
+@testset "TCPSocket RawFD constructor" begin
+    if Sys.islinux()
+        let fd = ccall(:socket, Int32, (Int32, Int32, Int32),
+                       2, # AF_INET
+                       1, # SOCK_STREAM
+                       0)
+            s = Sockets.TCPSocket(RawFD(fd))
+            close(s)
+        end
+    end
+end
+
+@testset "fd() methods" begin
+    function valid_fd(x)
+        if Sys.iswindows()
+            return x isa Base.OS_HANDLE
+        elseif !Sys.iswindows()
+            value = Base.cconvert(Cint, x)
+
+            # 2048 is a bit arbitrary, it depends on the process not having too many
+            # file descriptors open. But select() has a limit of 1024 and people
+            # don't seem to hit it too often so let's hope twice that is safe.
+            return value > 0 && value < 2048
+        end
+    end
+
+    sock = TCPSocket(; delay=false)
+    @test valid_fd(fd(sock))
+
+    sock = UDPSocket()
+    bind(sock, Sockets.localhost, 0)
+    @test valid_fd(fd(sock))
+
+    server = listen(Sockets.localhost, 0)
+    @test valid_fd(fd(server))
+end
+
 @testset "TCPServer constructor" begin
     s = Sockets.TCPServer(; delay=false)
     if ccall(:jl_has_so_reuseport, Int32, ()) == 1
         @test 0 == ccall(:jl_tcp_reuseport, Int32, (Ptr{Cvoid},), s.handle)
+    end
+end
+
+@testset "show(::LibuvServer)" begin
+    _, server = listenany(ip"127.0.0.1", 11011)
+    @test occursin(r"TCPServer\(.* active\)$", sprint(show, server))
+    close(server)
+    @test occursin(r"TCPServer\(.* closed\)$", sprint(show, server))
+end
+
+@testset "getipaddrs" begin
+    @test getipaddr() in getipaddrs()
+
+    has_ipv4 = !isempty(getipaddrs(IPv4))
+    if has_ipv4
+        @test getipaddr(IPv4) in getipaddrs(IPv4)
+    else
+        @test_throws "No networking interface available" getipaddr(IPv4)
+    end
+
+    has_ipv6 = !isempty(getipaddrs(IPv6))
+    if has_ipv6
+        @test getipaddr(IPv6) in getipaddrs(IPv6)
+    else
+        @test_throws "No networking interface available" getipaddr(IPv6)
+    end
+
+    @testset "getipaddr() prefers IPv4 over IPv6" begin
+        if has_ipv4
+            @test getipaddr() isa IPv4
+        else
+            @test getipaddr() isa IPv6
+        end
+    end
+
+    @testset "including loopback addresses" begin
+        @test issubset(getipaddrs(), getipaddrs(loopback=true))
+        @test issubset(getipaddrs(IPv6), getipaddrs(IPv6, loopback=true))
+    end
+end
+
+@testset "address scope" begin
+    @test islinklocaladdr(ip"169.254.1.0")
+    @test islinklocaladdr(ip"169.254.254.255")
+    @test islinklocaladdr(ip"fe80::")
+    @test islinklocaladdr(ip"febf::")
+    @test !islinklocaladdr(ip"127.0.0.1")
+    @test !islinklocaladdr(ip"2001::")
+
+end
+
+@static if !Sys.iswindows()
+    # Issue #29234
+    @testset "TCPSocket stdin" begin
+        let srv = listen(Sockets.InetAddr(ip"127.0.0.1", 0))
+            addr = Sockets.InetAddr(getsockname(srv)...)
+            s = connect(addr)
+
+            @test success(pipeline(`$(Base.julia_cmd()) --startup-file=no -e "exit()" -i`, stdin=s))
+
+            close(s)
+            close(srv)
+        end
     end
 end
 
@@ -461,4 +967,11 @@ end
             @test getaddrinfo("localhost") isa IPAddr
         end
     end
+end
+
+
+close(sockets_watchdog_timer)
+
+@testset "Docstrings" begin
+    @test isempty(Docs.undocumented_names(Sockets))
 end

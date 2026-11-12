@@ -1,0 +1,552 @@
+// This file is a part of Julia. License is MIT: https://julialang.org/license
+
+#include <optional>
+#include <utility>
+#include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Support/Debug.h>
+#include <llvm/IR/Attributes.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/DebugLoc.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/MDBuilder.h>
+#include <llvm/Support/ModRef.h>
+
+#include "julia.h"
+
+enum AddressSpace {
+    Generic = 0,
+    Tracked = 10,
+    Derived = 11,
+    CalleeRooted = 12,
+    Loaded = 13,
+    FirstSpecial = Tracked,
+    LastSpecial = Loaded,
+};
+
+namespace JuliaType {
+    static inline llvm::StructType* get_jlvalue_ty(llvm::LLVMContext &C) {
+        return llvm::StructType::get(C);
+    }
+
+    static inline llvm::PointerType* get_pjlvalue_ty(llvm::LLVMContext &C, unsigned addressSpace=0) {
+        return llvm::PointerType::get(C, addressSpace);
+    }
+
+    static inline llvm::PointerType* get_prjlvalue_ty(llvm::LLVMContext &C) {
+        return llvm::PointerType::get(C, AddressSpace::Tracked);
+    }
+
+    static inline llvm::PointerType* get_ppjlvalue_ty(llvm::LLVMContext &C) {
+        return llvm::PointerType::get(C, 0);
+    }
+
+    static inline llvm::PointerType* get_pprjlvalue_ty(llvm::LLVMContext &C) {
+        return llvm::PointerType::get(C, 0);
+    }
+
+    static inline auto get_jlfunc_ty(llvm::LLVMContext &C) {
+        auto T_prjlvalue = get_prjlvalue_ty(C);
+        auto T_pprjlvalue = llvm::PointerType::get(C, 0);
+        return llvm::FunctionType::get(T_prjlvalue, {
+                T_prjlvalue, // function
+                T_pprjlvalue, // args[]
+                llvm::Type::getInt32Ty(C)}, // nargs
+            false);
+    }
+
+    static inline auto get_jlfunc2_ty(llvm::LLVMContext &C) {
+        auto T_prjlvalue = get_prjlvalue_ty(C);
+        auto T_pprjlvalue = llvm::PointerType::get(C, 0);
+        return llvm::FunctionType::get(T_prjlvalue, {
+                T_prjlvalue, // function
+                T_pprjlvalue, // args[]
+                llvm::Type::getInt32Ty(C), // nargs
+                T_prjlvalue}, // linfo
+            false);
+    }
+
+    static inline auto get_jlfunc3_ty(llvm::LLVMContext &C) {
+        auto T_prjlvalue = get_prjlvalue_ty(C);
+        auto T_pprjlvalue = llvm::PointerType::get(C, 0);
+        auto T = get_pjlvalue_ty(C, Derived);
+        return llvm::FunctionType::get(T_prjlvalue, {
+                T, // function
+                T_pprjlvalue, // args[]
+                llvm::Type::getInt32Ty(C)}, // nargs
+            false);
+    }
+
+    static inline auto get_jlfuncparams_ty(llvm::LLVMContext &C) {
+        auto T_prjlvalue = get_prjlvalue_ty(C);
+        auto T_pprjlvalue = llvm::PointerType::get(C, 0);
+        return llvm::FunctionType::get(T_prjlvalue, {
+                T_prjlvalue, // function
+                T_pprjlvalue, // args[]
+                llvm::Type::getInt32Ty(C), // nargs
+                T_prjlvalue}, // linfo->sparam_vals
+            false);
+    }
+
+    static inline auto get_voidfunc_ty(llvm::LLVMContext &C) {
+        return llvm::FunctionType::get(llvm::Type::getVoidTy(C), /*isVarArg*/false);
+    }
+}
+
+// Shared by codegen and passes that create write barrier declarations.
+static inline llvm::AttributeList getWriteBarrierAttributes(llvm::LLVMContext &C)
+{
+    using namespace llvm;
+    AttrBuilder FnAttrs(C);
+    // The barrier inspects the parent's and children's headers, and it must
+    // stay ordered after the store it guards: a store may not be sunk past
+    // a later safepoint (see add_fn_attrs_for_effects in codegen.cpp), and
+    // reading the slot's memory here pins the store above the barrier.
+    auto effects = MemoryEffects::inaccessibleMemOnly() | MemoryEffects::argMemOnly(ModRefInfo::Ref);
+#ifdef GC_BARRIER_SNAPSHOT
+    // Snapshot barriers read old fields, including out-of-line object storage.
+    effects |= MemoryEffects::readOnly();
+#endif
+    FnAttrs.addMemoryAttr(effects);
+    FnAttrs.addAttribute(Attribute::NoUnwind);
+    FnAttrs.addAttribute(Attribute::NoRecurse);
+    AttrBuilder ParentAttrs(C);
+    ParentAttrs.addAttribute(Attribute::ReadOnly);
+    return AttributeList::get(C, AttributeSet::get(C, FnAttrs), AttributeSet(),
+                             {AttributeSet::get(C, ParentAttrs)});
+}
+
+// return how many Tracked pointers are in T (count > 0),
+// and if there is anything else in T (all == false)
+struct CountTrackedPointers {
+    unsigned count = 0;
+    bool all = true;
+    bool derived = false;
+    CountTrackedPointers(llvm::Type *T, bool ignore_loaded=false);
+};
+
+llvm::SmallVector<llvm::SmallVector<unsigned, 0>, 0> TrackCompositeType(llvm::Type *T);
+
+static inline void llvm_dump(llvm::Value *v)
+{
+    v->print(llvm::dbgs(), true);
+    llvm::dbgs() << "\n";
+}
+
+static inline void llvm_dump(llvm::Type *v)
+{
+    v->print(llvm::dbgs(), true);
+    llvm::dbgs() << "\n";
+}
+
+static inline void llvm_dump(llvm::Function *f)
+{
+    f->print(llvm::dbgs(), nullptr, false, true);
+}
+
+static inline void llvm_dump(llvm::Module *m)
+{
+    m->print(llvm::dbgs(), nullptr);
+}
+
+static inline void llvm_dump(llvm::Metadata *m)
+{
+    m->print(llvm::dbgs());
+    llvm::dbgs() << "\n";
+}
+
+static inline void llvm_dump(llvm::DebugLoc *dbg)
+{
+    dbg->print(llvm::dbgs());
+    llvm::dbgs() << "\n";
+}
+
+static inline std::pair<llvm::MDNode*,llvm::MDNode*> tbaa_make_child_with_context(llvm::LLVMContext &ctxt, const char *name, llvm::MDNode *parent=nullptr, bool isConstant=false)
+{
+    llvm::MDBuilder mbuilder(ctxt);
+    llvm::MDNode *jtbaa = mbuilder.createTBAARoot("jtbaa");
+    llvm::MDNode *tbaa_root = mbuilder.createTBAAScalarTypeNode("jtbaa", jtbaa);
+    llvm::MDNode *scalar = mbuilder.createTBAAScalarTypeNode(name, parent ? parent : tbaa_root);
+    llvm::MDNode *n = mbuilder.createTBAAStructTagNode(scalar, scalar, 0, isConstant);
+    return std::make_pair(n, scalar);
+}
+
+static inline llvm::MDNode *get_tbaa_const(llvm::LLVMContext &ctxt) {
+    return tbaa_make_child_with_context(ctxt, "jtbaa_const", nullptr, true).first;
+}
+
+static inline llvm::Instruction *tbaa_decorate(llvm::MDNode *md, llvm::Instruction *inst)
+{
+    using namespace llvm;
+    inst->setMetadata(llvm::LLVMContext::MD_tbaa, md);
+    if (llvm::isa<llvm::LoadInst>(inst) && md && md == get_tbaa_const(md->getContext())) {
+        inst->setMetadata(llvm::LLVMContext::MD_invariant_load, llvm::MDNode::get(md->getContext(), {}));
+    }
+    return inst;
+}
+
+// Whether the tag `TBAA`, or any of its ancestors up to the `jtbaa` root, has a
+// name in `strset`.
+static inline bool isTBAA(llvm::MDNode *TBAA, std::initializer_list<const char*> const strset)
+{
+    if (!TBAA)
+        return false;
+    while (TBAA->getNumOperands() > 1) {
+        TBAA = llvm::cast<llvm::MDNode>(TBAA->getOperand(1).get());
+        auto str = llvm::cast<llvm::MDString>(TBAA->getOperand(0))->getString();
+        for (auto str2 : strset) {
+            if (str == str2) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The '!alias.scope' domain naming which of codegen's memory regions an access may touch.
+#define JL_REGION_DOMAIN_NAME "jnoalias"
+
+// The regions in whose domain a base object cannot stop referencing a tracked
+// pointer stored in them while the base is live.
+static inline bool isRootedRegionName(llvm::StringRef name)
+{
+    return name == "jnoalias_immutdata" || name == "jnoalias_mutconstdata";
+}
+
+// Whether the object rooting the address `LI` loads from also roots the loaded value
+// -- so that late-gc-lowering may refine the loaded pointer to the load's pointer
+// operand instead of giving it a gc-frame slot of its own.
+//
+// This asks whether the slot is ever overwritten, so that what the base references
+// here is fixed for as long as it lives. The region records that ('!alias.scope'), the
+// access tag ('!tbaa') does not. A load qualifies if its scopes in the
+// region domain are nonempty and all rooted.
+static inline bool isLoadFromRootedRegion(llvm::LoadInst *LI)
+{
+    using namespace llvm;
+    // Constant memory never changes, so the base can never stop referencing what is
+    // stored here, wherever it lives. This is also the only leg that fires on foreign
+    // IR carrying no region metadata.
+    if (LI->getMetadata(LLVMContext::MD_invariant_load))
+        return true;
+    MDNode *scopes = LI->getMetadata(LLVMContext::MD_alias_scope);
+    if (!scopes)
+        return false;
+    bool found = false;
+    for (const MDOperand &op : scopes->operands()) {
+        MDNode *scope = dyn_cast_or_null<MDNode>(op.get());
+        if (!scope)
+            continue;
+        AliasScopeNode snode(scope);
+        const MDNode *domain = snode.getDomain();
+        if (!domain || domain->getNumOperands() < 1)
+            continue;
+        MDString *domain_name = dyn_cast<MDString>(domain->getOperand(0));
+        if (!domain_name || domain_name->getString() != JL_REGION_DOMAIN_NAME)
+            continue;
+        // A scope is named either by its string key in operand 0 ({name, domain})
+        // or, when a self-reference keys it, by a trailing name operand
+        // ({self, domain, name}); AliasScopeNode reads the latter.
+        StringRef name = snode.getName();
+        if (name.empty())
+            if (MDString *key = dyn_cast<MDString>(scope->getOperand(0)))
+                name = key->getString();
+        if (name.empty() || !isRootedRegionName(name))
+            return false; // may reside in a region that can drop the reference
+        found = true;
+    }
+    return found;
+}
+
+static inline bool isConstGV(llvm::GlobalVariable *gv)
+{
+    return gv->isConstant() || gv->getMetadata("julia.constgv");
+}
+
+// Get PTLS through current task.
+static inline llvm::Value *get_current_task_from_pgcstack(llvm::IRBuilder<> &builder, llvm::Value *pgcstack)
+{
+    using namespace llvm;
+    auto i8 = builder.getInt8Ty();
+    const int pgcstack_offset = offsetof(jl_task_t, gcstack);
+    return builder.CreateConstInBoundsGEP1_32(i8, pgcstack, -pgcstack_offset, "current_task");
+}
+
+// Get PTLS through current task.
+static inline llvm::Value *get_current_ptls_from_task(llvm::IRBuilder<> &builder, llvm::Value *current_task, llvm::MDNode *tbaa)
+{
+    using namespace llvm;
+    auto i8 = builder.getInt8Ty();
+    auto T_ptr = builder.getPtrTy();
+    const int ptls_offset = offsetof(jl_task_t, ptls);
+    llvm::Value *pptls = builder.CreateConstInBoundsGEP1_32(i8, current_task, ptls_offset, "ptls_field");
+    LoadInst *ptls_load = builder.CreateAlignedLoad(T_ptr, pptls, Align(sizeof(void *)), "ptls_load");
+    // Note: Corresponding store (`t->ptls = ptls`) happens in `ctx_switch` of tasks.c.
+    tbaa_decorate(tbaa, ptls_load);
+    return ptls_load;
+}
+
+// Get signal page through current task.
+static inline llvm::Value *get_current_signal_page_from_ptls(llvm::IRBuilder<> &builder, llvm::Value *ptls, llvm::MDNode *tbaa)
+{
+    using namespace llvm;
+    // return builder.CreateCall(prepare_call(reuse_signal_page_func));
+    auto T_ptr = builder.getPtrTy();
+    auto i8 = builder.getInt8Ty();
+    int nthfield = offsetof(jl_tls_states_t, safepoint);
+    llvm::Value *psafepoint = builder.CreateConstInBoundsGEP1_32(i8, ptls, nthfield, "safepoint_addr");
+    LoadInst *ptls_load = builder.CreateAlignedLoad(
+            T_ptr, psafepoint, Align(sizeof(void *)), "safepoint");
+    ptls_load->setOrdering(AtomicOrdering::Monotonic);
+    tbaa_decorate(tbaa, ptls_load);
+    return ptls_load;
+}
+
+static inline void emit_signal_fence(llvm::IRBuilder<> &builder)
+{
+    using namespace llvm;
+    builder.CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
+}
+
+static inline void emit_gc_safepoint(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, llvm::MDNode *tbaa, bool final = false)
+{
+    using namespace llvm;
+    llvm::Value *signal_page = get_current_signal_page_from_ptls(builder, ptls, tbaa);
+    emit_signal_fence(builder);
+    Module *M = builder.GetInsertBlock()->getModule();
+    LLVMContext &C = builder.getContext();
+    // inline jlsafepoint_func->realize(M)
+    if (final) {
+        builder.CreateLoad(T_size, signal_page, true);
+    }
+    else {
+        Function *F = M->getFunction("julia.safepoint");
+        if (!F) {
+            FunctionType *FT = FunctionType::get(Type::getVoidTy(C), {PointerType::getUnqual(T_size->getContext())}, false);
+            F = Function::Create(FT, Function::ExternalLinkage, "julia.safepoint", M);
+            F->setMemoryEffects(MemoryEffects::inaccessibleOrArgMemOnly());
+        }
+        builder.CreateCall(F, {signal_page});
+    }
+    emit_signal_fence(builder);
+}
+
+static inline llvm::Value *emit_gc_state_set(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, llvm::Value *state, llvm::Value *old_state, bool final)
+{
+    using namespace llvm;
+    Type *T_int8 = state->getType();
+    unsigned offset = offsetof(jl_tls_states_t, gc_state);
+    Value *gc_state = builder.CreateConstInBoundsGEP1_32(T_int8, ptls, offset, "gc_state");
+    if (old_state == nullptr) {
+        old_state = builder.CreateLoad(T_int8, gc_state, "old_state");
+        cast<LoadInst>(old_state)->setOrdering(AtomicOrdering::Monotonic);
+    }
+    builder.CreateAlignedStore(state, gc_state, Align(sizeof(void*)))->setOrdering(AtomicOrdering::Release);
+    if (auto *C = dyn_cast<ConstantInt>(old_state))
+        if (auto *C2 = dyn_cast<ConstantInt>(state))
+            if (C->getZExtValue() == C2->getZExtValue())
+                return old_state;
+    BasicBlock *passBB = BasicBlock::Create(builder.getContext(), "safepoint", builder.GetInsertBlock()->getParent());
+    BasicBlock *exitBB = BasicBlock::Create(builder.getContext(), "after_safepoint", builder.GetInsertBlock()->getParent());
+    builder.CreateCondBr(builder.CreateICmpNE(old_state, state, "is_new_state"), // Safepoint whenever we change the GC state
+                         passBB, exitBB);
+    builder.SetInsertPoint(passBB);
+    MDNode *tbaa = get_tbaa_const(builder.getContext());
+    emit_gc_safepoint(builder, T_size, ptls, tbaa, final);
+    builder.CreateBr(exitBB);
+    builder.SetInsertPoint(exitBB);
+    return old_state;
+}
+
+static inline llvm::Value *emit_gc_unsafe_enter(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, bool final)
+{
+    using namespace llvm;
+    Value *state = builder.getInt8(0);
+    return emit_gc_state_set(builder, T_size, ptls, state, nullptr, final);
+}
+
+static inline llvm::Value *emit_gc_unsafe_leave(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, llvm::Value *state, bool final)
+{
+    using namespace llvm;
+    Value *old_state = builder.getInt8(JL_GC_STATE_UNSAFE);
+    return emit_gc_state_set(builder, T_size, ptls, state, old_state, final);
+}
+
+static inline llvm::Value *emit_gc_safe_enter(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, bool final)
+{
+    using namespace llvm;
+    Value *state = builder.getInt8(JL_GC_STATE_SAFE);
+    return emit_gc_state_set(builder, T_size, ptls, state, nullptr, final);
+}
+
+static inline llvm::Value *emit_gc_safe_leave(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, llvm::Value *state, bool final)
+{
+    using namespace llvm;
+    Value *old_state = builder.getInt8(JL_GC_STATE_SAFE);
+    return emit_gc_state_set(builder, T_size, ptls, state, old_state, final);
+}
+
+namespace {
+using namespace llvm;
+
+// Iterate through uses of a particular type.
+// Recursively scan through `ConstantExpr` and `ConstantAggregate` use.
+template<typename U>
+struct ConstantUses {
+    template<typename T>
+    struct Info {
+        llvm::Use *use;
+        T *val;
+        // If `samebits == true`, the offset the original value appears in the constant.
+        size_t offset;
+        // This specify whether the original value appears in the current value in exactly
+        // the same bit pattern (with possibly an offset determined by `offset`).
+        bool samebits;
+        Info(llvm::Use *use, T *val, size_t offset, bool samebits) :
+            use(use),
+            val(val),
+            offset(offset),
+            samebits(samebits)
+        {
+        }
+        Info(llvm::Use *use, size_t offset, bool samebits) :
+            use(use),
+            val(cast<T>(use->getUser())),
+            offset(offset),
+            samebits(samebits)
+        {
+        }
+    };
+    using UseInfo = Info<U>;
+    struct Frame : Info<llvm::Constant> {
+        template<typename... Args>
+        Frame(Args &&... args) :
+            Info<llvm::Constant>(std::forward<Args>(args)...),
+            cur(this->val->use_empty() ? nullptr : &*this->val->use_begin()),
+            _next(cur ? cur->getNext() : nullptr)
+        {
+        }
+    private:
+        void next()
+        {
+            cur = _next;
+            if (!cur)
+                return;
+            _next = cur->getNext();
+        }
+        llvm::Use *cur;
+        llvm::Use *_next;
+        friend struct ConstantUses;
+    };
+    ConstantUses(llvm::Constant *c, llvm::Module &M)
+        : stack{Frame(nullptr, c, 0u, true)},
+          M(M)
+    {
+        forward();
+    }
+    UseInfo get_info() const
+    {
+        auto &top = stack.back();
+        return UseInfo(top.cur, top.offset, top.samebits);
+    }
+    const auto &get_stack() const
+    {
+        return stack;
+    }
+    void next()
+    {
+        stack.back().next();
+        forward();
+    }
+    bool done()
+    {
+        return stack.empty();
+    }
+private:
+    void forward();
+    llvm::SmallVector<Frame, 4> stack;
+    llvm::Module &M;
+};
+
+template<typename U>
+void ConstantUses<U>::forward()
+{
+    assert(!stack.empty());
+    auto frame = &stack.back();
+    const auto &DL = M.getDataLayout();
+    auto pop = [&] {
+        stack.pop_back();
+        if (stack.empty()) {
+            return false;
+        }
+        frame = &stack.back();
+        return true;
+    };
+    auto push = [&] (llvm::Use *use, llvm::Constant *c, size_t offset, bool samebits) {
+        stack.emplace_back(use, c, offset, samebits);
+        frame = &stack.back();
+    };
+    auto handle_constaggr = [&] (llvm::Use *use, llvm::ConstantAggregate *aggr) {
+        if (!frame->samebits) {
+            push(use, aggr, 0, false);
+            return;
+        }
+        if (auto strct = dyn_cast<llvm::ConstantStruct>(aggr)) {
+            auto layout = DL.getStructLayout(strct->getType());
+            push(use, strct, frame->offset + layout->getElementOffset(use->getOperandNo()), true);
+        }
+        else if (auto ary = dyn_cast<llvm::ConstantArray>(aggr)) {
+            auto elty = ary->getType()->getElementType();
+            push(use, ary, frame->offset + DL.getTypeAllocSize(elty) * use->getOperandNo(), true);
+        }
+        else if (auto vec = dyn_cast<llvm::ConstantVector>(aggr)) {
+            auto elty = vec->getType()->getElementType();
+            push(use, vec, frame->offset + DL.getTypeAllocSize(elty) * use->getOperandNo(), true);
+        }
+        else {
+            abort();
+        }
+    };
+    auto handle_constexpr = [&] (llvm::Use *use, llvm::ConstantExpr *expr) {
+        if (!frame->samebits) {
+            push(use, expr, 0, false);
+            return;
+        }
+        auto opcode = expr->getOpcode();
+        if (opcode == llvm::Instruction::PtrToInt || opcode == llvm::Instruction::IntToPtr ||
+            opcode == llvm::Instruction::AddrSpaceCast || opcode == llvm::Instruction::BitCast) {
+            push(use, expr, frame->offset, true);
+        }
+        else {
+            push(use, expr, 0, false);
+        }
+    };
+    while (true) {
+        auto use = frame->cur;
+        if (!use) {
+            if (!pop())
+                return;
+            continue;
+        }
+        auto user = use->getUser();
+        if (isa<U>(user))
+            return;
+        frame->next();
+        if (auto aggr = dyn_cast<llvm::ConstantAggregate>(user)) {
+            handle_constaggr(use, aggr);
+        }
+        else if (auto expr = dyn_cast<llvm::ConstantExpr>(user)) {
+            handle_constexpr(use, expr);
+        }
+    }
+}
+}
+
+
+void multiversioning_preannotate(llvm::Module &M);
+std::optional<bool> always_have_fma(Function&, const Triple &TT) JL_NOTSAFEPOINT;
+
+namespace llvm::jitlink {
+    class JITLinkMemoryManager;
+}
+std::unique_ptr<jitlink::JITLinkMemoryManager> createJITLinkMemoryManager() JL_NOTSAFEPOINT;

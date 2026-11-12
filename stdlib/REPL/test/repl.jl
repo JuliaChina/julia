@@ -3,10 +3,15 @@
 using Test
 using REPL
 using Random
+using Logging
 import REPL.LineEdit
 using Markdown
 
-const BASE_TEST_PATH = joinpath(Sys.BINDIR, "..", "share", "julia", "test")
+empty!(Base.Experimental._hint_handlers) # unregister error hints so they can be tested separately
+
+@test Base.REPL_MODULE_REF[] === REPL
+
+const BASE_TEST_PATH = joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "test")
 isdefined(Main, :FakePTYs) || @eval Main include(joinpath($(BASE_TEST_PATH), "testhelpers", "FakePTYs.jl"))
 import .Main.FakePTYs: with_fake_pty
 
@@ -16,26 +21,49 @@ include(joinpath(BASE_TEST_PATH, "testenv.jl"))
 include("FakeTerminals.jl")
 import .FakeTerminals.FakeTerminal
 
-
-function kill_timer(delay)
-    # Give ourselves a generous timer here, just to prevent
-    # this causing e.g. a CI hang when there's something unexpected in the output.
-    # This is really messy and leaves the process in an undefined state.
-    # the proper and correct way to do this in real code would be to destroy the
-    # IO handles: `close(stdout_read); close(stdin_write)`
-    test_task = current_task()
+# Fail instead of hanging on unexpected output: on expiry, close `ios` so blocked reads
+# return EOF. (Throwing into the test task does not work: an enclosing `@test` catches it.)
+# Callers test `isopen` on the timer before closing it, so an expired timer fails the test.
+function kill_timer(delay, ios...)
     function kill_test(t)
-        # **DON'T COPY ME.**
-        # The correct way to handle timeouts is to close the handle:
-        # e.g. `close(stdout_read); close(stdin_write)`
-        schedule(test_task, "hard kill repl test"; error=true)
-        print(stderr, "WARNING: attempting hard kill of repl test after exceeding timeout\n")
+        print(stderr, "WARNING: closing the IO of the repl test after exceeding timeout\n")
+        foreach(close, ios)
     end
     return Timer(kill_test, delay)
 end
 
+## Debugging toys. Usage:
+##   stdout_read = tee_repr_stdout(stdout_read)
+##   ccall(:jl_breakpoint, Cvoid, (Any,), stdout_read)
+#function tee(f, in::IO)
+#    copy = Base.BufferStream()
+#    t = @async try
+#        while !eof(in)
+#            l = readavailable(in)
+#            f(l)
+#            write(copy, l)
+#        end
+#    catch ex
+#        if !(ex isa Base.IOError && ex.code == Base.UV_EIO)
+#            rethrow() # ignore EIO on `in` stream
+#        end
+#    finally
+#        # TODO: could we call closewrite to propagate an error, instead of always doing a clean close here?
+#        closewrite(copy)
+#    end
+#    Base.errormonitor(t)
+#    return copy
+#end
+#tee(out::IO, in::IO) = tee(l -> write(out, l), in)
+#tee_repr_stdout(io) = tee(io) do x
+#    print(repr(String(copy(x))) * "\n")
+#end
+
 # REPL tests
-function fake_repl(@nospecialize(f); options::REPL.Options=REPL.Options(confirm_exit=false))
+function fake_repl(@nospecialize(f);
+        options::REPL.Options=REPL.Options(confirm_exit=false, style_input=false,
+            auto_insert_closing_bracket=false),
+        semantic_prompts::Bool=false)
     # Use pipes so we can easily do blocking reads
     # In the future if we want we can add a test that the right object
     # gets displayed by intercepting the display
@@ -46,10 +74,11 @@ function fake_repl(@nospecialize(f); options::REPL.Options=REPL.Options(confirm_
     Base.link_pipe!(output, reader_supports_async=true, writer_supports_async=true)
     Base.link_pipe!(err, reader_supports_async=true, writer_supports_async=true)
 
-    repl = REPL.LineEditREPL(FakeTerminal(input.out, output.in, err.in), true)
+    repl = REPL.LineEditREPL(FakeTerminal(input.out, output.in, err.in, options.hascolor), options.hascolor)
     repl.options = options
+    repl.options.semantic_prompts = semantic_prompts
 
-    hard_kill = kill_timer(900) # Your debugging session starts now. You have 15 minutes. Go.
+    hard_kill = kill_timer(900, input, output, err) # Your debugging session starts now. You have 15 minutes. Go.
     f(input.in, output.out, repl)
     t = @async begin
         close(input.in)
@@ -59,19 +88,147 @@ function fake_repl(@nospecialize(f); options::REPL.Options=REPL.Options(confirm_
     @test read(err.out, String) == ""
     #display(read(output.out, String))
     Base.wait(t)
+    @test isopen(hard_kill) # not fired
     close(hard_kill)
     nothing
 end
 
+# Semantic prompt markers delimit prompt input and output and report evaluation status.
+@test REPL.Options().semantic_prompts
+@test REPL.serialize_vscode_osc_message("a b;c\\d\nα") ==
+    "a\\x20b\\x3bc\\\\d\\x0aα"
+withenv("TERM_PROGRAM" => "") do
+    fake_repl(semantic_prompts=true) do stdin_write, stdout_read, repl
+        markers = REPL.OSC_133_MARKERS
+        repl.specialdisplay = REPL.REPLDisplay(repl)
+        repl.history_file = false
+        repltask = @async REPL.run_repl(repl)
+
+        prompt = readuntil(stdout_read, markers.prompt_end, keep=true)
+        @test occursin(markers.prompt_start, prompt)
+
+        write(stdin_write, "\"semantic output\"\n")
+        response = readuntil(stdout_read, markers.command_finish_ok, keep=true)
+        @test occursin(markers.command_start * "\"semantic output\"", response)
+        readuntil(stdout_read, markers.prompt_end)
+
+        write(stdin_write, "error(\"semantic failure\")\n")
+        response = readuntil(stdout_read, markers.command_finish_error, keep=true)
+        @test occursin(markers.command_start, response)
+        @test occursin("semantic failure", response)
+        readuntil(stdout_read, markers.prompt_end)
+
+        write(stdin_write, '\n')
+        readuntil(stdout_read, markers.command_finish)
+        readuntil(stdout_read, markers.prompt_end)
+
+        # A prompt without an associated REPL emits neither prompt nor command markers.
+        julia_prompt = repl.interface.modes[1]::LineEdit.Prompt
+        julia_prompt.repl = nothing
+        write(stdin_write, "1 + 1\n")
+        response = readuntil(stdout_read, "julia> ", keep=true)
+        @test !occursin("\e]133;", response)
+        julia_prompt.repl = repl
+
+        write(stdin_write, '\x04')
+        readuntil(stdout_read, markers.command_finish)
+        Base.wait(repltask)
+    end
+end
+
+withenv("TERM_PROGRAM" => "vscode") do
+    fake_repl(semantic_prompts=true) do stdin_write, stdout_read, repl
+        markers = REPL.OSC_633_MARKERS
+        # The terminal protocol is selected once when the REPL is constructed.
+        withenv("TERM_PROGRAM" => "") do
+            repl.specialdisplay = REPL.REPLDisplay(repl)
+            repl.history_file = false
+            repltask = @async REPL.run_repl(repl)
+
+            prompt = readuntil(stdout_read, markers.prompt_end, keep=true)
+            @test occursin(markers.prompt_start, prompt)
+
+            write(stdin_write, "2 + 2\n")
+            response = readuntil(stdout_read, markers.command_finish_ok, keep=true)
+            command_line = markers.command_line * "2\\x20+\\x202\a"
+            @test occursin(markers.command_start * "4", response)
+            @test occursin(command_line * markers.command_finish_ok, response)
+            @test !occursin("\e]133;", response)
+            readuntil(stdout_read, markers.prompt_end)
+
+            write(stdin_write, '\x04')
+            readuntil(stdout_read, markers.command_finish)
+            Base.wait(repltask)
+        end
+    end
+end
+
 # Writing ^C to the repl will cause sigint, so let's not die on that
-ccall(:jl_exit_on_sigint, Cvoid, (Cint,), 0)
-# These are integration tests. If you want to unit test test e.g. completion, or
+Base.exit_on_sigint(false)
+
+# make sure `run_interface` can normally handle `eof`
+# without any special handling by the user
+fake_repl() do stdin_write, stdout_read, repl
+    panel = LineEdit.Prompt("test";
+        prompt_prefix = "",
+        prompt_suffix = Base.text_colors[:white],
+        on_enter = s -> true)
+    panel.on_done = (s, buf, ok) -> begin
+        @test !ok
+        @test bytesavailable(buf) == position(buf) == 0
+        nothing
+    end
+    repltask = @async REPL.run_interface(repl.t, LineEdit.ModalInterface(Any[panel]))
+    close(stdin_write)
+    Base.wait(repltask)
+end
+
+
+# Pressing ^C twice in a row at an empty prompt cancels every task that earlier
+# REPL inputs started and that is still running (issue #47839, see
+# `Base.cancel_session_work!`). The first press only prints a hint. Any other
+# input in between resets this, so the next ^C counts as a first press again.
+#
+# In fake_repl, `stdout_read` only receives what the REPL itself prints: the
+# echo of the typed input, the prompts, and the displayed results. A `println`
+# in an evaluated expression goes to the process stdout instead. So each step
+# below evaluates an expression and waits for its displayed result. The results
+# are written as concatenations such as `"BG" * "UP"` so that the awaited text
+# occurs only in the result and not in the echo of the input.
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async REPL.run_repl(repl)
+    # start a background task that never finishes on its own
+    write(stdin_write, "global bg = @async while true; sleep(0.01); end; \"BG\" * \"UP\"\n")
+    readuntil(stdout_read, "BGUP")
+    readuntil(stdout_read, "julia> ")
+    # the first ^C at the empty prompt only prints a hint
+    write(stdin_write, "\x03")
+    readuntil(stdout_read, "press ^C again to cancel all in-flight work")
+    # entering anything else resets that, so this ^C again only prints the hint
+    write(stdin_write, "\"un\" * \"related\"\n")
+    readuntil(stdout_read, "unrelated")
+    write(stdin_write, "\x03")
+    readuntil(stdout_read, "press ^C again to cancel all in-flight work")
+    # a second ^C directly after it cancels the running tasks
+    write(stdin_write, "\x03")
+    readuntil(stdout_read, "Cancelled all in-flight work.")
+    # the background task was cancelled ...
+    write(stdin_write, "\"done=\" * string(timedwait(() -> istaskdone(bg), 30.0) === :ok)\n")
+    readuntil(stdout_read, "done=true")
+    # ... and the REPL still evaluates new input afterwards
+    write(stdin_write, "\"still\" * \"-alive\"\n")
+    readuntil(stdout_read, "still-alive")
+    write(stdin_write, '\x04') # ^D exits the REPL loop, not the process
+    Base.wait(repltask)
+end
+
+# These are integration tests. If you want to unit test e.g. completion, or
 # exact LineEdit behavior, put them in the appropriate test files.
 # Furthermore since we are emulating an entire terminal, there may be control characters
 # in the mix. If verification needs to be done, keep it to the bare minimum. Basically
 # this should make sure nothing crashes without depending on how exactly the control
 # characters are being used.
-fake_repl() do stdin_write, stdout_read, repl
+fake_repl(options = REPL.Options(confirm_exit=false,hascolor=true,style_input=false,auto_insert_closing_bracket=false)) do stdin_write, stdout_read, repl
     repl.specialdisplay = REPL.REPLDisplay(repl)
     repl.history_file = false
 
@@ -80,16 +237,28 @@ fake_repl() do stdin_write, stdout_read, repl
     end
 
     global inc = false
-    global b = Condition()
-    global c = Condition()
+    global b = Base.Event(true)
+    global c = Base.Event(true)
     let cmd = "\"Hello REPL\""
         write(stdin_write, "$(curmod_prefix)inc || wait($(curmod_prefix)b); r = $cmd; notify($(curmod_prefix)c); r\r")
     end
-    inc = true
-    notify(b)
-    wait(c)
+    let t = @async begin
+            inc = true
+            notify(b)
+            wait(c)
+        end
+        while (d = readline(stdout_read)) != ""
+            # first line [optional]: until 80th char of input
+            # second line: until end of input
+            # third line: "Hello REPL"
+            # last line: blank
+            # last+1 line: next prompt
+        end
+        wait(t)
+    end
 
     # Latex completions
+    readuntil(stdout_read, "julia> ", keep=true)
     write(stdin_write, "\x32\\alpha\t")
     readuntil(stdout_read, "α")
     # Bracketed paste in search mode
@@ -106,45 +275,58 @@ fake_repl() do stdin_write, stdout_read, repl
     # Test cd feature in shell mode.
     origpwd = pwd()
     mktempdir() do tmpdir
-        # Test `cd`'ing to an absolute path
-        write(stdin_write, ";")
-        readuntil(stdout_read, "shell> ")
-        write(stdin_write, "cd $(escape_string(tmpdir))\n")
-        readuntil(stdout_read, "cd $(escape_string(tmpdir))")
-        readuntil(stdout_read, realpath(tmpdir))
-        readuntil(stdout_read, "\n")
-        readuntil(stdout_read, "\n")
-        @test pwd() == realpath(tmpdir)
+        try
+            samefile = Base.Filesystem.samefile
+            tmpdir_pwd = cd(pwd, tmpdir)
+            homedir_pwd = cd(pwd, homedir())
 
-        # Test using `cd` to move to the home directory
-        write(stdin_write, ";")
-        readuntil(stdout_read, "shell> ")
-        write(stdin_write, "cd\n")
-        readuntil(stdout_read, realpath(homedir()))
-        readuntil(stdout_read, "\n")
-        readuntil(stdout_read, "\n")
-        @test pwd() == realpath(homedir())
-
-        # Test using `-` to jump backward to tmpdir
-        write(stdin_write, ";")
-        readuntil(stdout_read, "shell> ")
-        write(stdin_write, "cd -\n")
-        readuntil(stdout_read, tmpdir)
-        readuntil(stdout_read, "\n")
-        readuntil(stdout_read, "\n")
-        @test pwd() == realpath(tmpdir)
-
-        # Test using `~` in `cd` commands
-        if !Sys.iswindows()
-            write(stdin_write, ";")
+            # Test `cd`'ing to an absolute path
+            t = @async write(stdin_write, ";")
             readuntil(stdout_read, "shell> ")
-            write(stdin_write, "cd ~\n")
-            readuntil(stdout_read, realpath(homedir()))
-            readuntil(stdout_read, "\n")
-            readuntil(stdout_read, "\n")
-            @test pwd() == realpath(homedir())
+            wait(t)
+            t = @async write(stdin_write, "cd $(escape_string(tmpdir))\n")
+            readuntil(stdout_read, "cd $(escape_string(tmpdir))")
+            readuntil(stdout_read, tmpdir_pwd * "\n\n")
+            wait(t)
+            @test samefile(".", tmpdir)
+            write(stdin_write, "\b")
+
+            # Test using `cd` to move to the home directory
+            t = @async write(stdin_write, ";")
+            readuntil(stdout_read, "shell> ")
+            wait(t)
+            t = @async write(stdin_write, "cd\n")
+            readuntil(stdout_read, homedir_pwd * "\n\n")
+            wait(t)
+            @test samefile(".", homedir_pwd)
+            t1 = @async write(stdin_write, "\b")
+
+            # Test using `-` to jump backward to tmpdir
+            t = @async write(stdin_write, ";")
+            readuntil(stdout_read, "shell> ")
+            wait(t1)
+            wait(t)
+            t = @async write(stdin_write, "cd -\n")
+            readuntil(stdout_read, tmpdir_pwd * "\n\n")
+            wait(t)
+            @test samefile(".", tmpdir)
+            t1 = @async write(stdin_write, "\b")
+
+            # Test using `~` (Base.expanduser) in `cd` commands
+            if !Sys.iswindows()
+                t = @async write(stdin_write, ";")
+                readuntil(stdout_read, "shell> ")
+                wait(t1)
+                wait(t)
+                t = @async write(stdin_write, "cd ~\n")
+                readuntil(stdout_read, homedir_pwd * "\n\n")
+                wait(t)
+                @test samefile(".", homedir_pwd)
+                write(stdin_write, "\b")
+            end
+        finally
+            cd(origpwd)
         end
-        cd(origpwd)
     end
 
     # issue #20482
@@ -161,38 +343,44 @@ fake_repl() do stdin_write, stdout_read, repl
 
     # issue #20771
     let s
-        write(stdin_write, ";")
+        t = @async write(stdin_write, ";")
         readuntil(stdout_read, "shell> ")
-        write(stdin_write, "'\n") # invalid input
+        wait(t)
+        t = @async write(stdin_write, "'\n") # invalid input
         s = readuntil(stdout_read, "\n")
         @test occursin("shell> ", s) # check for the echo of the prompt
         @test occursin("'", s) # check for the echo of the input
         s = readuntil(stdout_read, "\n\n")
-        @test startswith(s, "\e[0mERROR: unterminated single quote\nStacktrace:\n [1] ") ||
-              startswith(s, "\e[0m\e[1m\e[91mERROR: \e[39m\e[22m\e[91munterminated single quote\e[39m\nStacktrace:\n [1] ")
+        @test(startswith(s, "\e[0mERROR: unterminated single quote\nStacktrace:\n [1] ") ||
+            startswith(s, "\e[0m\e[1m\e[91mERROR: \e[39m\e[22m\e[91munterminated single quote\e[39m\nStacktrace:\n [1] "),
+            skip = Sys.iswindows() && Sys.WORD_SIZE == 32)
+        write(stdin_write, "\b")
+        wait(t)
     end
 
     # issue #27293
     if Sys.isunix()
         let s, old_stdout = stdout
-            write(stdin_write, ";")
+            t = @async write(stdin_write, ";")
             readuntil(stdout_read, "shell> ")
-            write(stdin_write, "echo ~")
-            s = readuntil(stdout_read, "~")
+            wait(t)
 
             proc_stdout_read, proc_stdout = redirect_stdout()
             get_stdout = @async read(proc_stdout_read, String)
             try
-                write(stdin_write, "\n")
+                t = @async write(stdin_write, "echo ~\n")
+                readuntil(stdout_read, "~")
                 readuntil(stdout_read, "\n")
-                s = readuntil(stdout_read, "\n")
+                s = readuntil(stdout_read, "\n") # the child has exited
+                wait(t)
             finally
                 redirect_stdout(old_stdout)
             end
-            @test s == "\e[0m" # the child has exited
+            @test s == "\e[0m"
             close(proc_stdout)
             # check for the correct, expanded response
             @test occursin(expanduser("~"), fetch(get_stdout))
+            write(stdin_write, "\b")
         end
     end
 
@@ -217,33 +405,39 @@ fake_repl() do stdin_write, stdout_read, repl
     # issue #10120
     # ensure that command quoting works correctly
     let s, old_stdout = stdout
-        write(stdin_write, ";")
+        t = @async write(stdin_write, ";")
         readuntil(stdout_read, "shell> ")
-        Base.print_shell_escaped(stdin_write, Base.julia_cmd().exec..., special=Base.shell_special)
-        write(stdin_write, """ -e "println(\\"HI\\")\"""")
+        wait(t)
+        t = @async begin
+            Base.print_shell_escaped(stdin_write, Base.julia_cmd().exec..., special=Base.shell_special)
+            write(stdin_write, """ -e "println(\\"HI\\")\"""")
+        end
         readuntil(stdout_read, ")\"")
+        wait(t)
         proc_stdout_read, proc_stdout = redirect_stdout()
         get_stdout = @async read(proc_stdout_read, String)
         try
-            write(stdin_write, '\n')
-            s = readuntil(stdout_read, "\n", keep=true)
-            if s == "\n"
+            t = @async write(stdin_write, '\n')
+            s = readuntil(stdout_read, "\n")
+            if s == ""
                 # if shell width is precisely the text width,
                 # we may print some extra characters to fix the cursor state
-                s = readuntil(stdout_read, "\n", keep=true)
+                s = readuntil(stdout_read, "\n")
                 @test occursin("shell> ", s)
-                s = readuntil(stdout_read, "\n", keep=true)
-                @test s == "\r\r\n"
+                s = readuntil(stdout_read, "\n")
+                @test s == "\r\r"
             else
                 @test occursin("shell> ", s)
             end
-            s = readuntil(stdout_read, "\n", keep=true)
-            @test s == "\e[0m\n" # the child has exited
+            s = readuntil(stdout_read, "\n")
+            @test s == "\e[0m" # the child printed nothing
+            wait(t)
         finally
             redirect_stdout(old_stdout)
         end
         close(proc_stdout)
         @test fetch(get_stdout) == "HI\n"
+        write(stdin_write, "\b")
     end
 
     # Issue #7001
@@ -259,10 +453,11 @@ fake_repl() do stdin_write, stdout_read, repl
     write(stdin_write, "1+1\n") # populate history with a trivial input
     readline(stdout_read)
     write(stdin_write, "\e[A\n")
-    let t = kill_timer(60)
+    let t = kill_timer(60, stdin_write, stdout_read)
         # yield make sure this got processed
         readuntil(stdout_read, "1+1")
         readuntil(stdout_read, "\n\n")
+        @test isopen(t)
         close(t) # cancel timeout
     end
 
@@ -298,8 +493,23 @@ fake_repl() do stdin_write, stdout_read, repl
     write(stdin_write, "\e[B\n")
     readuntil(stdout_read, s2)
 
-    # Close REPL ^D
-    write(stdin_write, '\x04')
+    # test that prefix history search "passes through" key bindings to parent mode
+    write(stdin_write, "0x321\n")
+    readuntil(stdout_read, "0x321")
+    write(stdin_write, "\e[A\e[1;3C|||") # uparrow (go up history) and then Meta-rightarrow (indent right)
+    s2 = readuntil(stdout_read, "|||", keep=true)
+    @test endswith(s2, " 0x321\r\e[13C|||") # should have a space (from Meta-rightarrow) and not
+                                            # have a spurious C before ||| (the one here is not spurious!)
+
+    # "pass through" for ^x^x
+    write(stdin_write, "\x030x4321\n") # \x03 == ^c
+    readuntil(stdout_read, "0x4321")
+    write(stdin_write, "\e[A\x18\x18||\x18\x18||||") # uparrow, ^x^x||^x^x||||
+    s3 = readuntil(stdout_read, "||||", keep=true)
+    @test endswith(s3, "||0x4321\r\e[15C||||")
+
+    # Delete line (^U) and close REPL (^D)
+    write(stdin_write, "\x15\x04")
     Base.wait(repltask)
 
     nothing
@@ -341,14 +551,13 @@ function AddCustomMode(repl, prompt)
         end
     )
 
-    search_prompt, skeymap = LineEdit.setup_search_keymap(hp)
     mk = REPL.mode_keymap(main_mode)
 
-    b = Dict{Any,Any}[skeymap, mk, LineEdit.history_keymap, LineEdit.default_keymap, LineEdit.escape_defaults]
+    b = Dict{Any,Any}[mk, LineEdit.history_keymap, LineEdit.default_keymap, LineEdit.escape_defaults]
     foobar_mode.keymap_dict = LineEdit.keymap(b)
 
     main_mode.keymap_dict = LineEdit.keymap_merge(main_mode.keymap_dict, foobar_keymap)
-    foobar_mode, search_prompt
+    foobar_mode
 end
 
 # Note: since the \t character matters for the REPL file history,
@@ -394,25 +603,37 @@ for prompt = ["TestΠ", () -> randstring(rand(1:10))]
         # gets displayed by intercepting the display
         repl.specialdisplay = REPL.REPLDisplay(repl)
 
+        errormonitor(@async write(devnull, stdout_read)) # redirect stdout to devnull so we drain the output pipe
+
         repl.interface = REPL.setup_interface(repl)
         repl_mode = repl.interface.modes[1]
         shell_mode = repl.interface.modes[2]
         help_mode = repl.interface.modes[3]
-        histp = repl.interface.modes[4]
+        pkg_mode = repl.interface.modes[4]
+        # histp = repl.interface.modes[5]
         prefix_mode = repl.interface.modes[5]
 
         hp = REPL.REPLHistoryProvider(Dict{Symbol,Any}(:julia => repl_mode,
                                                        :shell => shell_mode,
                                                        :help  => help_mode))
-
-        REPL.hist_from_file(hp, IOBuffer(fakehistory), "fakehistorypath")
+        hist_path = tempname()
+        write(hist_path, fakehistory)
+        hp.history = REPL.History.HistoryFile(hist_path)
+        REPL.history_do_initialize(hp)
         REPL.history_reset_state(hp)
 
-        histp.hp = repl_mode.hist = shell_mode.hist = help_mode.hist = hp
+        # histp.hp = repl_mode.hist = shell_mode.hist = help_mode.hist = hp
+        repl_mode.hist = shell_mode.hist = help_mode.hist = hp
 
         # Some manual setup
         s = LineEdit.init_state(repl.t, repl.interface)
+        repl.mistate = s
         LineEdit.edit_insert(s, "wip")
+
+        # LineEdit functions related to history
+        LineEdit.edit_insert_last_word(s)
+        @test buffercontents(LineEdit.buffer(s)) == "wip2"
+        LineEdit.edit_backspace(s) # remove the "2"
 
         # Test that navigating history skips invalid modes
         # (in both directions)
@@ -456,7 +677,9 @@ for prompt = ["TestΠ", () -> randstring(rand(1:10))]
         @test buffercontents(LineEdit.buffer(s)) == "wip"
         @test position(LineEdit.buffer(s)) == 3
         # test that history_first jumps to beginning of current session's history
+        @test hp.start_idx == 11
         hp.start_idx -= 5 # temporarily alter history
+        @test REPL.repl_filename(repl, hp) == "REPL[5]"
         LineEdit.history_first(s, hp)
         @test hp.cur_idx == 6
         # we are at the beginning of current session's history, so history_first
@@ -504,105 +727,6 @@ for prompt = ["TestΠ", () -> randstring(rand(1:10))]
         @test LineEdit.input_string(ps) == "wip"
         @test position(LineEdit.buffer(s)) == 3
         LineEdit.accept_result(s, prefix_mode)
-
-        # Test that searching backwards puts you into the correct mode and
-        # skips invalid modes.
-        LineEdit.enter_search(s, histp, true)
-        ss = LineEdit.state(s, histp)
-        write(ss.query_buffer, "l")
-        LineEdit.update_display_buffer(ss, ss)
-        LineEdit.accept_result(s, histp)
-        @test LineEdit.mode(s) == shell_mode
-        @test buffercontents(LineEdit.buffer(s)) == "ls"
-        @test position(LineEdit.buffer(s)) == 0
-
-        # Test that searching for `ll` actually matches `ll` after
-        # both letters are types rather than jumping to `shell`
-        LineEdit.history_prev(s, hp)
-        LineEdit.enter_search(s, histp, true)
-        write(ss.query_buffer, "l")
-        LineEdit.update_display_buffer(ss, ss)
-        @test buffercontents(ss.response_buffer) == "ll"
-        @test position(ss.response_buffer) == 1
-        write(ss.query_buffer, "l")
-        LineEdit.update_display_buffer(ss, ss)
-        LineEdit.accept_result(s, histp)
-        @test LineEdit.mode(s) == shell_mode
-        @test buffercontents(LineEdit.buffer(s)) == "ll"
-        @test position(LineEdit.buffer(s)) == 0
-
-        # Test that searching backwards with a one-letter query doesn't
-        # return indefinitely the same match (#9352)
-        LineEdit.enter_search(s, histp, true)
-        write(ss.query_buffer, "l")
-        LineEdit.update_display_buffer(ss, ss)
-        LineEdit.history_next_result(s, ss)
-        LineEdit.update_display_buffer(ss, ss)
-        LineEdit.accept_result(s, histp)
-        @test LineEdit.mode(s) == repl_mode
-        @test buffercontents(LineEdit.buffer(s)) == "shell"
-        @test position(LineEdit.buffer(s)) == 4
-
-        # Test that searching backwards doesn't skip matches (#9352)
-        # (for a search with multiple one-byte characters, or UTF-8 characters)
-        LineEdit.enter_search(s, histp, true)
-        write(ss.query_buffer, "é") # matches right-most "é" in "éé"
-        LineEdit.update_display_buffer(ss, ss)
-        @test position(ss.query_buffer) == sizeof("é")
-        LineEdit.history_next_result(s, ss) # matches left-most "é" in "éé"
-        LineEdit.update_display_buffer(ss, ss)
-        LineEdit.accept_result(s, histp)
-        @test buffercontents(LineEdit.buffer(s)) == "éé"
-        @test position(LineEdit.buffer(s)) == 0
-
-        # Issue #7551
-        # Enter search mode and try accepting an empty result
-        REPL.history_reset_state(hp)
-        LineEdit.edit_clear(s)
-        cur_mode = LineEdit.mode(s)
-        LineEdit.enter_search(s, histp, true)
-        LineEdit.accept_result(s, histp)
-        @test LineEdit.mode(s) == cur_mode
-        @test buffercontents(LineEdit.buffer(s)) == ""
-        @test position(LineEdit.buffer(s)) == 0
-
-        # Test that new modes can be dynamically added to the REPL and will
-        # integrate nicely
-        foobar_mode, custom_histp = AddCustomMode(repl, prompt)
-
-        # ^R l, should now find `ls` in foobar mode
-        LineEdit.enter_search(s, histp, true)
-        ss = LineEdit.state(s, histp)
-        write(ss.query_buffer, "l")
-        LineEdit.update_display_buffer(ss, ss)
-        LineEdit.accept_result(s, histp)
-        @test LineEdit.mode(s) == foobar_mode
-        @test buffercontents(LineEdit.buffer(s)) == "ls"
-        @test position(LineEdit.buffer(s)) == 0
-
-        # Try the same for prefix search
-        LineEdit.history_next(s, hp)
-        LineEdit.history_prev_prefix(ps, hp, "l")
-        @test ps.parent == foobar_mode
-        @test LineEdit.input_string(ps) == "ls"
-        @test position(LineEdit.buffer(s)) == 1
-
-        # Some Unicode handling testing
-        LineEdit.history_prev(s, hp)
-        LineEdit.enter_search(s, histp, true)
-        write(ss.query_buffer, "x")
-        LineEdit.update_display_buffer(ss, ss)
-        @test buffercontents(ss.response_buffer) == "x ΔxΔ"
-        @test position(ss.response_buffer) == 4
-        write(ss.query_buffer, " ")
-        LineEdit.update_display_buffer(ss, ss)
-        LineEdit.accept_result(s, histp)
-        @test LineEdit.mode(s) == repl_mode
-        @test buffercontents(LineEdit.buffer(s)) == "x ΔxΔ"
-        @test position(LineEdit.buffer(s)) == 0
-
-        # Try entering search mode while in custom repl mode
-        LineEdit.enter_search(s, custom_histp, true)
     end
 end
 
@@ -617,13 +741,21 @@ fake_repl() do stdin_write, stdout_read, repl
         REPL.run_repl(repl)
     end
 
-    global c = Condition()
-    sendrepl2(cmd) = write(stdin_write, "$cmd\n notify($(curmod_prefix)c)\n")
+    global c = Base.Event(true)
+    function sendrepl2(cmd)
+        t = @async readuntil(stdout_read, "\"done\"\n\n")
+        write(stdin_write, "$cmd\n notify($(curmod_prefix)c); \"done\"\n")
+        wait(c)
+        fetch(t)
+    end
 
     # Test removal of prefix in single statement paste
     sendrepl2("\e[200~julia> A = 2\e[201~\n")
-    wait(c)
-    @test Main.A == 2
+    @test @world(Main.A, ∞) == 2
+
+    # Test removal of prefix in single statement paste
+    sendrepl2("\e[200~In [12]: A = 2.2\e[201~\n")
+    @test @world(Main.A, ∞) == 2.2
 
     # Test removal of prefix in multiple statement paste
     sendrepl2("""\e[200~
@@ -635,11 +767,10 @@ fake_repl() do stdin_write, stdout_read, repl
 
                     julia> A = 3\e[201~
              """)
-    wait(c)
-    @test Main.A == 3
-    @test Base.invokelatest(Main.foo, 4)
-    @test Base.invokelatest(Main.T17599, 3).a == 3
-    @test !Base.invokelatest(Main.foo, 2)
+    @test @world(Main.A, ∞) == 3
+    @test @invokelatest(Main.foo(4))
+    @test @invokelatest(Main.T17599(3)).a == 3
+    @test !@invokelatest(Main.foo(2))
 
     sendrepl2("""\e[200~
             julia> goo(x) = x + 1
@@ -648,26 +779,49 @@ fake_repl() do stdin_write, stdout_read, repl
             julia> A = 4
             4\e[201~
              """)
-    wait(c)
-    @test Main.A == 4
-    @test Base.invokelatest(Main.goo, 4) == 5
+    @test @world(Main.A, ∞) == 4
+    @test @invokelatest(Main.goo(4)) == 5
 
     # Test prefix removal only active in bracket paste mode
     sendrepl2("julia = 4\n julia> 3 && (A = 1)\n")
-    wait(c)
-    @test Main.A == 1
+    @test @world(Main.A, ∞) == 1
 
     # Test that indentation corresponding to the prompt is removed
-    sendrepl2("""\e[200~julia> begin\n           α=1\n           β=2\n       end\n\e[201~""")
-    wait(c)
-    readuntil(stdout_read, "begin")
-    @test readuntil(stdout_read, "end", keep=true) == "\n\r\e[7C    α=1\n\r\e[7C    β=2\n\r\e[7Cend"
+    s = sendrepl2("""\e[200~julia> begin\n           α=1\n           β=2\n       end\n\e[201~""")
+    s2 = split(rsplit(s, "begin", limit=2)[end], "end", limit=2)[1]
+    @test s2 == "\n\r\e[7C    α=1\n\r\e[7C    β=2\n\r\e[7C"
+
     # for incomplete input (`end` below is added after the end of bracket paste)
-    sendrepl2("""\e[200~julia> begin\n           α=1\n           β=2\n\e[201~end""")
-    wait(c)
-    readuntil(stdout_read, "begin")
-    readuntil(stdout_read, "begin")
-    @test readuntil(stdout_read, "end", keep=true) == "\n\r\e[7C    α=1\n\r\e[7C    β=2\n\r\e[7Cend"
+    s = sendrepl2("""\e[200~julia> begin\n           α=1\n           β=2\n\e[201~end""")
+    s2 = split(rsplit(s, "begin", limit=2)[end], "end", limit=2)[1]
+    @test s2 == "\n\r\e[7C    α=1\n\r\e[7C    β=2\n\r\e[7C"
+
+    # Test switching repl modes
+    redirect_stdout(devnull) do # to suppress "foo" echoes
+    sendrepl2("""\e[200~
+            julia> A = 1
+            1
+
+            shell> echo foo
+            foo
+
+            shell> echo foo
+                   foo
+            foo foo
+
+            help?> Int
+            Dummy docstring
+
+                Some text
+
+                julia> error("If this error throws, the paste handler has failed to ignore this docstring example")
+
+            julia> B = 2
+            2\e[201~
+             """)
+    @test @world(Main.A, ∞) == 1
+    @test @world(Main.B, ∞) == 2
+    end # redirect_stdout
 
     # Close repl
     write(stdin_write, '\x04')
@@ -690,78 +844,101 @@ fake_repl() do stdin_write, stdout_read, repl
         LineEdit.default_keymap, LineEdit.escape_defaults])
 
     c = Condition()
-    panel.on_done = (s,buf,ok)->begin
+    panel.on_done = (s, buf, ok) -> begin
         if !ok
-            LineEdit.transition(s,:abort)
+            LineEdit.transition(s, :abort)
         end
         line = strip(String(take!(buf)))
         LineEdit.reset_state(s)
-        return notify(c,line)
+        notify(c, line)
+        nothing
     end
 
-    repltask = @async REPL.run_interface(repl.t, LineEdit.ModalInterface([panel,search_prompt]))
+    repltask = @async REPL.run_interface(repl.t, LineEdit.ModalInterface(Any[panel, search_prompt]))
 
-    write(stdin_write,"a\n")
+    write(stdin_write, "a\n")
     @test wait(c) == "a"
     # Up arrow enter should recall history even at the start
-    write(stdin_write,"\e[A\n")
+    write(stdin_write, "\e[A\n")
     @test wait(c) == "a"
     # And again
-    write(stdin_write,"\e[A\n")
+    write(stdin_write, "\e[A\n")
     @test wait(c) == "a"
     # Close REPL ^D
     write(stdin_write, '\x04')
     Base.wait(repltask)
 end
 
-ccall(:jl_exit_on_sigint, Cvoid, (Cint,), 1)
+Base.exit_on_sigint(true)
 
-let exename = Base.julia_cmd()
+let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
     # Test REPL in dumb mode
-    if !Sys.iswindows()
-        with_fake_pty() do slave, master
-            nENV = copy(ENV)
-            nENV["TERM"] = "dumb"
-            p = run(setenv(`$exename --startup-file=no -q`,nENV),slave,slave,slave,wait=false)
-            output = readuntil(master,"julia> ",keep=true)
-            if ccall(:jl_running_on_valgrind,Cint,()) == 0
-                # If --trace-children=yes is passed to valgrind, we will get a
-                # valgrind banner here, not just the prompt.
-                @test output == "julia> "
-            end
-            write(master,"1\nexit()\n")
-
-            wait(p)
-            output = readuntil(master,' ',keep=true)
-            @test output == "1\r\nexit()\r\n1\r\n\r\njulia> "
-            @test bytesavailable(master) == 0
+    with_fake_pty() do pts, ptm
+        nENV = copy(ENV)
+        nENV["TERM"] = "dumb"
+        p = run(detach(setenv(`$exename -q`, nENV)), pts, pts, pts, wait=false)
+        Base.close_stdio(pts)
+        output = readuntil(ptm, "julia> ", keep=true)
+        if ccall(:jl_running_on_valgrind, Cint,()) == 0
+            # If --trace-children=yes is passed to valgrind, we will get a
+            # valgrind banner here, not just the prompt.
+            @test output == "julia> "
         end
+        write(ptm, "1\nexit()\n")
+
+        output = readuntil(ptm, ' ', keep=true)
+        if Sys.iswindows()
+            # Our fake pty is actually a pipe, and thus lacks the input echo feature of posix
+            @test output == "1\n\njulia> "
+        else
+            @test output == "1\r\nexit()\r\n1\r\n\r\njulia> "
+        end
+        @test bytesavailable(ptm) == 0
+        @test if Sys.iswindows() || Sys.isbsd()
+                eof(ptm)
+            else
+                # Some platforms (such as linux) report EIO instead of EOF
+                # possibly consume child-exited notification
+                # for example, see discussion in https://bugs.python.org/issue5380
+                try
+                    eof(ptm) && !Sys.islinux()
+                catch ex
+                    (ex isa Base.IOError && ex.code == Base.UV_EIO) || rethrow()
+                    @test_throws ex eof(ptm) # make sure the error is sticky
+                    ptm.readerror = nothing
+                    eof(ptm)
+                end
+            end
+        @test read(ptm, String) == ""
+        wait(p)
     end
 
     # Test stream mode
-    p = open(`$exename --startup-file=no -q`, "r+")
+    p = open(`$exename -q`, "r+")
     write(p, "1\nexit()\n")
     @test read(p, String) == "1\n"
 end # let exename
 
-# issue #19864:
+# issue #19864
 mutable struct Error19864 <: Exception; end
 function test19864()
     @eval Base.showerror(io::IO, e::Error19864) = print(io, "correct19864")
     buf = IOBuffer()
-    REPL.print_response(buf, Error19864(), [], false, false, nothing)
+    fake_response = (Base.ExceptionStack([(exception=Error19864(),backtrace=Ptr{Cvoid}[])]),true)
+    REPL.print_response(buf, fake_response, nothing, false, false, nothing)
     return String(take!(buf))
 end
 @test occursin("correct19864", test19864())
 
 # Test containers in error messages are limited #18726
 let io = IOBuffer()
-    Base.display_error(io,
-        try
+    Base.display_error(io, Base.ExceptionStack(Any[(exception =
+        (try
             [][trues(6000)]
+            @assert false
         catch e
             e
-        end, [])
+        end), backtrace = [])]))
     @test length(String(take!(io))) < 1500
 end
 
@@ -783,16 +960,36 @@ end
 let ends_with_semicolon = REPL.ends_with_semicolon
     @test !ends_with_semicolon("")
     @test ends_with_semicolon(";")
-    @test !ends_with_semicolon("a")
+    @test !ends_with_semicolon("ä")
+    @test !ends_with_semicolon("ä # äsdf ;")
+    @test ends_with_semicolon("""a * "#ä" ;""")
+    @test ends_with_semicolon("a; #=#=# =# =#\n")
     @test ends_with_semicolon("1;")
     @test ends_with_semicolon("1;\n")
     @test ends_with_semicolon("1;\r")
     @test ends_with_semicolon("1;\r\n   \t\f")
-    @test ends_with_semicolon("1;#text\n")
-    @test ends_with_semicolon("a; #=#=# =# =#\n")
+    @test ends_with_semicolon("1;#äsdf\n")
+    @test ends_with_semicolon("""1;\n#äsdf\n""")
+    @test !ends_with_semicolon("\"\\\";\"#\"")
+    @test ends_with_semicolon("\"\\\\\";#\"")
     @test !ends_with_semicolon("begin\na;\nb;\nend")
     @test !ends_with_semicolon("begin\na; #=#=#\n=#b=#\nend")
     @test ends_with_semicolon("\na; #=#=#\n=#b=#\n# test\n#=\nfoobar\n=##bazbax\n")
+    @test ends_with_semicolon("f()= 1; # é ; 2")
+    @test ends_with_semicolon("f()= 1; # é")
+    @test !ends_with_semicolon("f()= 1; \"é\"")
+    @test !ends_with_semicolon("""("f()= 1; # é")""")
+    @test !ends_with_semicolon(""" "f()= 1; # é" """)
+    @test ends_with_semicolon("f()= 1;")
+    # the next result does not matter because this is not legal syntax
+    @test_nowarn ends_with_semicolon("1; #=# 2")
+
+    # #46189 - adjoint operator with comment
+    @test ends_with_semicolon("W';") == true
+    @test ends_with_semicolon("W'; # comment")
+    @test !ends_with_semicolon("W'")
+    @test !ends_with_semicolon("x'")
+    @test !ends_with_semicolon("'a'")
 end
 
 # PR #20794, TTYTerminal with other kinds of streams
@@ -807,6 +1004,13 @@ let term = REPL.Terminals.TTYTerminal("dumb",IOBuffer("1+2\n"),IOContext(IOBuffe
     @test term[:foo] == get(term, :foo, nothing) == true
     @test get(term, :bar, nothing) === nothing
     @test_throws KeyError term[:bar]
+end
+
+# Ensure even the dumb REPL elides content
+let term = REPL.Terminals.TTYTerminal("dumb",IOBuffer("zeros(1000)\n"),IOBuffer(),IOBuffer())
+    r = REPL.BasicREPL(term)
+    REPL.run_repl(r)
+    @test contains(String(take!(term.out_stream)), "⋮")
 end
 
 
@@ -830,7 +1034,7 @@ function history_move_prefix(s::LineEdit.MIState,
     hist.last_idx = -1
     idxs = backwards ? ((cur_idx-1):-1:1) : ((cur_idx+1):length(hist.history))
     for idx in idxs
-        if startswith(hist.history[idx], prefix) && hist.history[idx] != allbuf
+        if startswith(hist.history[idx].content, prefix) && hist.history[idx].content != allbuf
             REPL.history_move(s, hist, idx)
             seek(LineEdit.buffer(s), pos)
             LineEdit.refresh_line(s)
@@ -886,7 +1090,7 @@ for keys = [altkeys, merge(altkeys...)],
 
             # Close the history file
             # (otherwise trying to delete it fails on Windows)
-            close(repl.interface.modes[1].hist.history_file)
+            close(repl.interface.modes[1].hist.history)
 
             # Check that the correct prompt was displayed
             output = readuntil(stdout_read, "1 * 1;", keep=true)
@@ -927,19 +1131,227 @@ fake_repl() do stdin_write, stdout_read, repl
     end
 
     @eval Main module TestShowTypeREPL; export TypeA; struct TypeA end; end
-    write(stdin_write, "TestShowTypeREPL.TypeA\n")
-    @test endswith(readline(stdout_read), "\r\e[7CTestShowTypeREPL.TypeA\r\e[29C")
-    readline(stdout_read)
-    readline(stdout_read)
+    t = @async write(stdin_write, "TestShowTypeREPL.TypeA\n")
+    s = readuntil(stdout_read, "\n\n")
+    s2 = rsplit(s, "\n", limit=2)[end]
+    @test s2 == "\e[0mMain.TestShowTypeREPL.TypeA"
+    wait(t)
     @eval Main using .TestShowTypeREPL
-    write(stdin_write, "TypeA\n")
-    @test endswith(readline(stdout_read), "\r\e[7CTypeA\r\e[12C")
-    readline(stdout_read)
+    readuntil(stdout_read, "julia> ", keep=true)
+    t = @async write(stdin_write, "TypeA\n")
+    s = readuntil(stdout_read, "\n\n")
+    s2 = rsplit(s, "\n", limit=2)[end]
+    @test s2 == "\e[0mTypeA"
+    wait(t)
 
     # Close REPL ^D
+    readuntil(stdout_read, "julia> ", keep=true)
     write(stdin_write, '\x04')
     Base.wait(repltask)
 end
+
+# test activate_module
+fake_repl() do stdin_write, stdout_read, repl
+    repl.history_file = false
+    repl.interface = REPL.setup_interface(repl)
+    repl.mistate = LineEdit.init_state(repl.t, repl.interface)
+
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+
+    write(stdin_write, " ( 123 , Base.Fix1 , ) \n")
+    s = readuntil(stdout_read, "\n\n")
+    @test endswith(s, "(123, Base.Fix1)")
+
+    repl.mistate.active_module = Base # simulate activate_module(Base)
+    write(stdin_write, " ( 456 , Base.Fix2 , ) \n")
+    s = readuntil(stdout_read, "\n\n")
+    # ".Base" prefix not shown here
+    @test endswith(s, "(456, Fix2)")
+
+    # Close REPL ^D
+    readuntil(stdout_read, "julia> ", keep=true)
+    write(stdin_write, '\x04')
+    Base.wait(repltask)
+end
+
+# Alt-m activates the module named around the cursor, and on an empty line toggles back.
+@eval Main module ActivateModuleTest; module Inner; end; end
+fake_repl() do stdin_write, stdout_read, repl
+    repl.history_file = false
+    repl.interface = REPL.setup_interface(repl)
+    repl.mistate = LineEdit.init_state(repl.t, repl.interface)
+    Base.active_repl = repl
+    try
+        repltask = @async REPL.run_repl(repl)
+        function active_module_after(keys)
+            write(stdin_write, keys * "\x15nameof(Base.active_module())\r")
+            s = readuntil(stdout_read, "\n\n")
+            return Symbol(rsplit(s, ':'; limit=2)[end])
+        end
+        readuntil(stdout_read, "julia> ")
+
+        # the cursor can be anywhere inside the dotted name, and the rest of the line goes away
+        @test active_module_after("1; ActivateModuleTest.Inner * 3\eb\eb\eb\e[C\em") === :Inner
+        readuntil(stdout_read, "(Main.ActivateModuleTest.Inner) julia> ")
+        @test active_module_after("\em") === :Main
+        readuntil(stdout_read, "julia> ")
+        @test active_module_after("\em") === :Inner
+        readuntil(stdout_read, "julia> ")
+
+        # names that are not another module change nothing, and the input stays
+        @test active_module_after("\em") === :Main
+        readuntil(stdout_read, "julia> ")
+        for bad in ("ActivateModuleTest.nothere", "sqrt", "1 +", "Main")
+            write(stdin_write, bad * "\em\x15nameof(Base.active_module())\r")
+            s = readuntil(stdout_read, "\n\n")
+            @test endswith(s, ":Main")
+            readuntil(stdout_read, "julia> ")
+        end
+
+        write(stdin_write, '\x04')
+        Base.wait(repltask)
+    finally
+        Base.active_repl = nothing
+    end
+end
+
+@testset "current_word_with_dots" begin
+    word(str, pos) = (buf = IOBuffer(str); seekend(buf); seek(buf, pos); LineEdit.current_word_with_dots(buf))
+    @test word("", 0) == ""
+    for pos in 3:7
+        @test word("X; A.B.C*3", pos) == "A.B.C"
+    end
+    @test word("Foo.Bar", 7) == "Foo.Bar"
+    @test word("α.β", 0) == "α.β"
+    @test word("α.β", 3) == "α.β"
+end
+
+# Keys that reach the modes and history of the REPL through the real input loop.
+function press_repl!(setup, keys)
+    term = FakeTerminal(IOBuffer(keys * "\r"), IOBuffer(), IOBuffer(), false)
+    repl = REPL.LineEditREPL(term, false)
+    repl.history_file = false
+    repl.options = REPL.Options(confirm_exit=false, style_input=false, hint_tab_completes=false,
+                                auto_insert_closing_bracket=true)
+    repl.interface = REPL.setup_interface(repl)
+    s = repl.mistate = LineEdit.init_state(term, repl.interface)
+    setup(repl, s)
+    LineEdit.prompt!(term, repl.interface, s)
+    return repl, s
+end
+press_repl!(keys) = press_repl!((_...) -> nothing, keys)
+
+@testset "REPL mode keys" begin
+    julia_mode(repl) = repl.interface.modes[1]
+    shell_mode(repl) = repl.interface.modes[2]
+    input(s) = LineEdit.input_string(LineEdit.state(s))
+
+    # `;` and `?` only change mode at the start of the input, and backspace goes back with the text
+    for (key, modeidx) in ((';', 2), ('?', 3))
+        repl, s = press_repl!("$(key)ls")
+        @test LineEdit.mode(s) === repl.interface.modes[modeidx]
+        @test input(s) == "ls"
+        repl, s = press_repl!("x$(key)")
+        @test LineEdit.mode(s) === julia_mode(repl)
+        @test input(s) == "x$key"
+        repl, s = press_repl!("$(key)ls\x01\x7f")
+        @test LineEdit.mode(s) === julia_mode(repl)
+        @test input(s) == "ls"
+        repl, s = press_repl!("$(key)\x7f")
+        @test LineEdit.mode(s) === julia_mode(repl)
+        repl, s = press_repl!("$(key)ls\x7f")
+        @test LineEdit.mode(s) === repl.interface.modes[modeidx]
+        @test input(s) == "l"
+    end
+    # backspace removes an inserted bracket pair, also in the other modes
+    repl, s = press_repl!("[\x7f")
+    @test input(s) == ""
+    repl, s = press_repl!(";[\x7f")
+    @test LineEdit.mode(s) === shell_mode(repl)
+    @test input(s) == ""
+
+    # backspace at the start of the main mode doesn't depend on any global REPL
+    repl, s = press_repl!("\x7fab\x01\x7f")
+    @test LineEdit.mode(s) === julia_mode(repl)
+    @test input(s) == "ab"
+    # neither does pasting a pkg prompt
+    repl, s = press_repl!("\e[200~pkg> st\e[201~")
+    @test LineEdit.mode(s) === repl.interface.modes[4]
+    @test input(s) == "st"
+
+    # ^C leaves a mode and drops the input
+    repl, s = press_repl!(";ls\x03")
+    @test LineEdit.mode(s) === julia_mode(repl)
+    @test input(s) == ""
+    @test occursin("^C\n\n", String(take!(repl.t.out_stream)))
+
+    # `]` inside the input is plain text and moves over an inserted bracket
+    repl, s = press_repl!("x]")
+    @test input(s) == "x]"
+    repl, s = press_repl!("[]+1")
+    @test input(s) == "[]+1"
+
+    # shift-tab also offers names that the module didn't define, for that one press
+    @eval Main module ShiftTabTest; const sina = 1; end
+    repl, s = press_repl!("ShiftTabTest.sin\t")
+    @test input(s) == "ShiftTabTest.sina"
+    repl, s = press_repl!("ShiftTabTest.sin\e[Z")
+    @test input(s) == "ShiftTabTest.sin"
+    repl, s = press_repl!("ShiftTabTest.sin\e[Z\t")
+    @test input(s) == "ShiftTabTest.sina"
+end
+
+@testset "history keys" begin
+    function press_history(keys)
+        hist_path = tempname()
+        write(hist_path, fakehistory)
+        repl, s = press_repl!(keys) do repl, s
+            modes = repl.interface.modes
+            hp = modes[1].hist
+            hp.history = REPL.History.HistoryFile(hist_path)
+            REPL.history_do_initialize(hp)
+            REPL.history_reset_state(hp)
+        end
+        close(repl.interface.modes[1].hist.history)
+        rm(hist_path)
+        return LineEdit.input_string(LineEdit.state(s)), LineEdit.mode(s), repl.interface.modes
+    end
+    up, down, pageup, pagedown = "\e[A", "\e[B", "\e[5~", "\e[6~"
+    # newest entries first; the `foobar` entries are not in the mode mapping and get skipped
+    for (keys, expected, modeidx) in (
+            ("\x10", "2 + 2", 1),                # ^P
+            ("\x10\x10", "ls", 2),               # skips the `foobar` entry and changes mode
+            ("\x10\x10\x0e", "2 + 2", 1),        # ^N
+            ("wip\x10\x0e", "wip", 1),           # back to the input in progress
+            ("\ep", "2 + 2", 1),
+            ("\ep\ep\en", "2 + 2", 1),
+            ("$pageup", "2 + 2", 1),
+            ("$pageup$pageup$pagedown", "2 + 2", 1),
+            ("\e<", "é", 1),
+            ("\e<\e>", "", 1),
+            # at the ends of the history nothing changes
+            ("\e<\ep", "é", 1),
+            ("\en", "", 1),
+            # arrows search by the prefix before the cursor, in any mode
+            ("$up", "2 + 2", 1),
+            ("1$up", "1 + 1", 1),
+            ("1$up$down", "1", 1),
+            ("sh\x10", "shell", 1),
+            ("sh\x10\x0e", "sh", 1),
+            # any other key leaves the search and acts on the result
+            ("1$up|", "1| + 1", 1),
+            ("\e.", "2", 1),                     # alt-. takes the last word of the last entry
+            ("x\e.", "x2", 1),
+        )
+        text, mode, modes = press_history(keys)
+        @test (keys => text) == (keys => expected)
+        @test mode === modes[modeidx]
+    end
+end
+
+help_result(line, mod::Module=Base) = Core.eval(mod, REPL._helpmode(IOBuffer(), line, mod))
 
 # Docs.helpmode tests: we test whether the correct expressions are being generated here,
 # rather than complete integration with Julia's REPL mode system.
@@ -955,25 +1367,1254 @@ for (line, expr) in Pair[
     "while       " => :while, # keyword, trailing spaces should be stripped.
     "0"            => 0,
     "\"...\""      => "...",
-    "r\"...\""     => Expr(:macrocall, Symbol("@r_str"), LineNumberNode(1, :none), "...")
+    "r\"...\""     => Expr(:macrocall, Symbol("@r_str"), LineNumberNode(1, :none), "..."),
+    "using Foo"    => :using,
+    "import Foo"   => :import,
     ]
-    #@test REPL._helpmode(line) == Expr(:macrocall, Expr(:., Expr(:., :Base, QuoteNode(:Docs)), QuoteNode(Symbol("@repl"))), LineNumberNode(119, doc_util_path), stdout, expr)
-    buf = IOBuffer()
-    @test Base.eval(REPL._helpmode(buf, line)) isa Union{Markdown.MD,Nothing}
+    @test REPL._helpmode(line).args[4] == expr
+    @test help_result(line) isa Union{Markdown.MD,Nothing}
 end
+
+# PR 30754, Issues #22013, #24871, #26933, #29282, #29361, #30348
+for line in ["′", "type"]
+    @test occursin("No documentation found.",
+        sprint(show, help_result(line)::Union{Markdown.MD,Nothing}))
+end
+
+# PR 35154
+@test occursin("|=", sprint(show, help_result("|=")))
+@test occursin("broadcast", sprint(show, help_result(".=")))
+
+# PR 35277
+@test occursin("identical", sprint(show, help_result("===")))
+@test occursin("broadcast", sprint(show, help_result(".<=")))
+
+# Issue 39427
+@test occursin("does not exist.", sprint(show, help_result(":=")))
+global some_undef_global
+@test occursin("exists,", sprint(show, help_result("some_undef_global", @__MODULE__)))
+
+# Issue #40563
+@test occursin("does not exist", sprint(show, help_result("..")))
+# test that helpmode is sensitive to contextual module
+@test occursin("No documentation found", sprint(show, help_result("Fix2", Main)))
+@test occursin("Alias for `Fix{2}`. See [`Fix`](@ref Base.Fix).", # exact string may change
+               sprint(show, help_result("Base.Fix2", Main)))
+@test occursin("Alias for `Fix{2}`. See [`Fix`](@ref Base.Fix).", # exact string may change
+               sprint(show, help_result("Fix2", Base)))
+
+
+# Issue #25930
+
+# Brief and extended docs (issue #25930)
+let text =
+        """
+            brief_extended()
+
+        Short docs
+
+        # Extended help
+
+        Long docs
+        """,
+    md = Markdown.parse(text)
+    @test md == REPL.trimdocs(md, false)
+    @test !isa(md.content[end], REPL.Message)
+    mdbrief = REPL.trimdocs(md, true)
+    @test length(mdbrief.content) == 3
+    @test isa(mdbrief.content[1], Markdown.Code)
+    @test isa(mdbrief.content[2], Markdown.Paragraph)
+    @test isa(mdbrief.content[3], REPL.Message)
+    @test occursin("??", mdbrief.content[3].msg)
+end
+
+# issue #35216: empty and non-strings in H1 headers
+let emptyH1 = Markdown.parse("# "),
+    codeH1 = Markdown.parse("# `hello`")
+    @test emptyH1 == REPL.trimdocs(emptyH1, false) == REPL.trimdocs(emptyH1, true)
+    @test codeH1 == REPL.trimdocs(codeH1, false) == REPL.trimdocs(codeH1, true)
+end
+
+module BriefExtended
+public f, f_plain
+"""
+    f()
+
+Short docs
+
+# Extended help
+
+Long docs
+"""
+f() = nothing
+@doc text"""
+    f_plain()
+
+Plain text docs
+"""
+f_plain() = nothing
+@doc html"""
+<h1><code>f_html()</code></h1>
+<p>HTML docs.</p>
+"""
+f_html() = nothing
+end # module BriefExtended
+
+buf = IOBuffer()
+md = Base.eval(REPL._helpmode(buf, "$(@__MODULE__).BriefExtended.f"))
+@test length(md.content) == 2 && isa(md.content[2], REPL.Message)
+buf = IOBuffer()
+md = Base.eval(REPL._helpmode(buf, "?$(@__MODULE__).BriefExtended.f"))
+@test length(md.content) == 1 && length(md.content[1].content[1].content) == 4
+buf = IOBuffer()
+txt = Base.eval(REPL._helpmode(buf, "$(@__MODULE__).BriefExtended.f_plain"))
+@test !isempty(sprint(show, txt))
+buf = IOBuffer()
+html = Base.eval(REPL._helpmode(buf, "$(@__MODULE__).BriefExtended.f_html"))
+@test !isempty(sprint(show, html))
 
 # PR #27562
 fake_repl() do stdin_write, stdout_read, repl
     repltask = @async begin
         REPL.run_repl(repl)
     end
-    write(stdin_write, "Expr(:call, GlobalRef(Base.Math, :float), Core.SlotNumber(1))\n")
+    t = @async write(stdin_write, "Expr(:call, GlobalRef(Base.Math, :float), Core.SlotNumber(1))\n")
     readline(stdout_read)
-    @test readline(stdout_read) == "\e[0m:((Base.Math.float)(_1))"
-    write(stdin_write, "ans\n")
+    s = readuntil(stdout_read, "\n\n")
+    @test endswith(s, "\e[0m:(Base.Math.float(_1))")
+    wait(t)
+
+    readuntil(stdout_read, "julia> ", keep=true)
+    t = @async write(stdin_write, "ans\n")
     readline(stdout_read)
-    readline(stdout_read)
-    @test readline(stdout_read) == "\e[0m:((Base.Math.float)(_1))"
+    s = readuntil(stdout_read, "\n\n")
+    @test endswith(s, "\e[0m:(Base.Math.float(_1))")
+    wait(t)
+    readuntil(stdout_read, "julia> ", keep=true)
     write(stdin_write, '\x04')
     Base.wait(repltask)
+end
+
+# issue #31352
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    t = @async write(stdin_write, "struct Errs end\n")
+    readuntil(stdout_read, "\e[0m")
+    readline(stdout_read)
+    wait(t)
+    readuntil(stdout_read, "julia> ", keep=true)
+    t = @async write(stdin_write, "Base.show(io::IO, ::Errs) = throw(Errs())\n")
+    readline(stdout_read)
+    readuntil(stdout_read, "\e[0m")
+    readline(stdout_read)
+    wait(t)
+    readuntil(stdout_read, "julia> ", keep=true)
+    t = @async write(stdin_write, "Errs()\n")
+    readline(stdout_read)
+    readuntil(stdout_read, "\n\n")
+    wait(t)
+    readuntil(stdout_read, "julia> ", keep=true)
+    write(stdin_write, '\x04')
+    wait(repltask)
+    @test istaskdone(repltask)
+end
+
+# issue #34842
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    write(stdin_write, "?;\n")
+    readline(stdout_read)
+    s = readline(stdout_read)
+    @test endswith(s, "search: ;")
+    readuntil(stdout_read, "julia> ", keep=true)
+    write(stdin_write, '\x04')
+    Base.wait(repltask)
+end
+
+# issue #35771
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    write(stdin_write, "global x\n")
+    readline(stdout_read)
+    @test !occursin("ERROR", readline(stdout_read))
+    readuntil(stdout_read, "julia> ", keep=true)
+    write(stdin_write, '\x04')
+    Base.wait(repltask)
+end
+
+
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    write(stdin_write, "anything\x15\x19\x19") # ^u^y^y : kill line backwards + 2 yanks
+    s1 = readuntil(stdout_read, "anything") # typed
+    s2 = readuntil(stdout_read, "anything") # yanked (first ^y)
+    s3 = readuntil(stdout_read, "anything") # previous yanked refreshed (from second ^y)
+    s4 = readuntil(stdout_read, "anything", keep=true) # last yanked
+    # necessary to read at least some part of the buffer,
+    # for the "region_active" to have time to be updated
+
+    @test LineEdit.state(repl.mistate).region_active === :off
+    @test s4 == "anything" # no control characters between the last two occurrences of "anything"
+    write(stdin_write, "\x15\x04")
+    Base.wait(repltask)
+end
+
+parse_syntax(s::AbstractString) = Meta.parse(s; type=Base.Syntax)
+
+# AST transformations (softscope, Revise, OhMyREPL, etc.)
+@testset "AST Transformation" begin
+    backend = REPL.REPLBackend()
+    errormonitor(@async REPL.start_repl_backend(backend))
+    put!(backend.repl_channel, (parse_syntax("1+1"), false))
+    reply = take!(backend.response_channel)
+    @test reply == Pair{Any, Bool}(2, false)
+    twice(ex) = Expr(:tuple, ex, ex)
+    push!(backend.ast_transforms, twice)
+    put!(backend.repl_channel, (parse_syntax("1+1"), false))
+    reply = take!(backend.response_channel)
+    @test reply == Pair{Any, Bool}((2, 2), false)
+    put!(backend.repl_channel, (nothing, -1))
+    Base.wait(backend.backend_task)
+end
+
+# a stray InterruptException forwarded to the backend between evaluations (e.g. a
+# Ctrl-C arriving just as user code finishes) must not tear down the backend (#58689)
+@testset "stray InterruptException in REPL backend" begin
+    backend = REPL.REPLBackend()
+    errormonitor(@async REPL.start_repl_backend(backend))
+    put!(backend.repl_channel, (parse_syntax("1+1"), false))
+    @test take!(backend.response_channel) == Pair{Any, Bool}(2, false)
+    # the backend task is now parked in take!(repl_channel); inject the interrupt
+    # from a throwaway task, since throwto does not reschedule its caller
+    @async Base.throwto(backend.backend_task, InterruptException())
+    yield()
+    @test !istaskdone(backend.backend_task)
+    put!(backend.repl_channel, (parse_syntax("1+2"), false))
+    @test timedwait(() -> isready(backend.response_channel), 60) === :ok
+    @test take!(backend.response_channel) == Pair{Any, Bool}(3, false)
+    put!(backend.repl_channel, (nothing, -1))
+    Base.wait(backend.backend_task)
+end
+
+# Mimic of JSON.jl's structure
+module JSON54872
+
+module Parser
+export parse
+function parse end
+end # Parser
+
+using .Parser: parse
+end # JSON54872
+
+# Test the public mechanism
+module JSON54872_public
+public tryparse
+end # JSON54872_public
+
+@testset "warn_on_non_owning_accesses AST transform" begin
+    @test REPL.has_ancestor(JSON54872.Parser, JSON54872)
+    @test !REPL.has_ancestor(JSON54872, JSON54872.Parser)
+
+    # JSON54872.Parser owns `parse`
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        JSON54872.Parser.parse
+    end)
+    @test isempty(warnings)
+
+    # A submodule of `JSON54872` owns `parse`
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        JSON54872.parse
+    end)
+    @test isempty(warnings)
+
+    # `JSON54872` does not own `tryparse` (nor is it public)
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        JSON54872.tryparse
+    end)
+    @test length(warnings) == 1
+    @test only(warnings).owner == Base
+    @test only(warnings).name_being_accessed == :tryparse
+
+    # Same for nested access
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        JSON54872.Parser.tryparse
+    end)
+    @test length(warnings) == 1
+    @test only(warnings).owner == Base
+    @test only(warnings).name_being_accessed == :tryparse
+
+    test_logger = TestLogger()
+    with_logger(test_logger) do
+        REPL.warn_on_non_owning_accesses(@__MODULE__, Base.expr_to_syntax(:(JSON54872.tryparse)))
+        REPL.warn_on_non_owning_accesses(@__MODULE__, Base.expr_to_syntax(:(JSON54872.tryparse)))
+    end
+    # only 1 logging statement emitted thanks to `maxlog` mechanism
+    @test length(test_logger.logs) == 1
+    record = only(test_logger.logs)
+    @test record.level == Warn
+    @test record.message == "tryparse is defined in Base and is not public in $JSON54872"
+
+    # However JSON54872_public has `tryparse` declared public
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        JSON54872_public.tryparse
+    end)
+    @test isempty(warnings)
+
+    # Now let us test some tricky cases
+    # No warning since `JSON54872` is local (LHS of `=`)
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        let JSON54872 = (; tryparse=1)
+            JSON54872.tryparse
+        end
+    end)
+    @test isempty(warnings)
+
+    # No warning for nested local access either
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        let JSON54872 = (; Parser = (; tryparse=1))
+            JSON54872.Parser.tryparse
+        end
+    end)
+    @test isempty(warnings)
+
+    # No warning since `JSON54872` is local (long-form function arg)
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        function f(JSON54872=(; tryparse))
+            JSON54872.tryparse
+        end
+    end)
+    @test isempty(warnings)
+
+    # No warning since `JSON54872` is local (short-form function arg)
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        f(JSON54872=(; tryparse)) = JSON54872.tryparse
+    end)
+    @test isempty(warnings)
+
+    # No warning since `JSON54872` is local (long-form anonymous function)
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        function (JSON54872=(; tryparse))
+            JSON54872.tryparse
+        end
+    end)
+    @test isempty(warnings)
+
+    # No warning since `JSON54872` is local (short-form anonymous function)
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        (JSON54872 = (; tryparse)) -> begin
+            JSON54872.tryparse
+        end
+    end)
+    @test isempty(warnings)
+
+    # false-negative: missing warning
+    warnings = REPL.collect_qualified_access_warnings(@__MODULE__, quote
+        let JSON54872 = JSON54872
+            JSON54872.tryparse
+        end
+    end)
+    @test_broken !isempty(warnings)
+end
+
+backend = REPL.REPLBackend()
+frontend_task = @async begin
+    try
+        @testset "AST Transformations Async" begin
+            put!(backend.repl_channel, (parse_syntax("1+1"), false))
+            reply = take!(backend.response_channel)
+            @test reply == Pair{Any, Bool}(2, false)
+            twice(ex) = Expr(:tuple, ex, ex)
+            push!(backend.ast_transforms, twice)
+            put!(backend.repl_channel, (parse_syntax("1+1"), false))
+            reply = take!(backend.response_channel)
+            @test reply == Pair{Any, Bool}((2, 2), false)
+        end
+    catch e
+        Base.rethrow(e)
+    finally
+        put!(backend.repl_channel, (nothing, -1))
+    end
+end
+REPL.start_repl_backend(backend)
+Base.wait(frontend_task)
+
+macro throw_with_linenumbernode(err)
+    Expr(:block, LineNumberNode(42, Symbol("test.jl")), :(() -> throw($err)))
+end
+
+@testset "Install missing packages via hooks" begin
+    @testset "Parse AST for packages" begin
+        test_find_packages(e) =
+            REPL.modules_to_be_loaded(Base.expr_to_syntax(e))
+        test_find_packages(s::String) =
+            REPL.modules_to_be_loaded(parse_syntax(s))
+
+        mods = test_find_packages("using Foo")
+        @test mods == [:Foo]
+        mods = test_find_packages("import Foo")
+        @test mods == [:Foo]
+        mods = test_find_packages("using Foo, Bar")
+        @test mods == [:Foo, :Bar]
+        mods = test_find_packages("import Foo, Bar")
+        @test mods == [:Foo, :Bar]
+        mods = test_find_packages("using Foo.bar, Foo.baz")
+        @test mods == [:Foo]
+
+        mods = test_find_packages("if false using Foo end")
+        @test mods == [:Foo]
+        mods = test_find_packages("if false if false using Foo end end")
+        @test mods == [:Foo]
+        mods = test_find_packages("if false using Foo, Bar end")
+        @test mods == [:Foo, :Bar]
+        mods = test_find_packages("if false using Foo: bar end")
+        @test mods == [:Foo]
+
+        mods = test_find_packages("import Foo.bar as baz")
+        @test mods == [:Foo]
+        mods = test_find_packages("using .Foo")
+        @test isempty(mods)
+        mods = test_find_packages("using Base")
+        @test isempty(mods)
+        mods = test_find_packages("using Base: nope")
+        @test isempty(mods)
+        mods = test_find_packages("using Main")
+        @test isempty(mods)
+        mods = test_find_packages("using Core")
+        @test isempty(mods)
+
+        mods = test_find_packages(":(using Foo)")
+        @test isempty(mods)
+        mods = test_find_packages("ex = :(using Foo)")
+        @test isempty(mods)
+
+        mods = test_find_packages("@eval using Foo")
+        @test isempty(mods)
+        mods = test_find_packages("begin using Foo; @eval using Bar end")
+        @test mods == [:Foo]
+        mods = test_find_packages("Core.eval(Main,\"using Foo\")")
+        @test isempty(mods)
+        mods = test_find_packages("begin using Foo; Core.eval(Main,\"using Foo\") end")
+        @test mods == [:Foo]
+
+        mods = test_find_packages(:(import .Foo: a))
+        @test isempty(mods)
+        mods = test_find_packages(:(using .Foo: a))
+        @test isempty(mods)
+    end
+end
+
+global packages_requested = Any[]
+old_hooks = copy(REPL.install_packages_hooks)
+empty!(REPL.install_packages_hooks)
+push!(REPL.install_packages_hooks, function(pkgs)
+    append!(packages_requested, pkgs)
+    false
+end)
+
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+
+    # Just consume all the output - we only test that the callback ran
+    read_resp_task = @async while !eof(stdout_read)
+        readavailable(stdout_read)
+    end
+
+    write(stdin_write, "using FooNotFound\n")
+    write(stdin_write, "macro usingfoo(); :(using FooNotFoundInMacro); end\n")
+    write(stdin_write, "@usingfoo\n")
+    write(stdin_write, "\x4")
+    Base.wait(repltask)
+    close(stdin_write)
+    close(stdout_read)
+    Base.wait(read_resp_task)
+end
+@test :FooNotFound in packages_requested
+# `using`/`import` are found before macro expansion, so this is missed
+@test_broken :FooNotFoundInMacro in packages_requested
+empty!(REPL.install_packages_hooks); append!(REPL.install_packages_hooks, old_hooks)
+
+# err should reprint error if deeper than top-level
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    # initialize `err` to `nothing`
+    t = @async (readline(stdout_read); readuntil(stdout_read, "\e[0m\n"))
+    write(stdin_write, "setglobal!(Base.MainInclude, :err, nothing)\n")
+    wait(t)
+    readuntil(stdout_read, "julia> ", keep=true)
+    # generate top-level error
+    write(stdin_write, "foobar\n")
+    readline(stdout_read)
+    @test readline(stdout_read) == "\e[0mERROR: UndefVarError: `foobar` not defined in `Main`"
+    @test readline(stdout_read) == "Stacktrace:" skip = Sys.iswindows() && Sys.WORD_SIZE == 32
+    @test readline(stdout_read) == " [1] top-level scope" skip = Sys.iswindows() && Sys.WORD_SIZE == 32
+    @test occursin(r"^   @ REPL\[\d+\]:1:?1?$", readline(stdout_read)) skip = Sys.iswindows() && Sys.WORD_SIZE == 32
+    readuntil(stdout_read, "julia> ", keep=true)
+    # check that top-level error did not change `err`
+    write(stdin_write, "err\n")
+    readline(stdout_read)
+    @test readline(stdout_read) == "\e[0m" skip = Sys.iswindows() && Sys.WORD_SIZE == 32
+    readuntil(stdout_read, "julia> ", keep=true)
+    # generate deeper error
+    write(stdin_write, "foo() = foobar\n")
+    readuntil(stdout_read, "\n\e[0m", keep=true)
+    readline(stdout_read)
+    readuntil(stdout_read, "julia> ", keep=true)
+    write(stdin_write, "foo()\n")
+    readline(stdout_read)
+    @test readline(stdout_read) == "\e[0mERROR: UndefVarError: `foobar` not defined in `Main`"
+    readuntil(stdout_read, "julia> ", keep=true)
+    # check that deeper error did set `err`
+    write(stdin_write, "err\n")
+    readline(stdout_read)
+    @test readline(stdout_read) == "\e[0m1-element ExceptionStack:"
+    @test readline(stdout_read) == "UndefVarError: `foobar` not defined in `Main`"
+    @test readline(stdout_read) == "Stacktrace:"
+    readuntil(stdout_read, "\n\n", keep=true)
+    readuntil(stdout_read, "julia> ", keep=true)
+    write(stdin_write, '\x04')
+    Base.wait(repltask)
+end
+
+fakehistory_2 = """
+# time: 2014-06-29 20:44:29 EDT
+# mode: shell
+\txyz = 2
+# time: 2014-06-29 20:44:29 EDT
+# mode: julia
+\txyz = 2
+# time: 2014-06-29 21:44:29 EDT
+# mode: julia
+\txyz = 1
+# time: 2014-06-30 17:32:49 EDT
+# mode: julia
+\tabc = 3
+# time: 2014-06-30 17:32:59 EDT
+# mode: julia
+\txyz = 1
+# time: 2014-06-30 99:99:99 EDT
+# mode: julia
+\txyz = 2
+# time: 2014-06-30 99:99:99 EDT
+# mode: extended
+\tuser imported custom mode
+"""
+
+# Test various history related issues
+for prompt = ["TestΠ", () -> randstring(rand(1:10))]
+    fake_repl() do stdin_write, stdout_read, repl
+        # In the future if we want we can add a test that the right object
+        # gets displayed by intercepting the display
+        repl.specialdisplay = REPL.REPLDisplay(repl)
+
+        errormonitor(@async write(devnull, stdout_read)) # redirect stdout to devnull so we drain the output pipe
+
+        repl.interface = REPL.setup_interface(repl)
+        repl_mode = repl.interface.modes[1]
+        shell_mode = repl.interface.modes[2]
+        help_mode = repl.interface.modes[3]
+        pkg_mode = repl.interface.modes[4]
+        # histp = repl.interface.modes[5]
+        prefix_mode = repl.interface.modes[5]
+
+        hp = REPL.REPLHistoryProvider(Dict{Symbol,Any}(:julia => repl_mode,
+                                                       :shell => shell_mode,
+                                                       :help  => help_mode))
+        hist_path = tempname()
+        write(hist_path, fakehistory_2)
+        histfile = REPL.HistoryFile(hist_path)
+        hp.history = histfile
+        REPL.history_do_initialize(hp)
+        REPL.history_reset_state(hp)
+
+        # histp.hp = repl_mode.hist = shell_mode.hist = help_mode.hist = hp
+
+        s = LineEdit.init_state(repl.t, prefix_mode)
+        prefix_prev() = REPL.history_prev_prefix(s, hp, "x")
+        prefix_prev()
+        @test LineEdit.mode(s) == repl_mode
+        @test buffercontents(LineEdit.buffer(s)) == "xyz = 2"
+        prefix_prev()
+        @test LineEdit.mode(s) == repl_mode
+        @test buffercontents(LineEdit.buffer(s)) == "xyz = 1"
+        prefix_prev()
+        @test LineEdit.mode(s) == repl_mode
+        @test buffercontents(LineEdit.buffer(s)) == "xyz = 2"
+        prefix_prev()
+        @test LineEdit.mode(s) == shell_mode
+        @test buffercontents(LineEdit.buffer(s)) == "xyz = 2"
+    end
+end
+
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    repl.interface = REPL.setup_interface(repl)
+    s = LineEdit.init_state(repl.t, repl.interface)
+    LineEdit.edit_insert(s, "1234αβ")
+    input_f = function(filename, line, column)
+        write(filename, "1234αβ56γ\n")
+    end
+    LineEdit.edit_input(s, input_f)
+    @test buffercontents(LineEdit.buffer(s)) == "1234αβ56γ"
+    write(stdin_write, '\x04')
+    wait(repltask)
+end
+
+# Test that numbered prompts start at one with initialized session history.
+fake_repl() do stdin_write, stdout_read, repl
+    repl.interface = REPL.setup_interface(repl)
+    hp = repl.interface.modes[1].hist
+    @test hp.start_idx == 1
+    @test REPL.history_do_initialize(hp)
+
+    backend = REPL.REPLBackend()
+    repltask = @async begin
+        REPL.run_repl(repl; backend)
+    end
+
+    REPL.numbered_prompt!(repl, backend)
+
+    global c = Base.Event(true)
+    function sendrepl2(cmd, txt)
+        t = @async write(stdin_write, "$cmd\n notify($(curmod_prefix)c); \"done\"\n")
+        r = readuntil(stdout_read, txt, keep=true)
+        readuntil(stdout_read, "\"done\"\n\n", keep=true)
+        wait(c)
+        wait(t)
+        return r
+    end
+
+    s = sendrepl2("\"z\" * \"z\"\n", "\"zz\"")
+    @test contains(s, "In [1]")
+    @test endswith(s, "Out[1]: \"zz\"")
+
+    s = sendrepl2("\"y\" * \"y\"\n", "\"yy\"")
+    @test endswith(s, "Out[3]: \"yy\"")
+
+    s = sendrepl2("Out[1] * Out[3]\n", "\"zzyy\"")
+    @test endswith(s, "Out[5]: \"zzyy\"")
+
+    # test a top-level expression
+    s = sendrepl2("import REPL\n", "In [8]")
+    @test !contains(s, "ERROR")
+    @test !contains(s, "[6]")
+    @test !contains(s, "Out[7]:")
+    @test contains(s, "In [7]: ")
+    @test contains(s, "import REPL")
+    s = sendrepl2("REPL\n", "In [10]")
+    @test contains(s, "Out[9]: REPL")
+
+    # Test for https://github.com/JuliaLang/julia/issues/46451
+    s = sendrepl2("x_47878 = range(-1; stop = 1)\n", "-1:1")
+    @test contains(s, "Out[11]: -1:1")
+
+    # Test for https://github.com/JuliaLang/julia/issues/49041
+    s = sendrepl2("using Test; @test true", "In [14]")
+    @test !contains(s, "ERROR")
+    @test contains(s, "Test Passed")
+
+    # Test for https://github.com/JuliaLang/julia/issues/49319
+    s = sendrepl2("# comment", "In [16]")
+    @test !contains(s, "ERROR")
+
+    write(stdin_write, '\x04')
+    Base.wait(repltask)
+end
+
+fake_repl() do stdin_write, stdout_read, repl
+    backend = REPL.REPLBackend()
+    repltask = @async REPL.run_repl(repl; backend)
+    write(stdin_write,
+          "a = UInt8(81):UInt8(160); b = view(a, 1:64); c = reshape(b, (8, 8)); d = reinterpret(reshape, Float64, c); sqrteach(a) = [sqrt(x) for x in a]; sqrteach(d)\n\"ZZZZZ\"\n")
+    txt = readuntil(stdout_read, "ZZZZZ")
+    write(stdin_write, '\x04')
+    wait(repltask)
+    @test contains(txt, "Some type information was truncated. Use `show(err)` to see complete types.")
+end
+
+# Hints for tab completes
+
+fake_repl() do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    write(stdin_write, "reada")
+    s1 = readuntil(stdout_read, "reada") # typed
+    s2 = readuntil(stdout_read, "vailable") # partial hint
+
+    write(stdin_write, "x") # "readax" doesn't tab complete so no hint
+    # we can't use readuntil given this doesn't print, so just wait for the hint state to be reset
+    while LineEdit.state(repl.mistate).hint !== nothing
+        sleep(0.1)
+    end
+    @test LineEdit.state(repl.mistate).hint === nothing
+
+    write(stdin_write, "\b") # only tab complete while typing forward
+    while LineEdit.state(repl.mistate).hint !== nothing
+        sleep(0.1)
+    end
+    @test LineEdit.state(repl.mistate).hint === nothing
+
+    write(stdin_write, "v")
+    s3 = readuntil(stdout_read, "ailable") # partial hint
+
+    write(stdin_write, "\t")
+    s4 = readuntil(stdout_read, "readavailable") # full completion is reprinted
+
+    write(stdin_write, "\x15")
+    write(stdin_write, "x") # single chars shouldn't hint e.g. `x` shouldn't hint at `xor`
+    while LineEdit.state(repl.mistate).hint !== nothing
+        sleep(0.1)
+    end
+    @test LineEdit.state(repl.mistate).hint === nothing
+
+    # issue #52376
+    write(stdin_write, "\x15")
+    write(stdin_write, "\\_ailuj")
+    while LineEdit.state(repl.mistate).hint !== nothing
+        sleep(0.1)
+    end
+    @test LineEdit.state(repl.mistate).hint === nothing
+    s5 = readuntil(stdout_read, "\\_ailuj")
+    write(stdin_write, "\t")
+    s6 = readuntil(stdout_read, "ₐᵢₗᵤⱼ")
+
+    write(stdin_write, "\x15\x04")
+    Base.wait(repltask)
+end
+# Hints and Enter with automatically inserted closing brackets
+fake_repl(options=REPL.Options(confirm_exit=false, style_input=false, auto_insert_closing_bracket=true)) do stdin_write, stdout_read, repl
+    repltask = @async REPL.run_repl(repl)
+    write(stdin_write, "f(reada")
+    readuntil(stdout_read, "reada")
+    # the hint is shown before the auto-inserted `)`, after making room for it
+    s1 = readuntil(stdout_read, "vailable")
+    @test contains(s1, "\e[8@")
+    write(stdin_write, "\x15")
+    # the `)` was typed, so moving back over it and pressing Enter runs the input
+    write(stdin_write, "(\"A\" * \"B\")\e[D\r")
+    readuntil(stdout_read, "\"AB\"")
+    write(stdin_write, "\x04")
+    Base.wait(repltask)
+end
+## hints disabled
+fake_repl(options=REPL.Options(confirm_exit=false,hascolor=true,hint_tab_completes=false,style_input=false,auto_insert_closing_bracket=false)) do stdin_write, stdout_read, repl
+    repltask = @async begin
+        REPL.run_repl(repl)
+    end
+    write(stdin_write, "reada")
+    s1 = readuntil(stdout_read, "reada") # typed
+    @test LineEdit.state(repl.mistate).hint === nothing
+
+    write(stdin_write, "\x15\x04")
+    Base.wait(repltask)
+    @test !occursin("vailable", String(readavailable(stdout_read)))
+end
+
+# banner
+let io = IOBuffer()
+    @test REPL.banner(io) === nothing
+    seek(io, 0)
+    @test countlines(io) == 9
+    @test occursin("Version $(Base.version_with_build_variant())", String(take!(io)))
+    @test REPL.banner(io; short=true) === nothing
+    seek(io, 0)
+    @test countlines(io) == 2
+    @test occursin("Version $(Base.version_with_build_variant())", String(take!(io)))
+end
+
+@testset "Docstrings" begin
+    undoc = Docs.undocumented_names(REPL)
+    @test_broken isempty(undoc)
+    @test undoc == [:AbstractREPL, :BasicREPL, :LineEditREPL, :StreamREPL]
+end
+
+struct A40735
+    str::String
+end
+
+# https://github.com/JuliaLang/julia/issues/40735
+@testset "Long printing" begin
+    previous = REPL.SHOW_MAXIMUM_BYTES
+    try
+        REPL.SHOW_MAXIMUM_BYTES = 1000
+        str = string(('a':'z')...)^50
+        @test length(str) > 1100
+        # For a raw string, we correctly get the standard abbreviated output
+        output = sprint(REPL.show_limited, MIME"text/plain"(), str; context=:limit => true)
+        hint = """call `show(stdout, MIME"text/plain"(), ans)` to print without truncation"""
+        suffix = "[printing stopped after displaying 1000 bytes; $hint]"
+        @test !endswith(output, suffix)
+        @test contains(output, "bytes ⋯")
+        # For a struct without a custom `show` method, we don't hit the abbreviated
+        # 3-arg show on the inner string, so here we check that the REPL print-limiting
+        # feature is correctly kicking in.
+        a = A40735(str)
+        output = sprint(REPL.show_limited, MIME"text/plain"(), a; context=:limit => true)
+        @test endswith(output, suffix)
+        @test length(output) <= 1200
+        # We also check some extreme cases
+        REPL.SHOW_MAXIMUM_BYTES = 1
+        output = sprint(REPL.show_limited, MIME"text/plain"(), 1)
+        @test output == "1"
+        output = sprint(REPL.show_limited, MIME"text/plain"(), 12)
+        @test output == "1…[printing stopped after displaying 1 byte; $hint]"
+        REPL.SHOW_MAXIMUM_BYTES = 0
+        output = sprint(REPL.show_limited, MIME"text/plain"(), 1)
+        @test output == "…[printing stopped after displaying 0 bytes; $hint]"
+        @test sprint(io -> show(REPL.LimitIO(io, 5), "abc")) == "\"abc\""
+        @test_throws REPL.LimitIOException(1) sprint(io -> show(REPL.LimitIO(io, 1), "abc"))
+
+        # displaying objects at the REPL sometimes needs access to displaysize, like Dict
+        @test displaysize(IOContext(REPL.LimitIO(stdout, 100), stdout)) == displaysize(stdout)
+    finally
+        REPL.SHOW_MAXIMUM_BYTES = previous
+    end
+end
+
+@testset "`displaysize` return type inference" begin
+    @test Tuple{Int, Int} === Base.infer_return_type(displaysize, Tuple{REPL.Terminals.UnixTerminal})
+end
+
+import REPL.Terminals
+
+struct BareTerminal <: Terminals.TextTerminal end
+
+# What a terminal type gets by default from the abstract terminal interface
+@testset "TextTerminal defaults" begin
+    t = BareTerminal()
+    @test !Terminals.hascolor(t)
+    for f in (flush, Terminals.beep, Terminals.enable_bracketed_paste, Terminals.disable_bracketed_paste)
+        @test f(t) === nothing
+    end
+    for f in (Base.pipe_reader, Base.pipe_writer, displaysize, Terminals.width, Terminals.height,
+              Terminals.getX, Terminals.getY, Terminals.pos, Terminals.clear, Terminals.clear_line,
+              t -> Terminals.clear_line(t, 1), t -> Terminals.cmove(t, 1, 1), t -> Terminals.raw!(t, true))
+        @test_throws "Unimplemented" f(t)
+    end
+end
+
+# escape sequences of the unix terminal
+@testset "UnixTerminal output" begin
+    t = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer())
+    for (f, args, expected) in (
+            (Terminals.cmove_up, (), "\e[1A"),
+            (Terminals.cmove_up, (3,), "\e[3A"),
+            (Terminals.cmove_down, (), "\e[1B"),
+            (Terminals.cmove_down, (3,), "\e[3B"),
+            (Terminals.cmove_right, (), "\e[1C"),
+            (Terminals.cmove_right, (3,), "\e[3C"),
+            (Terminals.cmove_left, (), "\e[1D"),
+            (Terminals.cmove_left, (3,), "\e[3D"),
+            (Terminals.cmove_line_up, (), "\e[1A\r"),
+            (Terminals.cmove_line_up, (2,), "\e[2A\r"),
+            (Terminals.cmove_line_down, (), "\e[1B\r"),
+            (Terminals.cmove_line_down, (2,), "\e[2B\r"),
+            (Terminals.cmove_col, (1,), "\r"),
+            (Terminals.cmove_col, (5,), "\r\e[4C"),
+            (Terminals.enable_bracketed_paste, (), "\e[?2004h"),
+            (Terminals.disable_bracketed_paste, (), "\e[?2004l"),
+            (Terminals.end_keypad_transmit_mode, (), "\e[?1l\e>"),
+            (Terminals.clear, (), "\e[H\e[2J"),
+            (Terminals.clear_line, (), "\r\e[0K"))
+        f(t, args...)
+        @test String(take!(t.out_stream)) == expected
+    end
+    Terminals.beep(t)
+    @test String(take!(t.err_stream)) == "\a"
+    @test isempty(take!(t.out_stream))
+end
+
+# Switching a real terminal device in and out of raw mode
+Sys.iswindows() || @testset "TTYTerminal raw!" begin
+    with_fake_pty() do pts, ptm
+        tty = Base.TTY(pts)
+        term = Terminals.TTYTerminal("xterm", tty, tty, tty)
+        Terminals.raw!(term, true) || error("could not enter raw mode")
+        # raw mode: no echo, no line buffering
+        write(ptm, "a")
+        @test read(tty, Char) == 'a'
+        write(tty, "b")
+        @test read(ptm, Char) == 'b'
+        Terminals.raw!(term, false) || error("could not leave raw mode")
+        write(ptm, "c\n")
+        @test readline(ptm) == "c"
+        @test readline(tty) == "c"
+        close(tty)
+    end
+end
+
+@testset "Dummy Pkg prompt" begin
+    # do this in an empty depot to test default for new users
+    withenv("JULIA_DEPOT_PATH" => mktempdir() * (Sys.iswindows() ? ";" : ":"), "JULIA_LOAD_PATH" => nothing) do
+        prompt = readchomp(`$(Base.julia_cmd()[1]) --startup-file=no -e "using REPL; print(REPL.Pkg_promptf())"`)
+        @test prompt == "(@v$(VERSION.major).$(VERSION.minor)) pkg> "
+    end
+
+    # Issue 55850
+    tmp_55850 = mktempdir()
+    tmp_sym_link = joinpath(tmp_55850, "sym")
+    symlink(tmp_55850, tmp_sym_link; dir_target=true)
+    withenv("JULIA_DEPOT_PATH" => tmp_sym_link * (Sys.iswindows() ? ";" : ":"), "JULIA_LOAD_PATH" => nothing) do
+        prompt = readchomp(`$(Base.julia_cmd()[1]) --startup-file=no -e "using REPL; print(REPL.projname(REPL.find_project_file()))"`)
+        @test prompt == "@v$(VERSION.major).$(VERSION.minor)"
+    end
+
+    get_prompt(proj::String) = readchomp(`$(Base.julia_cmd()[1]) --startup-file=no $(proj) -e "using REPL; print(REPL.Pkg_promptf())"`)
+
+    @test get_prompt("--project=$(pkgdir(REPL))") == "(REPL) pkg> "
+
+    tdir = mkpath(joinpath(mktempdir(), "foo"))
+    @test get_prompt("--project=$tdir") == "(foo) pkg> "
+
+    proj_file = joinpath(tdir, "Project.toml")
+    touch(proj_file) # make a bad Project.toml
+    @test get_prompt("--project=$proj_file") == "(foo) pkg> "
+
+    write(proj_file, "name = \"Bar\"\n")
+    @test get_prompt("--project=$proj_file") == "(Bar) pkg> "
+
+    # The rest don't need a process each. They only change state that they restore at the end.
+    old_project, old_load_path, old_depot_path = Base.ACTIVE_PROJECT[], copy(LOAD_PATH), copy(DEPOT_PATH)
+    function prompt_for(project)
+        Base.set_active_project(project)
+        return REPL.Pkg_promptf()
+    end
+    function write_project(dir, contents)
+        mkpath(dir)
+        project = joinpath(dir, "Project.toml")
+        write(project, contents)
+        return project
+    end
+    mktempdir() do root
+        root = realpath(root)
+        try
+            # projects without a usable name are named after their directory
+            @test prompt_for(joinpath(root, "new", "Project.toml")) == "(new) pkg> "
+            @test prompt_for(write_project(joinpath(root, "bad"), "name = [")) == "(bad) pkg> "
+            @test prompt_for(write_project(joinpath(root, "badname"), "name = 3")) == "(badname) pkg> "
+
+            # long names are shortened
+            @test prompt_for(write_project(joinpath(root, "len"), "name = \"$("a"^30)\"")) == "($("a"^30)) pkg> "
+            @test prompt_for(write_project(joinpath(root, "len2"), "name = \"$("b"^31)\"")) == "($("b"^27)...) pkg> "
+
+            # environments in a depot get a `@`
+            pushfirst!(DEPOT_PATH, joinpath(root, "depot"))
+            @test prompt_for(write_project(joinpath(root, "depot", "environments", "env"), "")) == "(@env) pkg> "
+            @test prompt_for(write_project(joinpath(root, "depot", "environments", "env2"), "name = \"X\"")) == "(@X) pkg> "
+            @test prompt_for(write_project(joinpath(root, "depot", "environments-old", "env"), "")) == "(env) pkg> " # same prefix only
+            popfirst!(DEPOT_PATH)
+
+            # a workspace member shows the root project and its path from there
+            ws = joinpath(root, "ws")
+            write_project(ws, "name = \"Root\"\n[workspace]\nprojects = [\"sub\", \"sub/nested\"]\n")
+            sub = write_project(joinpath(ws, "sub"), "name = \"Sub\"\n")
+            nested = write_project(joinpath(ws, "sub", "nested"), "name = \"Nested\"\n")
+            @test prompt_for(joinpath(ws, "Project.toml")) == "(Root) pkg> "
+            @test prompt_for(sub) == "(Root/sub) pkg> "
+            @test prompt_for(nested) == "(Root/$(joinpath("sub", "nested"))) pkg> "
+            @test REPL.find_root_base_project(nested) == joinpath(ws, "Project.toml")
+            @test REPL.relative_project_path(joinpath(ws, "Project.toml"), nested) == joinpath("sub", "nested", "Project.toml")
+            # not listed by the parent project, so not a member
+            @test prompt_for(write_project(joinpath(ws, "other"), "name = \"Other\"\n")) == "(Other) pkg> "
+
+            # the name is cached until the file's modification time changes
+            cached = write_project(joinpath(root, "cached"), "name = \"Old\"\n")
+            function set_mtime(path, t)
+                f = Base.Filesystem.open(path, Base.Filesystem.JL_O_RDWR)
+                try
+                    Base.Filesystem.futime(f, t, t)
+                finally
+                    close(f)
+                end
+            end
+            set_mtime(cached, 1.0e9)
+            @test prompt_for(cached) == "(Old) pkg> "
+            write(cached, "name = \"New\"\n")
+            set_mtime(cached, 1.0e9)
+            @test REPL.Pkg_promptf() == "(Old) pkg> "
+            set_mtime(cached, 1.0e9 + 2)
+            @test REPL.Pkg_promptf() == "(New) pkg> "
+            @test prompt_for(write_project(joinpath(root, "other"), "")) == "(other) pkg> "
+            @test prompt_for(cached) == "(New) pkg> "
+
+            # symlinks in the path are resolved, even for a path that doesn't exist yet
+            @test REPL.safe_realpath("") == ""
+            if !Sys.iswindows()
+                link = joinpath(root, "link")
+                symlink(root, link)
+                @test REPL.safe_realpath(joinpath(link, "nothere", "x")) == joinpath(root, "nothere", "x")
+            end
+
+            # no project at all
+            Base.ACTIVE_PROJECT[] = nothing
+            empty!(LOAD_PATH)
+            @test REPL.find_project_file() === nothing
+            @test REPL.Pkg_promptf() == "pkg> "
+        finally
+            Base.ACTIVE_PROJECT[] = old_project
+            copy!(LOAD_PATH, old_load_path)
+            copy!(DEPOT_PATH, old_depot_path)
+        end
+    end
+end
+
+# Issue #58158 add alias for Char display in REPL
+@testset "REPL show_repl Char alias" begin
+    # Test character with a known emoji alias
+    output = sprint(REPL.show_repl, MIME("text/plain"), '😼'; context=(:color => true))
+    # Check for base info and the specific alias
+    @test occursin("'😼': Unicode U+1F63C (category So: Symbol, other)", output)
+    @test occursin(", input as ", output) # Check for the prefix text
+    @test occursin("\\:smirk_cat:<tab>", output) # Check for the alias text (may be colored)
+
+    # Test character with a known LaTeX alias
+    output = sprint(REPL.show_repl, MIME("text/plain"), 'α'; context=(:color => true))
+    # Check for base info and the specific alias
+    @test occursin("'α': Unicode U+03B1 (category Ll: Letter, lowercase)", output)
+    @test occursin(", input as ", output) # Check for the prefix text
+    @test occursin("\\alpha<tab>", output) # Check for the alias text (may be colored)
+
+    # Test character without an alias
+    output = sprint(REPL.show_repl, MIME("text/plain"), 'X'; context=(:color => true))
+    # Check for base info only
+    @test occursin("'X': ASCII/Unicode U+0058 (category Lu: Letter, uppercase)", output)
+    # Ensure alias part is *not* printed
+    @test !occursin(", input as ", output)
+
+    # Test another character without an alias (symbol)
+    output = sprint(REPL.show_repl, MIME("text/plain"), '+'; context=(:color => true))
+    @test occursin("'+': ASCII/Unicode U+002B (category Sm: Symbol, math)", output)
+    @test !occursin(", input as ", output)
+end
+
+# Test syntax highlighting in REPL input
+@testset "Syntax highlighting" begin
+    using StyledStrings
+    using REPL.StylingPasses
+
+    # Use withfaces to ensure consistent face definitions regardless of user config
+    StyledStrings.withfaces(:julia_keyword => StyledStrings.Face(foreground=:red),
+                            :julia_number => StyledStrings.Face(foreground=:blue)) do
+
+        # Test that julia_prompt has syntax highlighting passes
+        fake_repl(options = REPL.Options(confirm_exit=false, style_input=true, auto_insert_closing_bracket=false)) do stdin_write, stdout_read, repl
+            repl.interface = REPL.setup_interface(repl)
+            julia_prompt = repl.interface.modes[1]
+            shell_mode = repl.interface.modes[3]
+
+            # Julia prompt should have syntax highlighting passes
+            @test length(julia_prompt.styling_passes) == 2
+            @test any(p -> p isa StylingPasses.SyntaxHighlightPass, julia_prompt.styling_passes)
+            @test any(p -> p isa StylingPasses.EnclosingParenHighlightPass, julia_prompt.styling_passes)
+
+            # Shell mode should not have syntax highlighting passes
+            @test length(shell_mode.styling_passes) == 0
+
+            # Test that syntax highlighting is actually applied
+            repltask = @async begin
+                REPL.run_repl(repl)
+            end
+
+            # Test 1: Simple keyword highlighting
+            write(stdin_write, "function # SENTINEL1")
+            s = readuntil(stdout_read, "# SENTINEL1", keep=true)
+            # The keyword "function" should be styled (have escape code before it)
+            # Look for "function" that appears after the prompt, not just anywhere
+            # Extract just the input portion after "julia> "
+            input_part = split(s, "julia> ", keepempty=false)
+            if !isempty(input_part)
+                input_text = input_part[end]
+                # If syntax highlighting is working, "function" will have an escape code before it
+                # like \e[31mfunction or similar
+                @test occursin(r"\e\[[0-9;]*m.*function", input_text)
+            end
+            write(stdin_write, "\x03")  # Ctrl-C to cancel
+
+            # Test 2: Unicode identifiers with syntax highlighting
+            readuntil(stdout_read, "julia> ")
+            write(stdin_write, "function αβ(a, β) # SENTINEL2")
+            s = readuntil(stdout_read, "# SENTINEL2", keep=true)
+            # Should highlight "function" keyword even with unicode following
+            input_part = split(s, "julia> ", keepempty=false)
+            if !isempty(input_part)
+                input_text = input_part[end]
+                # Keyword should be styled
+                @test occursin(r"\e\[[0-9;]*m.*function", input_text)
+            end
+            # Unicode should be preserved (may have ANSI codes interleaved, so check separately)
+            @test occursin("α", s)
+            @test occursin("β", s)
+            @test occursin("(", s)
+            @test occursin(")", s)
+            write(stdin_write, "\x03")  # Ctrl-C to cancel
+
+            # Test 3: Multi-line input with syntax highlighting
+            readuntil(stdout_read, "julia> ")
+            write(stdin_write, "begin\n")
+            readuntil(stdout_read, "begin")
+            write(stdin_write, "    local test_var_for_highlighting = 42 # SENTINEL3\n")
+            s = readuntil(stdout_read, "# SENTINEL3", keep=true)
+            # Should contain highlighting - the "local" keyword should be styled
+            @test occursin(r"\e\[[0-9;]*m.*local", s)
+            write(stdin_write, "\x03")  # Ctrl-C to cancel before executing
+            # Don't execute to avoid polluting Main module
+
+            # Test 4: Bracket highlighting (paren matching)
+            readuntil(stdout_read, "julia> ")
+            write(stdin_write, "(1 + (2 * 3)) # SENTINEL4")
+            # Move cursor to be inside the inner parens: between 2 and *
+            # Current position is at end: (1 + (2 * 3)) # SENTINEL4|
+            # Move left to get to: (1 + (2| * 3)) # SENTINEL4
+            # We need to move past " # SENTINEL4" which is 13 characters
+            for _ in 1:18  # 13 for " # SENTINEL4" + 5 to get between 2 and *
+                write(stdin_write, "\e[D")  # Left arrow
+            end
+            # Give it a moment to process and re-render
+            sleep(0.1)
+            # Now write a space to trigger re-render and capture output
+            write(stdin_write, " ")
+            s = readuntil(stdout_read, "# SENTINEL4", keep=true)
+            # The enclosing parens around "2 * 3" should be highlighted with bold/underline
+            # We can't easily test the exact positioning, but we can verify that
+            # there are ANSI codes for bold (\e[1m) or underline (\e[4m) present
+            @test occursin(r"\e\[[0-9;]*[14]m", s)  # Contains bold or underline codes
+            write(stdin_write, "\x03")  # Ctrl-C to cancel
+
+            write(stdin_write, '\x04')  # Exit
+            Base.wait(repltask)
+        end
+
+        # Test that syntax highlighting can be disabled
+        fake_repl(options = REPL.Options(confirm_exit=false, style_input=false, auto_insert_closing_bracket=false)) do stdin_write, stdout_read, repl
+            repl.interface = REPL.setup_interface(repl)
+
+            repltask = @async begin
+                REPL.run_repl(repl)
+            end
+
+            # Even though the prompt has styling passes, they shouldn't be applied
+            write(stdin_write, "function # SENTINEL5")
+            s = readuntil(stdout_read, "# SENTINEL5", keep=true)
+            # With style_input=false, there should be no color codes from syntax highlighting
+            # (there may still be prompt color codes, but not within the input text)
+            lines = split(s, '\n')
+            # The last line should contain just "function" without color codes around it
+            @test occursin("function", s)
+
+            write(stdin_write, "\x03")  # Ctrl-C to cancel
+            write(stdin_write, '\x04')  # Exit
+            Base.wait(repltask)
+        end
+    end
+end
+
+# Test find_enclosing_parens boundary conditions and multi-byte handling
+@testset "find_enclosing_parens" begin
+    using REPL.StylingPasses: find_enclosing_parens
+    JuliaSyntax = Base.JuliaSyntax
+    fep(input, cursor_pos) = find_enclosing_parens(input,
+        JuliaSyntax.parseall(JuliaSyntax.GreenNode, input; ignore_errors=true), cursor_pos)
+
+    # cursor_pos is a 1-indexed byte offset.
+    # Returned positions are 1-indexed byte positions.
+
+    # Boundary: "a(x)b" — '(' at byte 2, ')' at byte 4
+    # Match range is cursor_pos ∈ [open_pos-1, close_pos] = [1, 4]
+    @test isempty(fep("a(x)b", 1))    # just before range
+    @test fep("a(x)b", 2) == [(2, 4)] # on '(' (left boundary)
+    @test fep("a(x)b", 4) == [(2, 4)] # inside
+    @test fep("a(x)b", 5) == [(2, 4)] # one past ')' (right boundary)
+    @test isempty(fep("a(x)b", 6))    # just after range
+
+    # Multi-byte: α is 2 bytes, so ')' lands at byte 4 instead of 3
+    @test fep("(α)", 1) == [(1, 4)]
+    @test fep("(α)", 2) == [(1, 4)]
+    @test fep("(α)", 4) == [(1, 4)]
+    # 4-byte char: 𝐱 is U+1D431, ')' lands at byte 6
+    @test fep("(𝐱)", 1) == [(1, 6)]
+    @test fep("(𝐱)", 7) == [(1, 6)]
+
+    # Nested same-type: innermost wins
+    @test fep("(a+(b))", 5) == [(4, 6)]
+    # Mixed types: matched independently
+    pairs = fep("f(a[b])", 5)
+    @test (2, 7) in pairs && (4, 6) in pairs
+
+    # Edge cases
+    @test isempty(fep("", 1))
+    @test isempty(fep("(x", 2))
+end
+
+# Test that REPL picks up syntax version from active project and re-latches on project switch
+@testset "REPL syntax version switching" begin
+    mktempdir() do tmpdir
+        # Create two projects with different syntax versions
+        proj1 = joinpath(tmpdir, "proj1")
+        proj2 = joinpath(tmpdir, "proj2")
+        mkpath(proj1)
+        mkpath(proj2)
+        write(joinpath(proj1, "Project.toml"), "syntax.julia_version = \"1.13\"\n")
+        write(joinpath(proj2, "Project.toml"), "syntax.julia_version = \"1.14\"\n")
+        found_113 = found_114 = false
+
+        old_active_project = Base.ACTIVE_PROJECT[]
+        try
+            Base.set_active_project(joinpath(proj1, "Project.toml"))
+
+            fake_repl() do stdin_write, stdout_read, repl
+                repl.specialdisplay = REPL.REPLDisplay(repl)
+                repl.history_file = false
+
+                repltask = @async REPL.run_repl(repl)
+
+                # Wait for the first prompt
+                readuntil(stdout_read, "julia> ")
+
+                # Check syntax version is 1.13 from proj1
+                write(stdin_write, "(Base.Experimental.@VERSION).syntax\r")
+                readuntil(stdout_read, "v\"1.13")
+                found_113 = true
+
+                # Wait for next prompt
+                readuntil(stdout_read, "julia> ")
+
+                # Switch to proj2 with syntax version 1.14
+                write(stdin_write, "Base.set_active_project($(repr(joinpath(proj2, "Project.toml"))))\r")
+                readuntil(stdout_read, "julia> ")
+
+                # Next prompt should use syntax version 1.14 from proj2
+                write(stdin_write, "(Base.Experimental.@VERSION).syntax\r")
+                readuntil(stdout_read, "v\"1.14")
+                found_114 = true
+
+                write(stdin_write, '\x04')
+                Base.wait(repltask)
+            end
+        finally
+            Base.set_active_project(old_active_project)
+        end
+        @test found_113
+        @test found_114
+    end
+end
+
+@testset "REPL.hascolor(::BasicREPL)" begin
+    term = REPL.Terminals.TTYTerminal("dumb",IOBuffer("1+2\n"),IOContext(IOBuffer(),:foo=>true),IOBuffer())
+    r = REPL.BasicREPL(term)
+    @test !REPL.hascolor(r)
 end

@@ -10,26 +10,116 @@ if !@isdefined(testenv_defined)
     if haskey(ENV, "JULIA_TEST_EXEFLAGS")
         const test_exeflags = `$(Base.shell_split(ENV["JULIA_TEST_EXEFLAGS"]))`
     else
-        inline_flag = Base.JLOptions().can_inline == 1 ? `` : `--inline=no`
-        cov_flag = ``
-        if Base.JLOptions().code_coverage == 1
-            cov_flag = `--code-coverage=user`
-        elseif Base.JLOptions().code_coverage == 2
-            cov_flag = `--code-coverage=all`
+        const test_exeflags = Base.julia_cmd()
+        filter!(test_exeflags.exec) do c
+            return !(startswith(c, "--depwarn") || startswith(c, "--check-bounds"))
         end
-        const test_exeflags = `$cov_flag $inline_flag --check-bounds=yes --startup-file=no --depwarn=error`
+        push!(test_exeflags.exec, "--check-bounds=yes")
+        push!(test_exeflags.exec, "--startup-file=no")
+        push!(test_exeflags.exec, "--depwarn=error")
+        # keep reports of precompilation triggered by loading out of the test logs
+        push!(test_exeflags.exec, "-q")
+    end
+    if haskey(ENV, "JULIA_TEST_EXTRA_EXEFLAGS")
+        append!(test_exeflags.exec, Base.shell_split(ENV["JULIA_TEST_EXTRA_EXEFLAGS"]))
     end
 
     if haskey(ENV, "JULIA_TEST_EXENAME")
+        popfirst!(test_exeflags.exec)
         const test_exename = `$(Base.shell_split(ENV["JULIA_TEST_EXENAME"]))`
     else
-        const test_exename = `$(joinpath(Sys.BINDIR, Base.julia_exename()))`
+        const test_exename = popfirst!(test_exeflags.exec)
     end
 
-    addprocs_with_testenv(X; kwargs...) = addprocs(X; exename=test_exename, exeflags=test_exeflags, kwargs...)
+    if haskey(ENV, "JULIA_RR")
+        const rr_exename = `$(Base.shell_split(ENV["JULIA_RR"]))`
+    else
+        const rr_exename = ``
+    end
+
+    const test_relocated_depot = haskey(ENV, "RELOCATEDEPOT")
+
+    # OS pids of the workers spawned by `addprocs_with_testenv`, recorded at
+    # spawn time (while the worker is guaranteed healthy) so that the teardown
+    # hook in runtests.jl can signal workers that have hung in the meantime.
+    const worker_ospids = Dict{Int, Int}()
+
+    # Best-effort enumeration of the direct children of `pid`.
+    function child_pids(pid::Integer)
+        children = Int[]
+        try
+            # On Linux, read /proc. Elsewhere, ask pgrep.
+            if Sys.islinux()
+                for tid in readdir("/proc/$pid/task")
+                    append!(children, parse.(Int, split(read("/proc/$pid/task/$tid/children", String))))
+                end
+            else
+                # `pgrep -P` exits non-zero when there are no matches
+                append!(children, parse.(Int, split(read(ignorestatus(`pgrep -P $pid`), String))))
+            end
+        catch
+            # the process may have exited already; return what we have
+        end
+        return children
+    end
+
+    # Best-effort enumeration of the live descendants (children, grandchildren, ...)
+    # of `pid`, ordered parents-before-children.
+    function descendant_pids(pid::Integer)
+        pids = Int[]
+        queue = Int[pid]
+        while !isempty(queue)
+            children = child_pids(popfirst!(queue))
+            append!(pids, children)
+            append!(queue, children)
+        end
+        return pids
+    end
+
+    # Each worker gets an equal share of the machine's memory as its heap size hint, sized
+    # for a pool of `pool_size` workers. A worker that replaces a recycled one is started
+    # on its own, so it must pass the size of the pool it joins: sized for a pool of one,
+    # it would get half the machine's memory.
+    function addprocs_with_testenv(X; rr_allowed=true, pool_size=X, kwargs...)
+        exename = rr_allowed ? `$rr_exename $test_exename` : test_exename
+        exeflags = test_exeflags
+        if pool_size isa Integer
+            heap_size = round(Int, Sys.total_memory() / 2^20 / (pool_size + 1))
+            exeflags = `$exeflags --heap-size-hint=$(heap_size)M`
+        end
+        # starting many workers on a loaded machine can exceed the default 60 s
+        timeout = get(ENV, "JULIA_WORKER_TIMEOUT", "300")
+        procs = withenv("JULIA_WORKER_TIMEOUT" => timeout) do
+            addprocs(X; exename=exename, exeflags=exeflags, kwargs...)
+        end
+        for w in procs
+            worker_ospids[w] = remotecall_fetch(getpid, w)
+        end
+        return procs
+    end
+
+    function rmprocs_with_testenv(pids...; kwargs...)
+        result = rmprocs(pids...; kwargs...)
+        for p in pids, q in (p isa Integer ? (p,) : p)
+            delete!(worker_ospids, q)
+        end
+        return result
+    end
 
     const curmod = @__MODULE__
     const curmod_name = fullname(curmod)
     const curmod_str = curmod === Main ? "Main" : join(curmod_name, ".")
-    const curmod_prefix = "$(["$m." for m in curmod_name]...)"
+    const curmod_prefix = curmod === Main ? "" : "$(["$m." for m in curmod_name]...)"
+
+    # platforms that support cfunction with closures
+    # (requires LLVM back-end support for trampoline intrinsics)
+    const cfunction_closure = Sys.ARCH === :x86_64 || Sys.ARCH === :i686
+
+    macro async_logerr(expr)
+        :(@async try
+            $(esc(expr))
+        catch err
+            @error("An async task failed", exception=(err, catch_backtrace()))
+        end)
+    end
 end

@@ -1,0 +1,320 @@
+# This file is a part of Julia. License is MIT: https://julialang.org/license
+
+# RUNx: julia --startup-file=no -O2 --check-bounds=yes %s %t -O && llvm-link -S %t/* | FileCheck %s --check-prefixes=ALL
+# RUNx: julia --startup-file=no -O3 --check-bounds=yes %s %t -O && llvm-link -S %t/* | FileCheck %s --check-prefixes=ALL
+
+# RUN: julia --startup-file=no %s %t && llvm-link -S %t/* | FileCheck %s --check-prefix=UNOPT
+
+# RUN: julia --startup-file=no -O2 --check-bounds=no %s %t -O && llvm-link -S %t/* | FileCheck %s --check-prefixes=ALL,BC_OFF
+# RUN: julia --startup-file=no -O3 --check-bounds=no %s %t -O && llvm-link -S %t/* | FileCheck %s --check-prefixes=ALL,BC_OFF
+
+# RUN: julia --startup-file=no -O2 --check-bounds=auto %s %t -O && llvm-link -S %t/* | FileCheck %s --check-prefixes=ALL,BC_AUTO
+# RUN: julia --startup-file=no -O3 --check-bounds=auto %s %t -O && llvm-link -S %t/* | FileCheck %s --check-prefixes=ALL,BC_AUTO
+
+include(joinpath("..", "testhelpers", "llvmpasses.jl"))
+
+# COM: Ensure safe iteration over one array is not boundschecked and is vectorized
+
+# ALL-LABEL: @julia_iterate_read
+# ALL-NOT: bounds_error
+# ALL: vector.body
+function iterate_read(arr)
+    total = zero(eltype(arr))
+    for i in eachindex(arr)
+        total += arr[i]
+    end
+    total
+end
+
+# ALL-LABEL: @julia_iterate_write
+# ALL-NOT: bounds_error
+# ALL: vector.body
+function iterate_write(arr, out)
+    for i in eachindex(arr, out)
+        out[i] = arr[i]
+    end
+end
+
+# ALL-LABEL: @"julia_iterate_write!
+# ALL-NOT: bounds_error
+# ALL: vector.body
+function iterate_write!(arr)
+    for i in eachindex(arr)
+        arr[i] *= 2
+    end
+end
+
+# COM: Ensure safe iteration over multiple arrays is not boundschecked and is vectorized
+
+# ALL-LABEL: @julia_multiiterate_read
+# ALL-NOT: bounds_error
+# ALL: vector.body
+function multiiterate_read(arr1, arr2)
+    total = zero(eltype(arr1))
+    for i in eachindex(arr1, arr2)
+        total += arr1[i]
+        total += arr2[i]
+    end
+    total
+end
+
+# ALL-LABEL: @japi1_multiiterate_write
+# ALL-NOT: bounds_error
+# ALL: vector.body
+function multiiterate_write(arr1, arr2, arr3)
+    for i in eachindex(arr1, arr2, arr3)
+        arr3[i] += arr1[i]
+        arr3[i] += arr2[i]
+    end
+end
+
+# ALL-LABEL: @"julia_multiiterate_write!
+# ALL-NOT: bounds_error
+# ALL: vector.body
+function multiiterate_write!(arr1, arr2)
+    for i in eachindex(arr1, arr2)
+        arr1[i] += arr2[i]
+    end
+end
+
+# COM: Preserve alias information for complete small typed copies while keeping padded and large copies as memcpy
+
+# ALL-LABEL: @"julia_copy_complex!
+# ALL: vector.body
+# UNOPT-LABEL: @"julia_copy_complex!
+# UNOPT: [[COMPLEX0:%.*copyload.*]] = load i64
+# UNOPT: [[COMPLEX1:%.*copyload.*]] = load i64
+# UNOPT: store i64 [[COMPLEX0]], ptr addrspace(13)
+# UNOPT: store i64 [[COMPLEX1]], ptr addrspace(13)
+function copy_complex!(dest, src)
+    @inbounds @simd for i in eachindex(dest, src)
+        dest[i] = src[i]
+    end
+end
+
+# ALL-LABEL: @"julia_copy_bytes!
+# ALL: vector.body
+# UNOPT-LABEL: @"julia_copy_bytes!
+# UNOPT: [[BYTES:%.*copyload.*]] = load i64
+# UNOPT: store i64 [[BYTES]], ptr addrspace(13)
+function copy_bytes!(dest, src)
+    @inbounds @simd for i in eachindex(dest, src)
+        dest[i] = src[i]
+    end
+end
+
+# ALL-LABEL: @"julia_copy_three_bytes!
+# ALL: vector.body
+# UNOPT-LABEL: @"julia_copy_three_bytes!
+# UNOPT: [[BYTES0:%.*copyload.*]] = load i8
+# UNOPT: [[BYTES1:%.*copyload.*]] = load i8
+# UNOPT: [[BYTES2:%.*copyload.*]] = load i8
+# UNOPT: store i8 [[BYTES0]], ptr addrspace(13)
+# UNOPT: store i8 [[BYTES1]], ptr addrspace(13)
+# UNOPT: store i8 [[BYTES2]], ptr addrspace(13)
+function copy_three_bytes!(dest, src)
+    @inbounds @simd for i in eachindex(dest, src)
+        dest[i] = src[i]
+    end
+end
+
+# ALL-LABEL: @"julia_copy_float3!
+# ALL: vector.body
+# UNOPT-LABEL: @"julia_copy_float3!
+# UNOPT: [[FLOAT0:%.*copyload.*]] = load i32
+# UNOPT: [[FLOAT1:%.*copyload.*]] = load i32
+# UNOPT: [[FLOAT2:%.*copyload.*]] = load i32
+# UNOPT: store i32 [[FLOAT0]], ptr addrspace(13)
+# UNOPT: store i32 [[FLOAT1]], ptr addrspace(13)
+# UNOPT: store i32 [[FLOAT2]], ptr addrspace(13)
+function copy_float3!(dest, src)
+    @inbounds @simd for i in eachindex(dest, src)
+        dest[i] = src[i]
+    end
+end
+
+struct PaddedCopy
+    x::UInt8
+    y::UInt16
+end
+
+# UNOPT-LABEL: @"julia_copy_padded!
+# UNOPT: call void @llvm.memcpy{{.*}}(ptr addrspace(13) {{.*}}, ptr{{.*}}%"split::PaddedCopy", i64 4
+function copy_padded!(dest, src)
+    @inbounds dest[1] = src[1]
+end
+
+struct LargeCopy
+    data::NTuple{17, UInt8}
+end
+
+# UNOPT-LABEL: @"julia_copy_large!
+# UNOPT: call void @llvm.memcpy{{.*}}(ptr addrspace(13) {{.*}}, ptr{{.*}}%"split::LargeCopy", i64 17
+function copy_large!(dest, src)
+    @inbounds dest[1] = src[1]
+end
+
+# COM: memset checks
+
+# COM: INT64
+# ALL: define {{.*}} @julia_zeros
+# ALL-NOT: bounds_error
+# COM: memset is not used with bounds checks on (too late in the pipeline)
+# BC_OFF: llvm.memset
+# BC_AUTO: llvm.memset
+
+# COM: INT32
+# ALL: define {{.*}} @julia_zeros
+# ALL-NOT: bounds_error
+# COM: memset is not used with bounds checks on (too late in the pipeline)
+# BC_OFF: llvm.memset
+# BC_AUTO: llvm.memset
+
+# COM: INT16
+# ALL: define {{.*}} @julia_zeros
+# ALL-NOT: bounds_error
+# COM: memset is not used with bounds checks on (too late in the pipeline)
+# BC_OFF: llvm.memset
+# BC_AUTO: llvm.memset
+
+# COM: check reductive indvars/vectorization
+
+# ALL-LABEL: @julia_sumloop
+# ALL: mul
+function sumloop(N)
+    total = zero(typeof(N))
+    for i in one(typeof(N)):N
+        total += i
+    end
+    total
+end
+# ALL-LABEL: @julia_simd_sumloop
+# ALL: vector.body
+function simd_sumloop(N)
+    total = zero(typeof(N))
+    @simd for i in one(typeof(N)):N
+        total += i
+    end
+    total
+end
+
+# COM: check hoisting and loop deletion functionality
+
+# ALL-LABEL: @julia_loopedlength
+# ALL-NOT: br
+# ALL: ret
+function loopedlength(arr)
+    len = length(arr)
+    for i in 1:length(arr)
+        len = length(arr)
+    end
+    len
+end
+# COM: Vector
+# ALL-LABEL: @julia_memset_like
+# ALL: vector.body
+
+# COM: Memory
+# ALL-LABEL: @julia_memset_like
+# ALL: vector.body
+function memset_like(mem)
+    for idx in eachindex(mem)
+        mem[idx] = 1.0
+    end
+end
+
+# COM: A fill of an array of two or more dimensions allocated in the same function. LICM
+# COM: hoists the reload of its size out of the loop, and the size stored by the constructor
+# COM: must be forwarded to it before IndVarSimplify, or the bounds check stays and the loop
+# COM: does not become a memset (#61870)
+
+# ALL-LABEL: @julia_fill_fresh_matrix
+# BC_AUTO-NOT: call {{.*}}throw_boundserror
+# ALL: call void @llvm.memset{{.*}}(ptr {{.*}}, i8 0, i64 {{%.*}}, i1 false)
+# BC_AUTO-NOT: call {{.*}}throw_boundserror
+function fill_fresh_matrix(m, n)
+    A = Matrix{Float64}(undef, m, n)
+    for i in eachindex(A)
+        A[i] = 0.0
+    end
+    return A
+end
+
+# ALL-LABEL: @julia_fill_fresh_similar
+# BC_AUTO-NOT: call {{.*}}throw_boundserror
+# ALL: call void @llvm.memset{{.*}}(ptr {{.*}}, i8 0, i64 {{%.*}}, i1 false)
+# BC_AUTO-NOT: call {{.*}}throw_boundserror
+function fill_fresh_similar(B)
+    A = similar(B)
+    for i in eachindex(A)
+        A[i] = 0
+    end
+    return A
+end
+
+# COM: `===` on boxed values calls `jl_egal__unboxed`, which only reads memory, so a
+# COM: loop-invariant comparison is hoisted and the loop vectorizes
+
+# ALL-LABEL: @julia_sum_if_egal
+# ALL: call i32 @jl_egal__unboxed
+# ALL: vector.body
+# ALL-NOT: call i32 @jl_egal__unboxed
+# ALL: ret i64
+function sum_if_egal(v, @nospecialize(a), @nospecialize(b))
+    s = 0
+    for i in eachindex(v)
+        if a === b
+            s += v[i]
+        end
+    end
+    s
+end
+
+# COM: Small constant-trip inner loops must be fully unrolled before IRCE splits them,
+# COM: otherwise LoopIdiomRecognize turns them into a variable-length memcpy (#62798)
+
+# ALL-LABEL: @julia_small_column_copy
+# ALL-NOT: llvm.memcpy
+# ALL: ret void
+function small_column_copy(out, u)
+    for k in axes(out, 2)
+        u_node = (u[1, k], u[2, k], u[3, k], u[4, k], u[5, k])
+        for v in 1:5
+            out[v, k] = u_node[v]
+        end
+    end
+end
+
+emit(iterate_read, Vector{Int64})
+emit(iterate_write, Vector{Int64}, Vector{Int64})
+emit(iterate_write!, Vector{Int64})
+
+emit(multiiterate_read, Vector{Int64}, Vector{Int64})
+emit(multiiterate_write, Vector{Int64}, Vector{Int64}, Vector{Int64})
+emit(multiiterate_write!, Vector{Int64}, Vector{Int64})
+emit(copy_complex!, Vector{ComplexF64}, Vector{ComplexF64})
+emit(copy_bytes!, Vector{NTuple{8, UInt8}}, Vector{NTuple{8, UInt8}})
+emit(copy_three_bytes!, Vector{NTuple{3, UInt8}}, Vector{NTuple{3, UInt8}})
+emit(copy_float3!, Vector{NTuple{3, Float32}}, Vector{NTuple{3, Float32}})
+emit(copy_padded!, Vector{PaddedCopy}, Vector{PaddedCopy})
+emit(copy_large!, Vector{LargeCopy}, Vector{LargeCopy})
+
+emit(zeros, Core.TypeEgal{Int64}, Int64)
+emit(zeros, Core.TypeEgal{Int32}, Int64)
+emit(zeros, Core.TypeEgal{Int16}, Int64)
+# COM: Int8 is hardcoded to memset anyways
+
+emit(sumloop, Int64)
+# COM: Float64 doesn't vectorize for some reason
+emit(simd_sumloop, Float32)
+
+emit(loopedlength, Vector{Int64})
+
+emit(memset_like, Vector{Float64})
+emit(memset_like, Memory{Float64})
+
+emit(fill_fresh_matrix, Int64, Int64)
+emit(fill_fresh_similar, Array{Float32, 3})
+
+emit(sum_if_egal, Vector{Int64}, Any, Any)
+emit(small_column_copy, Matrix{Float64}, Matrix{Float64})

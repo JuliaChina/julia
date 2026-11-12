@@ -1,33 +1,39 @@
-# Sockets
-
 ```@meta
-DocTestSetup = :(using Sockets)
+EditURL = "https://github.com/JuliaLang/julia/blob/master/stdlib/Sockets/docs/src/index.md"
 ```
 
+# Sockets
+
 ```@docs
+Sockets.Sockets
 Sockets.connect(::TCPSocket, ::Integer)
 Sockets.connect(::AbstractString)
 Sockets.listen(::Any)
 Sockets.listen(::AbstractString)
 Sockets.getaddrinfo
 Sockets.getipaddr
+Sockets.getipaddrs
+Sockets.islinklocaladdr
 Sockets.getalladdrinfo
+Sockets.DNSError
 Sockets.getnameinfo
 Sockets.getsockname
 Sockets.getpeername
+Sockets.IPAddr
 Sockets.IPv4
 Sockets.IPv6
+Sockets.@ip_str
 Sockets.TCPSocket
 Sockets.UDPSocket
 Sockets.accept
 Sockets.listenany
-Sockets.bind
+Sockets.bind(::Union{Sockets.TCPServer, Sockets.UDPSocket, Sockets.TCPSocket}, ::Sockets.IPAddr, ::Integer)
 Sockets.send
 Sockets.recv
 Sockets.recvfrom
 Sockets.setopt
-```
-
-```@meta
-DocTestSetup = nothing
+Sockets.nagle
+Sockets.quickack
+Sockets.join_multicast_group
+Sockets.leave_multicast_group
 ```

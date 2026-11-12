@@ -9,7 +9,9 @@ include("FakeTerminals.jl")
 import .FakeTerminals.FakeTerminal
 
 # no need to have animation in tests
-REPL.GlobalOptions.region_animation_duration=0.001
+REPL.GlobalOptions.region_animation_duration=0.0001
+# tests are inserting code much faster than humans
+REPL.GlobalOptions.auto_indent_time_threshold = -0.0
 
 ## helper functions
 
@@ -17,6 +19,96 @@ function new_state()
     term = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer())
     LineEdit.init_state(term, LineEdit.ModalInterface([LineEdit.Prompt("test> ")]))
 end
+
+# Run `keys` through the real input loop of a prompt. The final `\r` ends the prompt.
+function press(keys; prompt=LineEdit.Prompt("test> "))
+    term = FakeTerminal(IOBuffer(keys * "\r"), IOBuffer(), IOBuffer(), false)
+    s = LineEdit.init_state(term, LineEdit.ModalInterface(LineEdit.TextInterface[prompt]))
+    LineEdit.prompt!(term, s.interface, s)
+    return s
+end
+
+# Normal and prefix history search prompts emit one marker pair without changing their width.
+@testset "semantic prompt rendering" begin
+    for markers in (REPL.OSC_133_MARKERS, REPL.OSC_633_MARKERS),
+            enabled in (false, true), color in (false, true)
+        output = IOBuffer()
+        term = FakeTerminal(IOBuffer(), output, IOBuffer(), color)
+        repl = REPL.LineEditREPL(term, color)
+        repl.semantic_prompt_markers = markers
+        repl.options.semantic_prompts = enabled
+        prompt = LineEdit.Prompt("julia> "; repl)
+        prefix_prompt = LineEdit.PrefixHistoryPrompt(prompt.hist, prompt)
+        rendered = color ? Base.text_colors[:bold] * "julia> " * Base.text_colors[:normal] : "julia> "
+        expected = enabled ? markers.prompt_start * rendered * markers.prompt_end : rendered
+        for state in (prompt, LineEdit.init_state(term, prompt), LineEdit.init_state(term, prefix_prompt))
+            @test LineEdit.write_prompt(term, state, color) == 7
+            @test String(take!(output)) == expected
+        end
+        prompt.repl = nothing
+        @test LineEdit.write_prompt(term, prompt, color) == 7
+        @test String(take!(output)) == rendered
+    end
+end
+
+# History search initializes prompt modes added after MIState creation (#61584).
+module HistorySearchDynamicMode
+
+using Test
+using REPL
+import REPL.LineEdit
+import ..FakeTerminals: FakeTerminal
+
+struct MockHistoryFile end
+
+mutable struct MockHistoryProvider <: LineEdit.HistoryProvider
+    history::MockHistoryFile
+    last_buffer::IOBuffer
+    last_mode::Union{Nothing,LineEdit.Prompt}
+    mode_mapping::Dict{Symbol,LineEdit.Prompt}
+end
+
+REPL.histsearch(::MockHistoryFile, args...) = (mode = :pkg, text = "status")
+LineEdit.add_history(::MockHistoryProvider, s) = nothing
+
+@testset "history search initializes dynamic modes" begin
+    term = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer())
+    main_mode = LineEdit.Prompt("julia> ")
+    dummy_pkg_mode = LineEdit.Prompt("pkg> ")
+    history = MockHistoryProvider(MockHistoryFile(), IOBuffer(), nothing,
+                                  Dict(:julia => main_mode, :pkg => dummy_pkg_mode))
+    main_mode.hist = dummy_pkg_mode.hist = history
+    interface = LineEdit.ModalInterface(LineEdit.TextInterface[main_mode, dummy_pkg_mode])
+    mistate = LineEdit.init_state(term, interface)
+    mistate.terminal_properties.da1 = Int[]
+
+    pkg_mode = LineEdit.Prompt("(project) pkg> ")
+    pkg_mode.hist = history
+    history.mode_mapping[:pkg] = pkg_mode
+    push!(interface.modes, pkg_mode)
+    @test !haskey(mistate.mode_state, pkg_mode)
+
+    LineEdit.history_search(mistate)
+    @test mistate.current_mode === pkg_mode
+    @test String(take!(copy(LineEdit.buffer(mistate)))) == "status"
+
+    # Both search keys start the search from the keymap and leave the result in the buffer.
+    prompt_keymap = LineEdit.keymap([LineEdit.history_keymap, LineEdit.default_keymap, LineEdit.escape_defaults])
+    for key in ("\x12", "\x13")
+        main_mode = LineEdit.Prompt("julia> "; keymap_dict=prompt_keymap)
+        pkg_mode = LineEdit.Prompt("pkg> "; keymap_dict=prompt_keymap)
+        main_mode.hist = pkg_mode.hist = MockHistoryProvider(MockHistoryFile(), IOBuffer(), nothing,
+            Dict(:julia => main_mode, :pkg => pkg_mode))
+        term = FakeTerminal(IOBuffer(key * "\r"), IOBuffer(), IOBuffer(), false)
+        mistate = LineEdit.init_state(term, LineEdit.ModalInterface(LineEdit.TextInterface[main_mode, pkg_mode]))
+        mistate.terminal_properties.da1 = Int[]
+        LineEdit.prompt!(term, mistate.interface, mistate)
+        @test mistate.current_mode === pkg_mode
+        @test LineEdit.input_string(LineEdit.state(mistate)) == "status"
+    end
+end
+
+end # module HistorySearchDynamicMode
 
 charseek(buf, i) = seek(buf, nextind(content(buf), 0, i+1)-1)
 charpos(buf, pos=position(buf)) = length(content(buf), 1, pos)
@@ -27,7 +119,7 @@ function transform!(f, s, i = -1) # i is char-based (not bytes) buffer position
     # simulate what happens in LineEdit.set_action!
     s isa LineEdit.MIState && (s.current_action = :unknown)
     status = f(s)
-    if s isa LineEdit.MIState && status != :ignore
+    if s isa LineEdit.MIState && status !== :ignore
         # simulate what happens in LineEdit.prompt!
         s.last_action = s.current_action
     end
@@ -46,20 +138,20 @@ end
 
 a_foo = 0
 
-const foo_keymap = Dict(
+const foo_keymap = Dict{Char,Any}(
     'a' => (o...)->(global a_foo; a_foo += 1)
 )
 
 b_foo = 0
 
-const foo2_keymap = Dict(
+const foo2_keymap = Dict{Char,Any}(
     'b' => (o...)->(global b_foo; b_foo += 1)
 )
 
 a_bar = 0
 b_bar = 0
 
-const bar_keymap = Dict(
+const bar_keymap = Dict{Char,Any}(
     'a' => (o...)->(global a_bar; a_bar += 1),
     'b' => (o...)->(global b_bar; b_bar += 1)
 )
@@ -82,7 +174,7 @@ run_test(test3_dict,IOBuffer("aab"))
 @test b_bar == 1
 
 # Multiple spellings in the same keymap
-const test_keymap_1 = Dict(
+const test_keymap_1 = Dict{Any,Any}(
     "^C" => (o...)->1,
     "\\C-C" => (o...)->2
 )
@@ -91,11 +183,11 @@ const test_keymap_1 = Dict(
 
 a_foo = a_bar = 0
 
-const test_keymap_2 = Dict(
+const test_keymap_2 = Dict{Any,Any}(
     "abc" => (o...)->(global a_foo = 1)
 )
 
-const test_keymap_3 = Dict(
+const test_keymap_3 = Dict{Any,Any}(
     "a"  => (o...)->(global a_foo = 2),
     "bc" => (o...)->(global a_bar = 3)
 )
@@ -117,13 +209,13 @@ end
 
 a_foo = 0
 
-const test_keymap_4 = Dict(
+const test_keymap_4 = Dict{Any,Any}(
     "a" => (o...)->(global a_foo = 1),
     "b" => "a",
     "c" => (o...)->(global a_foo = 2),
 )
 
-const test_keymap_5 = Dict(
+const test_keymap_5 = Dict{Any,Any}(
     "a" => (o...)->(global a_foo = 3),
     "d" => "c"
 )
@@ -141,7 +233,7 @@ end
 
 # Eager redirection with cycles
 
-const test_cycle = Dict(
+const test_cycle = Dict{Any,Any}(
     "a" => "b",
     "b" => "a"
 )
@@ -150,15 +242,15 @@ const test_cycle = Dict(
 
 # Lazy redirection with Cycles
 
-const level1 = Dict(
+const level1 = Dict{Any,Any}(
     "a" => LineEdit.KeyAlias("b")
 )
 
-const level2a = Dict(
+const level2a = Dict{Any,Any}(
     "b" => "a"
 )
 
-const level2b = Dict(
+const level2b = Dict{Any,Any}(
     "b" => LineEdit.KeyAlias("a")
 )
 
@@ -169,13 +261,13 @@ const level2b = Dict(
 
 a_foo = 0
 
-const test_keymap_6 = Dict(
+const test_keymap_6 = Dict{Any,Any}(
     "a" => (o...)->(global a_foo = 1),
     "b" => LineEdit.KeyAlias("a"),
     "c" => (o...)->(global a_foo = 2),
 )
 
-const test_keymap_7 = Dict(
+const test_keymap_7 = Dict{Any,Any}(
     "a" => (o...)->(global a_foo = 3),
     "d" => "c"
 )
@@ -198,7 +290,7 @@ global path1 = 0
 global path2 = 0
 global path3 = 0
 
-const test_keymap_8 = Dict(
+const test_keymap_8 = Dict{Any,Any}(
     "**" => (o...)->(global path1 += 1),
     "ab" => (o...)->(global path2 += 1),
     "cd" => (o...)->(global path3 += 1),
@@ -221,7 +313,7 @@ end
 global path1 = 0
 global path2 = 0
 
-const test_keymap_9 = Dict(
+const test_keymap_9 = Dict{Any,Any}(
     "***" => (o...)->(global path1 += 1),
     "*a*" => (o...)->(global path2 += 1)
 )
@@ -240,21 +332,22 @@ end
 buf = IOBuffer("a\na\na\n")
 seek(buf, 0)
 for i = 1:6
-    LineEdit.edit_move_right(buf)
+    @test LineEdit.edit_move_right(buf)
     @test position(buf) == i
 end
 @test eof(buf)
-for i = 5:0
-    LineEdit.edit_move_left(buf)
+@test !LineEdit.edit_move_right(buf)
+for i = 5:-1:0
+    @test @inferred LineEdit.edit_move_left(buf)
     @test position(buf) == i
 end
 
 # skip unicode combining characters
 buf = IOBuffer("ŷ")
 seek(buf, 0)
-LineEdit.edit_move_right(buf)
+@test LineEdit.edit_move_right(buf)
 @test eof(buf)
-LineEdit.edit_move_left(buf)
+@test LineEdit.edit_move_left(buf)
 @test position(buf) == 0
 
 ## edit_move_{up,down} ##
@@ -303,25 +396,25 @@ seek(buf,0)
 
 ## edit_delete_prev_word ##
 
-buf = IOBuffer("type X\n ")
+buf = IOBuffer(Vector{UInt8}("type X\n "), read=true, write=true)
 seekend(buf)
-@test !isempty(LineEdit.edit_delete_prev_word(buf))
+@test !isempty(@inferred(LineEdit.edit_delete_prev_word(buf)))
 @test position(buf) == 5
 @test buf.size == 5
 @test content(buf) == "type "
 
-buf = IOBuffer("4 +aaa+ x")
+buf = IOBuffer(Vector{UInt8}("4 +aaa+ x"), read=true, write=true)
 seek(buf,8)
 @test !isempty(LineEdit.edit_delete_prev_word(buf))
 @test position(buf) == 3
 @test buf.size == 4
 @test content(buf) == "4 +x"
 
-buf = IOBuffer("x = func(arg1,arg2 , arg3)")
+buf = IOBuffer(Vector{UInt8}("x = func(arg1,arg2 , arg3)"), read=true, write=true)
 seekend(buf)
 LineEdit.char_move_word_left(buf)
 @test position(buf) == 21
-@test !isempty(LineEdit.edit_delete_prev_word(buf))
+@test !isempty(@inferred(LineEdit.edit_delete_prev_word(buf)))
 @test content(buf) == "x = func(arg1,arg3)"
 @test !isempty(LineEdit.edit_delete_prev_word(buf))
 @test content(buf) == "x = func(arg3)"
@@ -334,18 +427,18 @@ let buf = IOBuffer()
     LineEdit.edit_move_left(buf)
     @test position(buf) == 0
     LineEdit.edit_move_right(buf)
-    @test bytesavailable(buf) == 0
-    LineEdit.edit_backspace(buf, false, false)
+    @test @inferred(bytesavailable(buf)) == 0
+    @inferred(LineEdit.edit_backspace(buf, false, false))
     @test content(buf) == "a"
 end
 
 ## edit_transpose_chars ##
 let buf = IOBuffer()
-    edit_insert(buf, "abcde")
+    @inferred(edit_insert(buf, "abcde"))
     seek(buf,0)
-    LineEdit.edit_transpose_chars(buf)
+    @inferred(LineEdit.edit_transpose_chars(buf))
     @test content(buf) == "abcde"
-    LineEdit.char_move_right(buf)
+    @inferred Union{Char,Bool} LineEdit.char_move_right(buf)
     LineEdit.edit_transpose_chars(buf)
     @test content(buf) == "bacde"
     LineEdit.edit_transpose_chars(buf)
@@ -357,7 +450,7 @@ let buf = IOBuffer()
     @test content(buf) == "bcade"
 
     seek(buf, 0)
-    LineEdit.edit_clear(buf)
+    @inferred(LineEdit.edit_clear(buf))
     edit_insert(buf, "αβγδε")
     seek(buf,0)
     LineEdit.edit_transpose_chars(buf)
@@ -372,6 +465,25 @@ let buf = IOBuffer()
     @test content(buf) == "βγαεδ"
     LineEdit.edit_transpose_chars(buf)
     @test content(buf) == "βγαδε"
+
+
+    # Transposing a one-char buffer should behave like Emacs
+    seek(buf, 0)
+    @inferred(LineEdit.edit_clear(buf))
+    edit_insert(buf, "a")
+    LineEdit.edit_transpose_chars(buf)
+    @test content(buf) == "a"
+    seekend(buf)
+    LineEdit.edit_transpose_chars(buf)
+    @test content(buf) == "a"
+    @test position(buf) == 0
+
+    # Transposing an empty buffer shouldn't implode
+    seek(buf, 0)
+    LineEdit.edit_clear(buf)
+    LineEdit.edit_transpose_chars(buf)
+    @test content(buf) == ""
+    @test position(buf) == 0
 end
 
 @testset "edit_word_transpose" begin
@@ -383,7 +495,7 @@ end
 
     mode[] = :readline
     edit_insert(buf, "àbç def  gh ")
-    @test transpose!(0) == ("àbç def  gh ", 0)
+    @test @inferred(transpose!(0)) == ("àbç def  gh ", 0)
     @test transpose!(1) == ("àbç def  gh ", 1)
     @test transpose!(2) == ("àbç def  gh ", 2)
     @test transpose!(3) == ("def àbç  gh ", 7)
@@ -393,7 +505,7 @@ end
     @test transpose!(7) == ("àbç gh  def ", 11)
     @test transpose!(10) == ("àbç def  gh ", 11)
     @test transpose!(11) == ("àbç gh   def", 12)
-    edit_insert(buf, " ")
+    @inferred(edit_insert(buf, " "))
     @test transpose!(13) == ("àbç def    gh", 13)
 
     take!(buf)
@@ -410,7 +522,7 @@ end
 let s = new_state(),
     buf = buffer(s)
 
-    edit_insert(s,"first line\nsecond line\nthird line")
+    @inferred Union{Int,LineEdit.InputAreaState} edit_insert(s,"first line\nsecond line\nthird line")
     @test content(buf) == "first line\nsecond line\nthird line"
 
     ## edit_move_line_start/end ##
@@ -436,14 +548,14 @@ let s = new_state(),
 
     ## edit_kill_line, edit_yank ##
     seek(buf, 0)
-    LineEdit.edit_kill_line(s)
+    @inferred Union{Symbol,LineEdit.InputAreaState} LineEdit.edit_kill_line(s)
     s.key_repeats = 1 # Manually flag a repeated keypress
     LineEdit.edit_kill_line(s)
     s.key_repeats = 0
     @test content(buf) == "second line\nthird line"
     LineEdit.move_line_end(s)
     LineEdit.edit_move_right(s)
-    LineEdit.edit_yank(s)
+    @inferred Union{Symbol,LineEdit.InputAreaState} LineEdit.edit_yank(s)
     @test content(buf) == "second line\nfirst line\nthird line"
 end
 
@@ -452,13 +564,14 @@ end
 # julia> is 6 characters + 1 character for space,
 # so the rest of the terminal is 73 characters
 #########################################################################
-let buf = IOBuffer(
+withenv("COLUMNS"=>"80") do
+    buf = IOBuffer(
         "begin\nprint(\"A very very very very very very very very very very very very ve\")\nend")
     seek(buf, 4)
     outbuf = IOBuffer()
     termbuf = REPL.Terminals.TerminalBuffer(outbuf)
     term = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer())
-    s = LineEdit.refresh_multi_line(termbuf, term, buf,
+    s = @inferred LineEdit.refresh_multi_line(termbuf, term, buf,
         REPL.LineEdit.InputAreaState(0,0), "julia> ", indent = 7)
     @test s == REPL.LineEdit.InputAreaState(3,1)
 end
@@ -466,9 +579,9 @@ end
 @testset "function prompt indentation" begin
     local s, term, ps, buf, outbuf, termbuf
     s = new_state()
-    term = REPL.LineEdit.terminal(s)
+    term = @inferred REPL.AbstractTerminal REPL.LineEdit.terminal(s)
     # default prompt: PromptState.indent should not be set to a final fixed value
-    ps::LineEdit.PromptState = s.mode_state[s.current_mode]
+    ps::LineEdit.PromptState = @inferred LineEdit.ModeState s.mode_state[s.current_mode]
     @test ps.indent == -1
     # the prompt is modified afterwards to a function
     ps.p.prompt = let i = 0
@@ -478,7 +591,7 @@ end
     write(buf, "begin\n    julia = :fun\nend")
     outbuf = IOBuffer()
     termbuf = REPL.Terminals.TerminalBuffer(outbuf)
-    LineEdit.refresh_multi_line(termbuf, term, ps)
+    @inferred(LineEdit.refresh_multi_line(termbuf, term, ps))
     @test String(take!(outbuf)) ==
         "\r\e[0K\e[1mJulia is Fun! > \e[0m\r\e[16Cbegin\n" *
         "\r\e[16C    julia = :fun\n" *
@@ -494,14 +607,32 @@ end
     s = new_state()
     edit_insert(s, "αä🐨") # for issue #28183
     s.current_action = :unknown
-    LineEdit.edit_shift_move(s, LineEdit.edit_move_left)
+    @inferred Union{Bool, LineEdit.InputAreaState} LineEdit.edit_shift_move(s, LineEdit.edit_move_left)
     @test LineEdit.region(s) == (5=>9)
     LineEdit.edit_shift_move(s, LineEdit.edit_move_left)
     @test LineEdit.region(s) == (2=>9)
     LineEdit.edit_shift_move(s, LineEdit.edit_move_left)
     @test LineEdit.region(s) == (0=>9)
-    LineEdit.edit_shift_move(s, LineEdit.edit_move_right)
+    @inferred Union{Bool, LineEdit.InputAreaState} LineEdit.edit_shift_move(s, LineEdit.edit_move_right)
     @test LineEdit.region(s) == (2=>9)
+
+    # issue #61377
+    for edit_move in [LineEdit.edit_insert_newline, LineEdit.edit_backspace,
+            LineEdit.edit_move_left, LineEdit.edit_move_right,
+            LineEdit.edit_move_word_left, LineEdit.edit_move_word_right,
+            LineEdit.edit_move_up, LineEdit.edit_move_down]
+        s = new_state()
+        edit_insert(s, "abcd\nefgh\nijkl")
+        s.current_action = :unknown
+        LineEdit.edit_move_up(s)
+        s.current_action = :unknown
+        LineEdit.edit_shift_move(s, LineEdit.edit_move_left)
+        s.current_action = :unknown
+        LineEdit.edit_shift_move(s, LineEdit.edit_move_left)
+        s.current_action = :unknown
+        edit_move(s)
+        @test !LineEdit.is_region_active(s)
+    end
 end
 
 @testset "tab/backspace alignment feature" begin
@@ -511,9 +642,9 @@ end
     end
 
     edit_insert(s, "for x=1:10\n")
-    LineEdit.edit_tab(s)
+    @inferred Union{Symbol,LineEdit.InputAreaState} LineEdit.edit_tab(s)
     @test content(s) == "for x=1:10\n    "
-    LineEdit.edit_backspace(s, true, false)
+    @inferred Union{Nothing,LineEdit.InputAreaState} LineEdit.edit_backspace(s, true, false)
     @test content(s) == "for x=1:10\n"
     edit_insert(s, "  ")
     @test position(s) == 13
@@ -604,13 +735,13 @@ end
 
 @testset "change case on the right" begin
     local buf = IOBuffer()
-    edit_insert(buf, "aa bb CC")
+    edit_insert(buf, "aa bB CC")
     seekstart(buf)
-    LineEdit.edit_upper_case(buf)
-    LineEdit.edit_title_case(buf)
+    @inferred LineEdit.edit_upper_case(buf)
+    @inferred LineEdit.edit_title_case(buf)
     @test String(take!(copy(buf))) == "AA Bb CC"
     @test position(buf) == 5
-    LineEdit.edit_lower_case(buf)
+    @inferred LineEdit.edit_lower_case(buf)
     @test String(take!(copy(buf))) == "AA Bb cc"
 end
 
@@ -619,18 +750,18 @@ end
     s = new_state()
     buf = buffer(s)
     edit_insert(s, "ça ≡ nothing")
-    @test transform!(LineEdit.edit_copy_region, s) == ("ça ≡ nothing", 12, 0)
+    @test @inferred transform!(LineEdit.edit_copy_region, s) == ("ça ≡ nothing", 12, 0)
     @test s.kill_ring[end] == "ça ≡ nothing"
-    @test transform!(LineEdit.edit_exchange_point_and_mark, s)[2:3] == (0, 12)
+    @test @inferred transform!(LineEdit.edit_exchange_point_and_mark, s)[2:3] == (0, 12)
     charseek(buf, 8); setmark(s)
     charseek(buf, 1)
-    @test transform!(LineEdit.edit_kill_region, s) == ("çhing", 1, 1)
+    @test @inferred transform!(LineEdit.edit_kill_region, s) == ("çhing", 1, 1)
     @test s.kill_ring[end] == "a ≡ not"
     charseek(buf, 0)
-    @test transform!(LineEdit.edit_yank, s) == ("a ≡ notçhing", 7, 0)
+    @test @inferred transform!(LineEdit.edit_yank, s) == ("a ≡ notçhing", 7, 0)
     s.last_action = :unknown
     # next action will fail, as yank-pop doesn't know a yank was just issued
-    @test transform!(LineEdit.edit_yank_pop, s) == ("a ≡ notçhing", 7, 0)
+    @test @inferred transform!(LineEdit.edit_yank_pop, s) == ("a ≡ notçhing", 7, 0)
     s.last_action = :edit_yank
     # now this should work:
     @test transform!(LineEdit.edit_yank_pop, s) == ("ça ≡ nothingçhing", 12, 0)
@@ -642,7 +773,7 @@ end
     s.last_action = :unknown
     @test transform!(s->LineEdit.edit_yank_pop(s, false), s) == ("ça ≡ nothinga ≡ not", 19, 12)
 
-    # repetition (concatenation of killed strings
+    # repetition (concatenation of killed strings)
     edit_insert(s, "A B  C")
     LineEdit.edit_delete_prev_word(s)
     s.key_repeats = 1
@@ -687,13 +818,13 @@ end
 
     edit_insert(s, "one two three")
 
-    @test edit!(LineEdit.edit_delete_prev_word) == "one two "
-    @test edit!(edit_undo!) == "one two three"
+    @test @inferred edit!(LineEdit.edit_delete_prev_word) == "one two "
+    @test @inferred edit!(edit_undo!) == "one two three"
     @test edit!(edit_redo!) == "one two "
     @test edit!(edit_undo!) == "one two three"
 
     edit_insert(s, " four")
-    @test edit!(s->edit_insert(s, " five")) == "one two three four five"
+    @test @inferred edit!(s->edit_insert(s, " five")) == "one two three four five"
     @test edit!(edit_undo!) == "one two three four"
     @test edit!(edit_undo!) == "one two three"
     @test edit!(edit_redo!) == "one two three four"
@@ -701,16 +832,16 @@ end
     @test edit!(edit_undo!) == "one two three four"
     @test edit!(edit_undo!) == "one two three"
 
-    @test edit!(LineEdit.edit_clear) == ""
+    @test @inferred edit!(LineEdit.edit_clear) == ""
     @test edit!(LineEdit.edit_clear) == "" # should not be saved twice
     @test edit!(edit_undo!) == "one two three"
 
-    @test edit!(LineEdit.edit_insert_newline) == "one two three\n"
+    @test @inferred edit!(LineEdit.edit_insert_newline) == "one two three\n"
     @test edit!(edit_undo!) == "one two three"
 
     LineEdit.edit_move_left(s)
     LineEdit.edit_move_left(s)
-    @test edit!(LineEdit.edit_transpose_chars) == "one two there"
+    @test @inferred edit!(LineEdit.edit_transpose_chars) == "one two there"
     @test edit!(edit_undo!) == "one two three"
     @test edit!(LineEdit.edit_transpose_words) == "one three two"
     @test edit!(edit_undo!) == "one two three"
@@ -806,8 +937,8 @@ end
     local buf = IOBuffer()
     write(buf, "1\n22\n333")
     seek(buf, 0)
-    @test LineEdit.edit_indent(buf, -1, false) == false
-    @test transform!(buf->LineEdit.edit_indent(buf, -1, false), buf) == ("1\n22\n333", 0, 0)
+    @test @inferred LineEdit.edit_indent(buf, -1, false) == false
+    @test @inferred transform!(buf->LineEdit.edit_indent(buf, -1, false), buf) == ("1\n22\n333", 0, 0)
     @test transform!(buf->LineEdit.edit_indent(buf, +1, false), buf) == (" 1\n22\n333", 1, 0)
     @test transform!(buf->LineEdit.edit_indent(buf, +2, false), buf) == ("   1\n22\n333", 3, 0)
     @test transform!(buf->LineEdit.edit_indent(buf, -2, false), buf) == (" 1\n22\n333", 1, 0)
@@ -840,10 +971,10 @@ end
 end
 
 @testset "edit_transpose_lines_{up,down}!" begin
-    transpose_lines_up!(buf) = LineEdit.edit_transpose_lines_up!(buf, position(buf)=>position(buf))
-    transpose_lines_up_reg!(buf) = LineEdit.edit_transpose_lines_up!(buf, region(buf))
-    transpose_lines_down!(buf) = LineEdit.edit_transpose_lines_down!(buf, position(buf)=>position(buf))
-    transpose_lines_down_reg!(buf) = LineEdit.edit_transpose_lines_down!(buf, region(buf))
+    transpose_lines_up!(buf) = @inferred LineEdit.edit_transpose_lines_up!(buf, position(buf)=>position(buf))
+    transpose_lines_up_reg!(buf) = @inferred LineEdit.edit_transpose_lines_up!(buf, region(buf))
+    transpose_lines_down!(buf) = @inferred LineEdit.edit_transpose_lines_down!(buf, position(buf)=>position(buf))
+    transpose_lines_down_reg!(buf) = @inferred LineEdit.edit_transpose_lines_down!(buf, region(buf))
 
     local buf
     buf = IOBuffer()
@@ -876,5 +1007,781 @@ end
     buf.mark = 0
     seek(buf, 1)
     @test transform!(transpose_lines_down_reg!, buf) == ("l2\nl3\nl1", 4, 3)
-
 end
+
+@testset "edit_insert_last_word" begin
+    get_last_word(str::String) = @inferred LineEdit.get_last_word(IOBuffer(str))
+    @test get_last_word("1+2") == "2"
+    @test get_last_word("1+23") == "23"
+    @test get_last_word("1+2") == "2"
+    @test get_last_word(""" "a" * "b" """) == "b"
+    @test get_last_word(""" "a" * 'b' """) == "b"
+    @test get_last_word(""" "a" * `b` """) == "b"
+    @test get_last_word("g()") == "g()"
+    @test get_last_word("g(1, 2)") == "2"
+    @test get_last_word("g(1, f())") == "f"
+    @test get_last_word("a[1]") == "1"
+    @test get_last_word("a[b[]]") == "b"
+    @test get_last_word("a[]") == "a[]"
+end
+
+@testset "show_completions" begin
+    term = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer())
+
+    function getcompletion(completions)
+        promptstate = REPL.LineEdit.init_state(term, REPL.LineEdit.mode(new_state()))
+        REPL.LineEdit.show_completions(promptstate, completions)
+        return String(take!(term.out_stream))
+    end
+
+    # When the number of completions is less than
+    # LineEdit.MULTICOLUMN_THRESHOLD, they should be in a single column.
+    strings = ["abcdef", "123456", "ijklmn"]
+    @assert length(strings) < LineEdit.MULTICOLUMN_THRESHOLD
+    @test getcompletion(strings) == "\033[0B\n\rabcdef\n\r123456\n\rijklmn\n"
+
+    # But with more than the threshold there should be multiple columns
+    strings2 = repeat(["foo"], LineEdit.MULTICOLUMN_THRESHOLD + 1)
+    @test getcompletion(strings2) == "\033[0B\n\rfoo\r\e[5Cfoo\n\rfoo\r\e[5Cfoo\n\rfoo\r\e[5Cfoo\n"
+
+    # Check that newlines in completions are handled correctly (issue #45836)
+    strings3 = ["abcdef", "123456\nijklmn"]
+    @test getcompletion(strings3) == "\033[0B\nabcdef\n123456\nijklmn\n"
+
+    # Internal names come after the public ones, under a header and in their own columns.
+    # Lists without internal names get no header, as checked above.
+    named = [LineEdit.NamedCompletion("b", "b", true), LineEdit.NamedCompletion("a"),
+             LineEdit.NamedCompletion("long_internal", "long_internal", true)]
+    @test getcompletion(named) == "\033[0B\n\ra\n\rInternal:\n\rb\n\rlong_internal\n"
+    named2 = vcat(map(LineEdit.NamedCompletion, strings2),
+                  [LineEdit.NamedCompletion("internal", "internal", true) for _ in strings2])
+    @test getcompletion(named2) ==
+        "\033[0B\n" * "\rfoo\r\e[5Cfoo\n" ^ 3 * "\rInternal:\n" * "\rinternal\r\e[10Cinternal\n" ^ 3
+    @test getcompletion([LineEdit.NamedCompletion("x", "x", true)]) == "\033[0B\n\rInternal:\n\rx\n"
+end
+
+# Each binding of the default keymap, with `|` typed at the end to show where the cursor is.
+@testset "default keymap" begin
+    left, right, up, down = "\e[D", "\e[C", "\e[A", "\e[B"
+    newline = "\e\r"
+    for (keys, expected) in Pair{String,String}[
+            # cursor movement
+            "abc$left|" => "ab|c",
+            "abc$left$left$right|" => "ab|c",
+            "abc\x02|" => "ab|c", # ^B
+            "abc\x02\x02\x06|" => "ab|c", # ^F
+            "ab\e[H|" => "|ab",
+            "ab\e[H\e[F|" => "ab|",
+            "ab cd\x01\x05|" => "ab cd|", # ^A, ^E
+            "a$(newline)bc$up|" => "a|\nbc",
+            "a$(newline)bc$up$down|" => "a\nb|c",
+            "a$(newline)bc\x10|" => "a|\nbc", # ^P
+            "a$(newline)bc\x10\x0e|" => "a\nb|c", # ^N
+            "ab cd\eb|" => "ab |cd",
+            "ab cd\eb\ef|" => "ab cd|",
+            "ab cd\e[1;5D|" => "ab |cd",
+            "ab cd\e[1;5D\e[1;5C|" => "ab cd|",
+            "ab cd\eOd|" => "ab |cd",
+            "ab cd\eOd\eOc|" => "ab cd|",
+            # deleting and killing
+            "ab cd\e\b" => "ab ",
+            "ab cd\e\x7f" => "ab ",
+            "ab\e[H\x04" => "b", # ^D on a non-empty buffer
+            "ab\e[H\e[3~" => "b",
+            "ab cd\x17" => "ab ", # ^W
+            "ab cd\x01\ed" => " cd",
+            "ab cd\x02\x02\x0b" => "ab ", # ^K
+            "ab cd\x02\x02\x15" => "cd", # ^U
+            "ab cd\x02\x02\x0b\x01\x19" => "cdab ", # ^Y
+            "ab cd\x17\x19\x19" => "ab cdcd",
+            "ab\x17 cd\x17\x19\ey" => " ab", # alt-y cycles through the kill ring
+            # the region: ^space twice activates it
+            "abc\0\x02\x02\x7f" => "bc",
+            "abc\0\0\x02\x02\x7f" => "a",
+            "abc\0\0\x02\x02\x07\x7f" => "bc", # ^G cancels it
+            "ab\0\x01\x18\x18|" => "ab|", # ^X^X
+            "abc\0\x02\ew\x05\x19" => "abcc",
+            "abc\0\x02\eW|" => "ab|",
+            "abc\e[1;2D\e[1;2D\x7f" => "a",
+            "abc\x01\e[1;2C\x7f" => "bc",
+            "a$(newline)b\e[1;2A\x7f" => "a",
+            "a$(newline)b\x01\x10\e[1;2B\x7f" => "b",
+            # moving and indenting lines
+            "l1$(newline)l2\e[1;3A" => "l2\nl1",
+            "l1$(newline)l2\e[1;3A\e[1;3B" => "l1\nl2",
+            "l1$(newline)l2\e[1;3B" => "l1\nl2",
+            "l1$(newline)l2$(newline)l3\0\0\x02\x02\x10\e[1;3A" => "l2\nl3\nl1", # the whole region moves
+            "l1$(newline)l2$(newline)l3\e[A\0\0\x02\x02\x10\e[1;3B" => "l3\nl1\nl2",
+            "ab\e[1;3C" => " ab",
+            "    ab\e[1;3D" => "   ab",
+            "ab\e[1;3D" => "ab",
+            # other edits
+            "ab\x14" => "ba", # ^T
+            "ab cd\x01\et" => "cd ab",
+            "abc\x01\eu" => "ABC",
+            "ABC\x01\el" => "abc",
+            "abc\x01\ec" => "Abc",
+            "\e[200~ a\r  b\e[201~" => "a\n b",
+            # alt-. needs a history, and this prompt has none
+            "ab\e." => "ab",
+            "\x0c" => "",
+            "a\x0cb" => "ab",
+            "a\x03b" => "b",
+        ]
+        @test (keys => content(press(keys))) == (keys => expected)
+    end
+
+    term_output(s) = String(take!(LineEdit.terminal(s).out_stream))
+    @test occursin("\e[H\e[2J", term_output(press("\x0c")))
+    @test occursin("^C\n\n", term_output(press("a\x03")))
+    @test occursin("press ^C again to cancel all in-flight work", term_output(press("\x03\x03")))
+
+    # ^Z asks the caller to suspend and keeps the input.
+    if Sys.isunix()
+        term = FakeTerminal(IOBuffer("ab\x1a"), IOBuffer(), IOBuffer(), false)
+        s = LineEdit.init_state(term, LineEdit.ModalInterface(LineEdit.TextInterface[LineEdit.Prompt("test> ")]))
+        buf, ok, suspend = LineEdit.prompt!(term, s.interface, s)
+        @test ok && suspend
+        @test content(buf) == "ab"
+    end
+
+    # ^D on an empty prompt asks for confirmation on the terminal when that is enabled.
+    let repl = REPL.LineEditREPL(FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer(), false), false)
+        repl.options = REPL.Options(confirm_exit=true)
+        prompt = LineEdit.Prompt("test> "; repl)
+        term = FakeTerminal(IOBuffer("\x04\x04"), IOBuffer(), IOBuffer(), false)
+        s = LineEdit.init_state(term, LineEdit.ModalInterface(LineEdit.TextInterface[prompt]))
+        buf, ok, suspend = LineEdit.prompt!(term, s.interface, s)
+        @test !ok && s.aborted
+        @test occursin("Type ^D again to exit.", term_output(s))
+    end
+
+    # A key that changes nothing must not leave a step in the undo history.
+    for noop in ("\x7f", "\e\b", "\x17", "\x15", "\e[1;3D", "\eW")
+        @test content(press("ab\x01$noop\x1f")) == "a"
+    end
+    for noop in ("\x04", "\e[3~", "\ed", "\x0b")
+        @test content(press("ab$noop\x1f")) == "a"
+    end
+    @test content(press("ab\x1f")) == "a"
+    @test content(press("abc\x1f\x1f\e_")) == "ab"
+    @test content(press("abc\x1f\x1f\e_\e_\e_")) == "abc" # redo stops at the newest edit
+    @test content(press("ab\x1fc\e_")) == "ac" # redo needs an undo right before it
+    @test content(press("\x1f")) == ""
+end
+
+@testset "show" begin
+    prompt = LineEdit.Prompt(() -> "test> ")
+    @test occursin("test> ", repr(prompt))
+    s = LineEdit.init_state(FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer()), LineEdit.ModalInterface([prompt]))
+    @test repr(s) == "MI State ($(repr(prompt)) active)"
+end
+
+struct StaticCompletions <: LineEdit.CompletionProvider
+    completions::Any
+    should_complete::Bool
+end
+# Hints run on another task and would race with the key presses.
+function LineEdit.complete_line(c::StaticCompletions, s; hint::Bool=false)
+    hint && return LineEdit.NamedCompletion[], "", false
+    word = last(split("x " * LineEdit.input_string(s)[1:position(s)], ' '))
+    return c.completions, String(word), c.should_complete
+end
+
+@testset "completion keys" begin
+    function complete(keys, completions; should_complete=true)
+        s = press(keys; prompt=LineEdit.Prompt("test> "; complete=StaticCompletions(completions, should_complete)))
+        return content(s), String(take!(LineEdit.terminal(s).out_stream))
+    end
+    listed(out) = occursin("\n\rfoo", out)
+
+    # one choice replaces the word, and undo brings it back
+    @test complete("f\t", ["foo"])[1] == "foo"
+    @test complete("x f\t|", ["foo"])[1] == "x foo|"
+    @test complete("f\t\x1f", ["foo"])[1] == "f"
+    @test complete("f\e[Z", ["foo"])[1] == "foo"
+
+    # several choices complete their common prefix, then list on the next press
+    named = LineEdit.NamedCompletion.(["foo1", "foo2"])
+    for completions in (["foo1", "foo2"], named)
+        text, out = complete("f\t", completions)
+        @test text == "foo"
+        @test !listed(out)
+        text, out = complete("f\t\t", completions)
+        @test text == "foo"
+        @test listed(out)
+    end
+    @test complete("f\t", ["αβγ", "αβδ"])[1] == "αβ"
+    @test complete("f\t", ["αβ", "αβγ"])[1] == "αβ"
+    @test complete("f\t", ["", "foo"])[1] == "f"
+    @test complete("f\t", ["abc", "xyz"])[1] == "f"
+
+    # should_complete only lists, even for one choice
+    text, out = complete("f\t", ["foo"]; should_complete=false)
+    @test text == "f"
+    @test occursin("foo", out)
+
+    # no choice leaves the input alone
+    @test complete("f\t", String[])[1] == "f"
+
+    # right arrow at the end of the input accepts a single completion, in either return format
+    @test complete("fo\e[C", ["foo"])[1] == "foo"
+    @test complete("fo\e[C", LineEdit.NamedCompletion.(["foo"]))[1] == "foo"
+    @test complete("fo\e[C", ["foo", "fob"])[1] == "fo"
+    @test complete("f\e[C", ["foo"])[1] == "f"
+    @test complete("fo\e[C", ["foo"]; should_complete=false)[1] == "fo"
+    @test complete("fo\x01\e[C|", ["foo"])[1] == "f|o"
+end
+
+@testset "beep" begin
+    term = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer(), true)
+    prompt = LineEdit.Prompt("test> "; prompt_prefix="\e[1m")
+    s = LineEdit.init_state(term, prompt)
+    # disabled when not interactive
+    LineEdit.beep(s, 0.01, 0.001, 0.01; colors=["\e[41m"], use_current=true)
+    @test s.beeping == 0.0
+    @test isempty(take!(term.out_stream))
+
+    old = isinteractive()
+    @eval Base is_interactive = true
+    try
+        LineEdit.beep(s, 100.0, 0.001, 0.005; colors=["\e[41m"], use_current=true)
+        @test s.beeping == 0.005 # capped
+        yield() # let it start, so that the wait below sees it running
+        LineEdit.cancel_beep(s)
+    finally
+        @eval Base is_interactive = $old
+    end
+    @test s.beeping <= 0.0
+    @test prompt.prompt_prefix == "\e[1m"
+    out = String(take!(term.out_stream))
+    @test occursin("\e[41m", out)
+    @test endswith(first(out, findlast('>', out)), "\e[0K\e[1m\e[1mtest>") # the last redraw restored the prefix
+end
+
+@testset "Hints at the terminal edge" begin
+    # Hints must leave room for trailing brackets and keep the cursor on its original row.
+    for color in (false, true),
+        (prefix, trailing, visible) in ((" "^57, ")", true), (" "^58, ")", false),
+                                        (" "^60, ")", false), (" "^80, ")", true),
+                                        (" "^56, "))", true), (" "^57, "))", false),
+                                        ("界"^29, ")", false), ("e\u0301"^58, ")", false),
+                                        ("x\n" * " "^58, ")", false),
+                                        (" "^58, "", false))
+        output = IOBuffer()
+        term = FakeTerminal(IOBuffer(), output, IOBuffer(), color)
+        s = LineEdit.init_state(term, LineEdit.Prompt("julia> "))
+        input = prefix * "f(reada" * trailing
+        LineEdit.replace_line(s, input)
+        cursor = sizeof(prefix * "f(reada")
+        seek(buffer(s), cursor)
+        s.hint = "vailable"
+        LineEdit.refresh_line(s)
+        rendered = String(take!(output))
+        @test occursin("vailable", rendered) == visible
+        @test occursin("\e[8@", rendered) == (visible && !isempty(trailing))
+        @test occursin(Base.text_colors[:light_black], rendered) == (visible && color)
+        @test content(s) == input
+        @test position(buffer(s)) == cursor
+    end
+end
+
+# Test bracket insertion functionality
+@testset "Bracket insertion" begin
+    # Test bracket insertion with a fake REPL that has bracket completion enabled
+    term = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer())
+    prompt = LineEdit.Prompt("test> ")
+
+    # Build keymap with bracket insertion enabled (as it would be in practice)
+    base_keymaps = Dict{Any,Any}[LineEdit.bracket_insert_keymap, LineEdit.default_keymap, LineEdit.escape_defaults]
+    prompt.keymap_dict = LineEdit.keymap(base_keymaps)
+
+    interface = LineEdit.ModalInterface([prompt])
+    s = LineEdit.init_state(term, interface)
+
+    # Helper to write characters as stdin input
+    write_input(s, str) = for c in str
+        buf = IOBuffer(string(c))
+        LineEdit.match_input(prompt.keymap_dict, s, buf)(s, buf)
+    end
+
+    # Test left bracket at EOF triggers auto-complete
+    write_input(s, "(")
+    @test content(s) == "()"
+    @test position(buffer(s)) == 1
+
+    # Test right bracket skips over matching bracket
+    write_input(s, ")")
+    @test content(s) == "()"
+    @test position(buffer(s)) == 2
+
+    # Test backspace removes both brackets
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "(")
+    write_input(s, "\b")
+    @test content(s) == ""
+    @test position(buffer(s)) == 0
+
+    # Test quote insertion at EOF
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "\"")
+    @test content(s) == "\"\""
+    @test position(buffer(s)) == 1
+
+    # Test quote skip over
+    write_input(s, "\"")
+    @test content(s) == "\"\""
+    @test position(buffer(s)) == 2
+
+    # Test transpose detection - single quote after letter shouldn't auto-complete
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "A")
+    write_input(s, "'")
+    @test content(s) == "A'"
+    @test position(buffer(s)) == 2
+
+    # Test single quote after space should auto-complete
+    s = LineEdit.init_state(term, interface)
+    write_input(s, " ")
+    write_input(s, "'")
+    @test content(s) == " ''"
+    @test position(buffer(s)) == 2
+
+    # Test bracket not inserted when next char is not whitespace
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "x")
+    charseek(buffer(s), 0)
+    write_input(s, "(")
+    @test content(s) == "(x"
+    @test position(buffer(s)) == 1
+
+    # Test all bracket types
+    for (left, right) in (('[', ']'), ('{', '}'))
+        s = LineEdit.init_state(term, interface)
+        write_input(s, string(left))
+        @test content(s) == string(left, right)
+        @test position(buffer(s)) == 1
+        write_input(s, string(right))
+        @test position(buffer(s)) == 2
+        write_input(s, "\b")
+        @test content(s) == string(left)
+        @test position(buffer(s)) == 1
+        write_input(s, "\b")
+        @test content(s) == ""
+        @test position(buffer(s)) == 0
+    end
+
+    # Test all quote types
+    for quote_char in ('`', '"', '\'')
+        s = LineEdit.init_state(term, interface)
+        write_input(s, string(quote_char))
+        @test content(s) == string(quote_char, quote_char)
+        @test position(buffer(s)) == 1
+    end
+
+    # Test nested brackets
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "(")
+    write_input(s, "[")
+    @test content(s) == "([])"
+    @test position(buffer(s)) == 2
+    write_input(s, "]")
+    @test position(buffer(s)) == 3
+    write_input(s, ")")
+    @test position(buffer(s)) == 4
+
+    # Test backspace in middle of nested brackets
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "(")
+    write_input(s, "{")
+    @test content(s) == "({})"
+    @test position(buffer(s)) == 2
+    write_input(s, "\b")
+    @test content(s) == "()"
+    @test position(buffer(s)) == 1
+
+    # Test triple quotes don't auto-complete
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "\"")
+    @test content(s) == "\"\""
+    @test position(buffer(s)) == 1
+    write_input(s, "\"")
+    @test content(s) == "\"\""
+    @test position(buffer(s)) == 2
+    write_input(s, "\"")
+    @test content(s) == "\"\"\""
+    @test position(buffer(s)) == 3
+
+    # Test transpose detection for various cases
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "x123")
+    write_input(s, "'")
+    @test content(s) == "x123'"
+    @test position(buffer(s)) == 5
+
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "arr]")
+    write_input(s, "'")
+    @test content(s) == "arr]'"
+    @test position(buffer(s)) == 5
+
+    # Test right bracket insert when not matching
+    s = LineEdit.init_state(term, interface)
+    write_input(s, ")")
+    @test content(s) == ")"
+    @test position(buffer(s)) == 1
+
+    # Test backspace doesn't remove mismatched brackets
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "(")
+    write_input(s, "]")
+    charseek(buffer(s), 1)
+    write_input(s, "\b")
+    @test content(s) == "])"
+    @test position(buffer(s)) == 0
+
+    # Test bracket insertion followed by whitespace
+    s = LineEdit.init_state(term, interface)
+    write_input(s, " ")
+    charseek(buffer(s), 0)
+    write_input(s, "(")
+    @test content(s) == "() "
+    @test position(buffer(s)) == 1
+
+    # Test quote behavior: |foo" + " -> "foo" (not ""foo")
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "foo\"")
+    charseek(buffer(s), 0)
+    write_input(s, "\"")
+    @test content(s) == "\"foo\""
+    @test position(buffer(s)) == 1
+
+    # Test quote behavior: foo| + " -> foo" (not foo"")
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "foo")
+    write_input(s, "\"")
+    @test content(s) == "foo\""
+    @test position(buffer(s)) == 4
+
+    # Test quote behavior: foo | + " -> foo ""
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "foo ")
+    write_input(s, "\"")
+    @test content(s) == "foo \"\""
+    @test position(buffer(s)) == 5
+
+    # Test quote behavior: | foo + " -> "" foo (space before foo means double quotes)
+    s = LineEdit.init_state(term, interface)
+    write_input(s, " foo")
+    charseek(buffer(s), 0)
+    write_input(s, "\"")
+    @test content(s) == "\"\" foo"
+    @test position(buffer(s)) == 1
+
+    # Test quote behavior:  | + " -> ""
+    s = LineEdit.init_state(term, interface)
+    write_input(s, " ")
+    write_input(s, "\"")
+    @test content(s) == " \"\""
+    @test position(buffer(s)) == 2
+
+    # Test quote behavior: (|) + " -> ("")
+    s = LineEdit.init_state(term, interface)
+    write_input(s, ")")
+    charseek(buffer(s), 0)
+    write_input(s, "(")
+    # Buffer is now () with cursor at 1 (not paired since there was an unmatched `)`)
+    @test content(s) == "()"
+    write_input(s, "\"")
+    @test content(s) == "(\"\")"
+    @test position(buffer(s)) == 2
+
+    # Test quote behavior: (|bar) + " -> ("bar)
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "(bar)")
+    charseek(buffer(s), 1)
+    write_input(s, "\"")
+    @test content(s) == "(\"bar)"
+    @test position(buffer(s)) == 2
+
+    # Brackets are not paired inside literals and comments: "|" + ( -> "(|"
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "\"\"")
+    charseek(buffer(s), 1)
+    write_input(s, "(")
+    @test content(s) == "\"(\""
+    @test position(buffer(s)) == 2
+
+    # Typing out code gives that code, also when literals contain brackets or quotes
+    for str in ("split(s, \"(\")", "c = '('", "c = '['", "f(x, \"a (b\")", "\"a\\\"b\\\"\"",
+                "# don't \"quote", "r\"[a-z]+\"", "x = \"\"\"a\"b\"\"\"", "`echo \"(\"`",
+                "println(\"\$x[1]\")", "\"\$f(\$x)\"", "Regex(\"^\$v[a-z]\")",
+                "print(\"\"\"x = \$(f(1))\"\"\")", "f(`a \$(g(1)) b`)")
+        s = LineEdit.init_state(term, interface)
+        write_input(s, str)
+        @test content(s) == str
+        @test position(buffer(s)) == sizeof(str)
+    end
+
+    # An escaped newline and its indentation are still inside the string literal.
+    for prefix in ("\"abc\\\n", "\"abc\\\n    ")
+        s = LineEdit.init_state(term, interface)
+        LineEdit.replace_line(LineEdit.state(s), prefix)
+        write_input(s, "\"")
+        @test content(s) == prefix * "\""
+        @test position(buffer(s)) == sizeof(prefix) + 1
+
+        s = LineEdit.init_state(term, interface)
+        LineEdit.replace_line(LineEdit.state(s), prefix * ")\"")
+        seek(buffer(s), sizeof(prefix))
+        write_input(s, ")")
+        @test content(s) == prefix * "))\""
+        @test position(buffer(s)) == sizeof(prefix) + 1
+    end
+
+    # Interpolation in a string is code
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "\"\$(")
+    @test content(s) == "\"\$()\""
+
+    # Don't pair a bracket in front of a string, char or command literal
+    for str in ("\"a\"", "'a'", "`a`")
+        s = LineEdit.init_state(term, interface)
+        write_input(s, str)
+        charseek(buffer(s), 0)
+        write_input(s, "f(")
+        @test content(s) == "f(" * str
+        @test position(buffer(s)) == 2
+    end
+
+    # Don't move over a closing bracket that is needed by another opening one
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "f(g(x")
+    @test content(s) == "f(g(x))"
+    LineEdit.edit_delete(buffer(s))
+    write_input(s, ")")
+    @test content(s) == "f(g(x))"
+    @test position(buffer(s)) == 6
+    write_input(s, ")")
+    @test content(s) == "f(g(x))"
+    @test position(buffer(s)) == 7
+
+    # Don't remove a closing bracket that is needed by another opening one
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "f((a)")
+    @test content(s) == "f((a))"
+    write_input(s, "\b\b")
+    @test content(s) == "f(()"
+    write_input(s, "\b")
+    @test content(s) == "f()"
+    @test position(buffer(s)) == 2
+    write_input(s, "\b")
+    @test content(s) == "f"
+
+    # Quotes: don't remove two adjacent strings' quotes; do move over a closing quote
+    # that isn't escaped
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "\"a\"\"b\"")
+    charseek(buffer(s), 3)
+    write_input(s, "\b")
+    @test content(s) == "\"a\"b\""
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "\"a\\")
+    write_input(s, "\"")
+    @test content(s) == "\"a\\\"\""
+    @test position(buffer(s)) == 4
+    write_input(s, "\"")
+    @test content(s) == "\"a\\\"\""
+    @test position(buffer(s)) == 5
+
+    # Inserting and removing a pair are undo steps of their own
+    s = LineEdit.init_state(term, interface)
+    write_input(s, "ab(\"")
+    @test content(s) == "ab(\"\")"
+    LineEdit.edit_undo!(s)
+    @test content(s) == "ab()"
+    write_input(s, "\b")
+    @test content(s) == "ab"
+    LineEdit.edit_undo!(s)
+    @test content(s) == "ab()"
+    LineEdit.edit_undo!(s)
+    @test content(s) == "ab"
+
+    # Enter continues on a new line when the input is only complete thanks to automatically
+    # inserted closing brackets, but not for an input that wasn't typed (e.g. from history)
+    # Typing or moving over an automatically inserted closing bracket commits it
+    prompt.on_enter = REPL.return_callback
+    function type_keys(s, keys)
+        done = false
+        for k in keys
+            buf = IOBuffer(k)
+            done = LineEdit.match_input(prompt.keymap_dict, s, buf)(s, buf) === :done
+            LineEdit.auto_closed_after_cursor(s) # as the prompt does after each key
+        end
+        return done
+    end
+    for (str, expected) in (("[1, 2\r3]\r", "[1, 2\n3]"), ("f(\r1)\r", "f(\n1)"),
+                            ("x = [\rx\rfor x in 1:2\r]\r", "x = [\nx\nfor x in 1:2\n]"),
+                            ("([]\r)\r", "([]\n)"), ("([]\e[C\r", "([])"),
+                            ("()\e[D\r", "()"), ("f(x\e[D\r", "f(x)"),
+                            ("print(\"\"\"\rx = \$(f(1))\r\"\"\")\r", "print(\"\"\"\nx = \$(f(1))\n\"\"\")"))
+        s = LineEdit.init_state(term, interface)
+        @test type_keys(s, [String(m.match) for m in eachmatch(r"\e\[.|.", str)])
+        @test content(s) == expected
+    end
+    s = LineEdit.init_state(term, interface)
+    type_keys(s, ["f", "(", "x"])
+    @test LineEdit.at_input_end(LineEdit.state(s))
+    type_keys(s, ["\e[D"])
+    @test !LineEdit.at_input_end(LineEdit.state(s))
+    s = LineEdit.init_state(term, interface)
+    LineEdit.replace_line(LineEdit.state(s), "f(x)")
+    charseek(buffer(s), 3)
+    buf = IOBuffer("\r")
+    @test LineEdit.match_input(prompt.keymap_dict, s, buf)(s, buf) === :done
+    @test content(s) == "f(x)"
+end
+
+@testset "Conflicting definitions for keyseq" begin
+    @testset "string" begin
+        keymap = Dict{Char, Any}()
+        REPL.LineEdit.add_nested_key!(keymap, "a", "abc")
+        @test keymap == Dict('a' => "abc")
+        expected_msg = "Conflicting definitions for keyseq a within one keymap"
+        @test_throws ErrorException(expected_msg) REPL.LineEdit.add_nested_key!(keymap, "a", "abdef")
+        @test keymap == Dict('a' => "abc")
+    end
+    @testset "char" begin
+        keymap = Dict{Char, Any}()
+        REPL.LineEdit.add_nested_key!(keymap, 'a', "abc")
+        @test keymap == Dict('a' => "abc")
+        expected_msg = "Conflicting definitions for keyseq a within one keymap"
+        @test_throws ErrorException(expected_msg) REPL.LineEdit.add_nested_key!(keymap, 'a', "abdef")
+        @test keymap == Dict('a' => "abc")
+   end
+end
+
+# Test TerminalProperties and private CSI (`\e[?`) parsing
+@testset "TerminalProperties" begin
+    # Feed `input` (after `\e[?` has been consumed) to a fresh set of properties.
+    function receive_csi(input; awaiting = false)
+        props = LineEdit.TerminalProperties()
+        props.awaiting_colors = awaiting
+        term = FakeTerminal(IOBuffer(input), IOBuffer(), IOBuffer())
+        LineEdit.receive_private_csi!(props, term)
+        props, term
+    end
+
+    @testset "DA1 responses" begin
+        @test receive_csi("64;1;2;6;22c")[1].da1 == [64, 1, 2, 6, 22]
+        @test receive_csi("1c")[1].da1 == [1]
+        # An empty response is still a response, but a truncated one is not.
+        @test receive_csi("c")[1].da1 == Int[]
+        @test receive_csi("64;1\x03")[1].da1 === nothing
+        @test receive_csi("64;1")[1].da1 === nothing
+    end
+
+    @testset "palette update notifications" begin
+        props, term = receive_csi("997;1nabc")
+        @test props.awaiting_colors
+        @test read(term.in_stream, String) == "abc"
+        @test startswith(String(take!(term.out_stream)), "\e]4;0;?\e\\")
+        # Not while a query is already being answered, nor for other reports (here DECRPM).
+        for (input, awaiting) in (("997;2n", true), ("2031;1\$yabc", false))
+            props, term = receive_csi(input; awaiting)
+            @test isempty(take!(term.out_stream))
+            @test props.da1 === nothing
+        end
+        @test read(term.in_stream, String) == "abc"
+    end
+
+    @testset "TerminalProperties default initialization" begin
+        props = LineEdit.TerminalProperties()
+        @test props.da1 === nothing
+    end
+
+    @testset "MIState has terminal_properties" begin
+        s = new_state()
+        @test s.terminal_properties isa LineEdit.TerminalProperties
+        @test s.terminal_properties.da1 === nothing
+    end
+end
+
+# Test OSC colour response parsing (see `query_colors`)
+# The sentinel reply applies the palette to StyledStrings' global colour state, which other
+# tests on the same worker would otherwise see, so restore it afterwards.
+osc_saved_colors = copy(REPL.StyledStrings.FACES.basecolors)
+osc_saved_faces = copy(REPL.StyledStrings.FACES.current[])
+@testset "OSC colour responses" begin
+    RGB(r, g, b) = (; r=UInt8(r), g=UInt8(g), b=UInt8(b))
+    # `awaiting` mirrors a pending `query_colors`, so the sentinel applies the palette.
+    function receive(responses...; awaiting = true)
+        props = LineEdit.TerminalProperties()
+        props.awaiting_colors = awaiting
+        for r in responses
+            LineEdit.receive_osc!(props, IOBuffer(r))
+        end
+        props
+    end
+
+    @testset "interpret_color" begin
+        @test LineEdit.interpret_color("rgb:24/27/30") == RGB(0x24, 0x27, 0x30)
+        @test LineEdit.interpret_color("rgb:1/2/3") == RGB(0x11, 0x22, 0x33)
+        @test LineEdit.interpret_color("rgb:242/272/303") == RGB(0x24, 0x27, 0x30)
+        @test LineEdit.interpret_color("rgb:2424/2727/3030") == RGB(0x24, 0x27, 0x30)
+        @test LineEdit.interpret_color("rgb:24242/2/3") === nothing
+        @test LineEdit.interpret_color("rgba:24/27/30/ff") == RGB(0x24, 0x27, 0x30)
+        @test LineEdit.interpret_color("#242730") === nothing
+        @test LineEdit.interpret_color("rgb:24/27") === nothing
+        @test LineEdit.interpret_color("rgb:24/27/30/ff") === nothing
+        @test LineEdit.interpret_color("rgba:24/27/30") === nothing
+        @test LineEdit.interpret_color("rgb:zz/27/30") === nothing
+    end
+
+    @testset "read_osc_response terminators" begin
+        for term in ("\a", "\e\\", "\x9c", "\x03")
+            @test LineEdit.read_osc_response(IOBuffer("10;rgb:24/27/30" * term)) == "10;rgb:24/27/30"
+        end
+        # An unterminated response ends at EOF rather than blocking.
+        @test LineEdit.read_osc_response(IOBuffer("10;rgb:24/27/30")) == "10;rgb:24/27/30"
+    end
+
+    @testset "colour accumulation" begin
+        props = receive("4;1;rgb:ff/00/00\a", "4;2;rgb:00/ff/00\a")
+        @test props.colors == [:red => RGB(0xff, 0, 0), :green => RGB(0, 0xff, 0)]
+        @test receive("4;15;rgb:ff/ff/ff\a").colors == [:bright_white => RGB(0xff, 0xff, 0xff)]
+        # Out-of-range indices and malformed specs are dropped, not stored.
+        @test isempty(receive("4;16;rgb:ff/ff/ff\a").colors)
+        @test isempty(receive("4;0;not-a-color\a").colors)
+        @test isempty(receive("nonsense\a").colors)
+    end
+
+    @testset "foreground/background sentinel" begin
+        props = receive("4;0;rgb:00/00/00\a", "10;rgb:bb/c2/cf\a", "11;rgb:24/27/30\a")
+        @test props.colors == [:black => RGB(0, 0, 0), :foreground => RGB(0xbb, 0xc2, 0xcf),
+                               :background => RGB(0x24, 0x27, 0x30)]
+        props = receive("4;0;rgb:00/00/00\a", "10;rgb:bb/c2/cf\a")
+        @test props.awaiting_colors
+        LineEdit.receive_osc!(props, IOBuffer("11;rgb:24/27/30\a"))
+        @test !props.awaiting_colors
+    end
+
+    @testset "partial response" begin
+        # A terminal that answers only fg/bg still applies its colours.
+        props = receive("10;rgb:bb/c2/cf\a", "11;rgb:24/27/30\a")
+        @test props.colors == [:foreground => RGB(0xbb, 0xc2, 0xcf), :background => RGB(0x24, 0x27, 0x30)]
+        @test !props.awaiting_colors
+        # One that answers only the palette never reaches the sentinel.
+        props = receive("4;0;rgb:00/00/00\a")
+        @test props.awaiting_colors
+        # A malformed sentinel reply still ends the query.
+        props = receive("10;garbage\a", "11;rgb:24/27/30\a")
+        @test props.colors == [:background => RGB(0x24, 0x27, 0x30)]
+        @test !props.awaiting_colors
+        # Responses outside a query are ignored.
+        props = receive("4;1;rgb:ff/00/00\a", awaiting = false)
+        @test isempty(props.colors)
+    end
+end
+merge!(empty!(REPL.StyledStrings.FACES.basecolors), osc_saved_colors)
+merge!(empty!(REPL.StyledStrings.FACES.current[]), osc_saved_faces)

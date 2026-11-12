@@ -1,8 +1,9 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 @testset "basic properties" begin
-
+    @test typemax(Char) == reinterpret(Char, typemax(UInt32))
     @test typemin(Char) == Char(0)
+    @test typemax(Char) == reinterpret(Char, 0xffffffff)
     @test ndims(Char) == 0
     @test getindex('a', 1) == 'a'
     @test_throws BoundsError getindex('a', 2)
@@ -19,7 +20,7 @@
 
     @test widen('a') === 'a'
     # just check this works
-    @test_throws Base.CodePointError Base.code_point_err(UInt32(1))
+    @test_throws Base.CodePointError Base.throw_code_point_err(UInt32(1))
 end
 
 @testset "ASCII conversion to/from Integer" begin
@@ -99,6 +100,7 @@ end
     #getindex(c::Char) = c
     for x in testarrays
         @test getindex(x) == x
+        @test getindex(x, CartesianIndex()) == x
     end
 
     #first(c::Char) = c
@@ -119,7 +121,7 @@ end
     #iterate(c::Char)
     for x in testarrays
         @test iterate(x)[1] == x
-        @test iterate(x, iterate(x)[2]) == nothing
+        @test iterate(x, iterate(x)[2]) === nothing
     end
 
     #isless(x::Char, y::Integer) = isless(UInt32(x), y)
@@ -185,6 +187,7 @@ end
 
 @testset "sprint, repr" begin
     @test sprint(show, "text/plain", '$') == "'\$': ASCII/Unicode U+0024 (category Sc: Symbol, currency)"
+    @test sprint(show, "text/plain", '$', context=:compact => true) == "'\$'"
     @test repr('$') == "'\$'"
 end
 
@@ -210,10 +213,39 @@ end
     end
 end
 
+# issue #50532
+@testset "invalid read(io, Char)" begin
+    # byte values with different numbers of leading bits
+    B = UInt8[
+        0x3f, 0x4d, 0x52, 0x63, 0x81, 0x83, 0x89, 0xb6,
+        0xc0, 0xc8, 0xd3, 0xe3, 0xea, 0xeb, 0xf0, 0xf2,
+        0xf4, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+    ]
+    f = tempname()
+    for b1 in B, b2 in B, t = 0:3
+        bytes = [b1, b2]
+        append!(bytes, rand(B, t))
+        s = String(bytes)
+        write(f, s)
+        @test s == read(f, String)
+        chars = collect(s)
+        ios = [IOBuffer(s), open(f), Base.Filesystem.open(f, 0)]
+        for io in ios
+            chars′ = Char[]
+            while !eof(io)
+                push!(chars′, read(io, Char))
+            end
+            @test chars == chars′
+            close(io)
+        end
+    end
+    rm(f)
+end
+
 @testset "overlong codes" begin
     function test_overlong(c::Char, n::Integer, rep::String)
-        if isvalid(c)
-            @test Int(c) == n
+        if !Base.ismalformed(c)
+            @test Int(c) == n == codepoint(c)
         else
             @test_throws Base.InvalidCharError UInt32(c)
         end
@@ -246,6 +278,7 @@ Base.codepoint(c::ASCIIChar) = reinterpret(UInt8, c)
 
 @testset "abstractchar" begin
     @test AbstractChar('x') === AbstractChar(UInt32('x')) === 'x'
+    @test convert(AbstractChar, 2.0) == Char(2)
 
     @test isascii(ASCIIChar('x'))
     @test ASCIIChar('x') < 'y'
@@ -253,6 +286,155 @@ Base.codepoint(c::ASCIIChar) = reinterpret(UInt8, c)
     @test ASCIIChar('x')^3 == "xxx"
     @test repr(ASCIIChar('x')) == "'x'"
     @test string(ASCIIChar('x')) == "x"
+    @test length(ASCIIChar('x')) == 1
+    @test !isempty(ASCIIChar('x'))
+    @test ndims(ASCIIChar('x')) == 0
+    @test ndims(ASCIIChar) == 0
+    @test Base.IteratorSize(ASCIIChar) === Base.HasShape{0}()
+    @test firstindex(ASCIIChar('x')) == 1
+    @test lastindex(ASCIIChar('x')) == 1
+    @test eltype(ASCIIChar) == ASCIIChar
     @test_throws MethodError write(IOBuffer(), ASCIIChar('x'))
     @test_throws MethodError read(IOBuffer('x'), ASCIIChar)
+end
+
+@testset "ncodeunits(::Char)" begin
+    # valid encodings
+    @test ncodeunits('\0')       == 1
+    @test ncodeunits('\x1')      == 1
+    @test ncodeunits('\x7f')     == 1
+    @test ncodeunits('\u80')     == 2
+    @test ncodeunits('\uff')     == 2
+    @test ncodeunits('\u7ff')    == 2
+    @test ncodeunits('\u800')    == 3
+    @test ncodeunits('\uffff')   == 3
+    @test ncodeunits('\U10000')  == 4
+    @test ncodeunits('\U10ffff') == 4
+    # invalid encodings
+    @test ncodeunits(reinterpret(Char, 0x80_00_00_00)) == 1
+    @test ncodeunits(reinterpret(Char, 0x01_00_00_00)) == 1
+    @test ncodeunits(reinterpret(Char, 0x00_80_00_00)) == 2
+    @test ncodeunits(reinterpret(Char, 0x00_01_00_00)) == 2
+    @test ncodeunits(reinterpret(Char, 0x00_00_80_00)) == 3
+    @test ncodeunits(reinterpret(Char, 0x00_00_01_00)) == 3
+    @test ncodeunits(reinterpret(Char, 0x00_00_00_80)) == 4
+    @test ncodeunits(reinterpret(Char, 0x00_00_00_01)) == 4
+end
+
+@testset "reinterpret(Char, ::UInt32)" begin
+    for s = 0:31
+        u = one(UInt32) << s
+        @test reinterpret(UInt32, reinterpret(Char, u)) === u
+    end
+end
+
+@testset "broadcasting of Char" begin
+    @test identity.('a') == 'a'
+    @test 'a' .* ['b', 'c'] == ["ab", "ac"]
+end
+
+@testset "code point format of U+ syntax (PR 33291)" begin
+    @test repr("text/plain", '\n') == "'\\n': ASCII/Unicode U+000A (category Cc: Other, control)"
+    @test repr("text/plain", '/') == "'/': ASCII/Unicode U+002F (category Po: Punctuation, other)"
+    @test repr("text/plain", '\u10e') == "'Ď': Unicode U+010E (category Lu: Letter, uppercase)"
+    @test repr("text/plain", '\u3a2c') == "'㨬': Unicode U+3A2C (category Lo: Letter, other)"
+    @test repr("text/plain", '\U001f428') == "'🐨': Unicode U+1F428 (category So: Symbol, other)"
+    @test repr("text/plain", '\U010f321') == "'\\U10f321': Unicode U+10F321 (category Co: Other, private use)"
+end
+
+@testset "malformed chars" begin
+    u1 = UInt32(0xc0) << 24
+    u2 = UInt32(0xc1) << 24
+    u3 = UInt32(0x0704) << 21
+    u4 = UInt32(0x0f08) << 20
+
+    overlong_uints = [u1, u2, u3, u4]
+    overlong_chars = reinterpret.(Char, overlong_uints)
+    @test all(Base.is_overlong_enc, overlong_uints)
+    @test all(Base.isoverlong, overlong_chars)
+    @test all(Base.ismalformed, overlong_chars)
+    @test repr("text/plain", overlong_chars[1]) ==
+        "'\\xc0': Malformed UTF-8 (category Ma: Malformed, bad data)"
+
+    # Predicates annotated `@assume_effects` must not throw on arbitrary Char bit-patterns.
+    # Skip 0x00000000 ('\0', well-formed); the rest must be malformed for this to test what we want.
+    for u in (0x80000000, 0xC0000000, 0xE0000000, 0xF0000000,
+              0xF8000000, 0xFF000000, 0xFFFFFFFF, 0x80808080)
+        c = reinterpret(Char, u)
+        @test Base.ismalformed(c)
+        @test textwidth(c) isa Int
+        @test Base.Unicode.category_code(c) isa Integer
+        @test Base.Unicode.category_abbrev(c) isa AbstractString
+        @test Base.Unicode.category_string(c) isa AbstractString
+        @test Base.Unicode.isassigned(c) isa Bool
+        @test islowercase(c) isa Bool
+        @test isuppercase(c) isa Bool
+        for f in (lowercase, uppercase, titlecase)
+            @test_throws Base.InvalidCharError f(c)
+        end
+    end
+end
+
+@testset "overlong, non-malformed chars" begin
+    c = ['\xc0\xa0', '\xf0\x8e\x80\x80']
+    @test all(Base.isoverlong, c)
+    @test !any(Base.ismalformed, c)
+    @test repr("text/plain", c[1]) == "'\\xc0\\xa0': [overlong] ASCII/Unicode U+0020 (category Zs: Separator, space)"
+    @test codepoint.(c) == [0x20, 0xE000]
+    @test isuppercase(c[1]) == isuppercase(c[2]) == false # issue #54343
+end
+
+@testset "More fallback tests" begin
+    @test length(ASCIIChar('x')) == 1
+    @test firstindex(ASCIIChar('x')) == 1
+    @test !isempty(ASCIIChar('x'))
+    @test hash(ASCIIChar('x'), UInt(10)) == hash('x', UInt(10))
+    @test Base.IteratorSize(Char) == Base.HasShape{0}()
+    @test convert(ASCIIChar, 1) == Char(1)
+end
+
+@testset "foldable functions" begin
+    v = @inferred (() -> Val(isuppercase('C')))()
+    @test v isa Val{true}
+    v = @inferred (() -> Val(islowercase('C')))()
+    @test v isa Val{false}
+
+    v = @inferred (() -> Val(isletter('C')))()
+    @test v isa Val{true}
+    v = @inferred (() -> Val(isnumeric('C')))()
+    @test v isa Val{false}
+
+    struct MyChar <: AbstractChar
+        x :: Char
+    end
+    Base.codepoint(m::MyChar) = codepoint(m.x)
+    MyChar(x::UInt32) = MyChar(Char(x))
+
+    v = @inferred (() -> Val(isuppercase(MyChar('C'))))()
+    @test v isa Val{true}
+    v = @inferred (() -> Val(islowercase(MyChar('C'))))()
+    @test v isa Val{false}
+
+    v = @inferred (() -> Val(isletter(MyChar('C'))))()
+    @test v isa Val{true}
+    v = @inferred (() -> Val(isnumeric(MyChar('C'))))()
+    @test v isa Val{false}
+
+    for f in (isletter, isspace, isuppercase, islowercase, isdigit, isnumeric,
+              iscntrl, ispunct, isprint, isxdigit, textwidth,
+              Base.Unicode.isassigned, Base.Unicode.category_code,
+              Base.Unicode.category_abbrev, Base.Unicode.category_string)
+        @test Core.Compiler.is_removable_if_unused(Base.infer_effects(f, (Char,)))
+    end
+    for f in (lowercase, uppercase, titlecase)
+        effects = Base.infer_effects(f, (Char,))
+        @test Core.Compiler.is_foldable(effects)
+        @test !Core.Compiler.is_nothrow(effects)
+    end
+    for f in (isascii, textwidth, lastindex)
+        @test Core.Compiler.is_removable_if_unused(Base.infer_effects(f, (String,)))
+    end
+    for f in (length, isascii, textwidth, lastindex)
+        @test Core.Compiler.is_removable_if_unused(Base.infer_effects(f, (SubString{String},)))
+    end
 end
